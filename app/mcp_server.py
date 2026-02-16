@@ -14,12 +14,17 @@ MCP Tools:
 - query_dataset: SQL query against datasets
 - list_datasets: List loaded datasets
 - create_session: Create workspace session
+
+Version: 1.0.6 - Fixed internal API base URL
 """
 
 from mcp.server.fastmcp import FastMCP
 from typing import Optional, Dict
 import httpx
 import os
+import logging
+
+logger = logging.getLogger(__name__)
 
 # MCP Server
 mcp = FastMCP(
@@ -28,8 +33,15 @@ mcp = FastMCP(
 )
 
 # Internal API base URL
-API_BASE = os.getenv("API_BASE_URL", "http://localhost:8000")
+# On Railway, the app runs on port 8080. We use 127.0.0.1 (not localhost)
+# because some container environments resolve localhost differently.
+# The API_BASE_URL env var can override this if needed.
+_default_base = "http://127.0.0.1:8080"
+API_BASE = os.getenv("API_BASE_URL", _default_base)
 API_KEY = os.getenv("API_KEY", "")
+
+logger.info(f"MCP Server: API_BASE={API_BASE}")
+logger.info(f"MCP Server: API_KEY={'***configured***' if API_KEY else 'NOT SET'}")
 
 
 def _headers():
@@ -57,13 +69,20 @@ async def execute_code(
     Returns:
         Execution result with stdout, result, errors, files created
     """
-    async with httpx.AsyncClient(timeout=70) as client:
-        resp = await client.post(
-            f"{API_BASE}/api/execute",
-            headers=_headers(),
-            json={"code": code, "session_id": session_id, "timeout": timeout}
-        )
-        return resp.text
+    url = f"{API_BASE}/api/execute"
+    logger.info(f"execute_code: POST {url}")
+    try:
+        async with httpx.AsyncClient(timeout=70) as client:
+            resp = await client.post(
+                url,
+                headers=_headers(),
+                json={"code": code, "session_id": session_id, "timeout": timeout}
+            )
+            logger.info(f"execute_code: response status={resp.status_code}")
+            return resp.text
+    except Exception as e:
+        logger.error(f"execute_code: error: {e}", exc_info=True)
+        return f"Error calling execute API: {e}"
 
 
 @mcp.tool()
@@ -90,13 +109,19 @@ async def submit_job(
     Returns:
         Job ID and status
     """
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.post(
-            f"{API_BASE}/api/jobs/submit",
-            headers=_headers(),
-            json={"code": code, "session_id": session_id, "timeout": timeout}
-        )
-        return resp.text
+    url = f"{API_BASE}/api/jobs/submit"
+    logger.info(f"submit_job: POST {url}")
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                url,
+                headers=_headers(),
+                json={"code": code, "session_id": session_id, "timeout": timeout}
+            )
+            return resp.text
+    except Exception as e:
+        logger.error(f"submit_job: error: {e}", exc_info=True)
+        return f"Error calling submit_job API: {e}"
 
 
 @mcp.tool()
@@ -111,12 +136,15 @@ async def get_job_status(job_id: str) -> str:
     Returns:
         Job status with timing info
     """
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.get(
-            f"{API_BASE}/api/jobs/{job_id}/status",
-            headers=_headers()
-        )
-        return resp.text
+    url = f"{API_BASE}/api/jobs/{job_id}/status"
+    logger.info(f"get_job_status: GET {url}")
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(url, headers=_headers())
+            return resp.text
+    except Exception as e:
+        logger.error(f"get_job_status: error: {e}", exc_info=True)
+        return f"Error calling get_job_status API: {e}"
 
 
 @mcp.tool()
@@ -131,12 +159,15 @@ async def get_job_result(job_id: str) -> str:
     Returns:
         Full job result
     """
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.get(
-            f"{API_BASE}/api/jobs/{job_id}/result",
-            headers=_headers()
-        )
-        return resp.text
+    url = f"{API_BASE}/api/jobs/{job_id}/result"
+    logger.info(f"get_job_result: GET {url}")
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(url, headers=_headers())
+            return resp.text
+    except Exception as e:
+        logger.error(f"get_job_result: error: {e}", exc_info=True)
+        return f"Error calling get_job_result API: {e}"
 
 
 @mcp.tool()
@@ -153,13 +184,15 @@ async def list_files(session_id: str = None) -> str:
     if session_id:
         params["session_id"] = session_id
     
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.get(
-            f"{API_BASE}/api/files",
-            headers=_headers(),
-            params=params
-        )
-        return resp.text
+    url = f"{API_BASE}/api/files"
+    logger.info(f"list_files: GET {url}")
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(url, headers=_headers(), params=params)
+            return resp.text
+    except Exception as e:
+        logger.error(f"list_files: error: {e}", exc_info=True)
+        return f"Error calling list_files API: {e}"
 
 
 @mcp.tool()
@@ -183,18 +216,24 @@ async def load_dataset(
     Returns:
         Dataset info with row count, columns, preview
     """
-    async with httpx.AsyncClient(timeout=300) as client:
-        resp = await client.post(
-            f"{API_BASE}/api/data/load-csv",
-            headers=_headers(),
-            json={
-                "file_path": file_path,
-                "dataset_name": dataset_name,
-                "session_id": session_id,
-                "delimiter": delimiter
-            }
-        )
-        return resp.text
+    url = f"{API_BASE}/api/data/load-csv"
+    logger.info(f"load_dataset: POST {url}")
+    try:
+        async with httpx.AsyncClient(timeout=300) as client:
+            resp = await client.post(
+                url,
+                headers=_headers(),
+                json={
+                    "file_path": file_path,
+                    "dataset_name": dataset_name,
+                    "session_id": session_id,
+                    "delimiter": delimiter
+                }
+            )
+            return resp.text
+    except Exception as e:
+        logger.error(f"load_dataset: error: {e}", exc_info=True)
+        return f"Error calling load_dataset API: {e}"
 
 
 @mcp.tool()
@@ -217,13 +256,19 @@ async def query_dataset(
     Returns:
         Query results with columns and data
     """
-    async with httpx.AsyncClient(timeout=60) as client:
-        resp = await client.post(
-            f"{API_BASE}/api/data/query",
-            headers=_headers(),
-            json={"sql": sql, "limit": limit, "offset": offset}
-        )
-        return resp.text
+    url = f"{API_BASE}/api/data/query"
+    logger.info(f"query_dataset: POST {url}")
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(
+                url,
+                headers=_headers(),
+                json={"sql": sql, "limit": limit, "offset": offset}
+            )
+            return resp.text
+    except Exception as e:
+        logger.error(f"query_dataset: error: {e}", exc_info=True)
+        return f"Error calling query_dataset API: {e}"
 
 
 @mcp.tool()
@@ -243,13 +288,15 @@ async def list_datasets(session_id: str = None) -> str:
     if session_id:
         params["session_id"] = session_id
     
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.get(
-            f"{API_BASE}/api/data/datasets",
-            headers=_headers(),
-            params=params
-        )
-        return resp.text
+    url = f"{API_BASE}/api/data/datasets"
+    logger.info(f"list_datasets: GET {url}")
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(url, headers=_headers(), params=params)
+            return resp.text
+    except Exception as e:
+        logger.error(f"list_datasets: error: {e}", exc_info=True)
+        return f"Error calling list_datasets API: {e}"
 
 
 @mcp.tool()
@@ -268,10 +315,16 @@ async def create_session(
     Returns:
         Session ID and details
     """
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.post(
-            f"{API_BASE}/api/sessions",
-            headers=_headers(),
-            json={"name": name, "description": description}
-        )
-        return resp.text
+    url = f"{API_BASE}/api/sessions"
+    logger.info(f"create_session: POST {url}")
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                url,
+                headers=_headers(),
+                json={"name": name, "description": description}
+            )
+            return resp.text
+    except Exception as e:
+        logger.error(f"create_session: error: {e}", exc_info=True)
+        return f"Error calling create_session API: {e}"

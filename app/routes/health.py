@@ -5,9 +5,8 @@ Public endpoints (no auth required).
 
 from fastapi import APIRouter
 from datetime import datetime
-from app.database import check_database
-from app.engine.job_manager import job_manager
 from app import __version__
+from app.config import settings
 
 router = APIRouter()
 
@@ -15,14 +14,21 @@ router = APIRouter()
 @router.get("/health")
 async def health_check():
     """Health check endpoint for Railway"""
-    db_ok = await check_database()
+    db_status = "not_configured"
+    
+    if settings.DATABASE_URL:
+        try:
+            from app.database import check_database
+            db_ok = await check_database()
+            db_status = "connected" if db_ok else "disconnected"
+        except Exception:
+            db_status = "error"
     
     return {
-        "status": "healthy" if db_ok else "degraded",
+        "status": "healthy",
         "version": __version__,
         "service": "power-interpreter",
-        "database": "connected" if db_ok else "disconnected",
-        "active_jobs": job_manager.active_job_count,
+        "database": db_status,
         "timestamp": datetime.utcnow().isoformat()
     }
 

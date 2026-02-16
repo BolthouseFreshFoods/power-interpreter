@@ -11,12 +11,13 @@ Features:
 - Pre-installed data science libraries
 
 Author: Kaffer AI for Timothy Escamilla
-Version: 1.0.5
+Version: 1.0.6
 """
 
 import logging
 import asyncio
 import json
+import inspect
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Depends, Request
 from fastapi.responses import Response, JSONResponse
@@ -41,7 +42,7 @@ async def lifespan(app: FastAPI):
     """Application lifecycle management"""
     # --- STARTUP ---
     logger.info("="*60)
-    logger.info("Power Interpreter MCP v1.0.5 starting...")
+    logger.info("Power Interpreter MCP v1.0.6 starting...")
     logger.info("="*60)
     
     # Ensure directories exist
@@ -74,8 +75,8 @@ async def lifespan(app: FastAPI):
     logger.info(f"  Max memory: {settings.MAX_MEMORY_MB} MB")
     logger.info(f"  Max concurrent jobs: {settings.MAX_CONCURRENT_JOBS}")
     logger.info(f"  Job timeout: {settings.JOB_TIMEOUT}s")
-    logger.info(f"  MCP server: mounted at /mcp (SSE transport)")
-    logger.info(f"  Direct JSON-RPC handler: POST /mcp/sse (bypasses SSE for SimTheory)")
+    logger.info(f"  MCP SSE transport: GET /mcp/sse (standard clients)")
+    logger.info(f"  MCP JSON-RPC direct: POST /mcp/sse (SimTheory)")
     
     yield
     
@@ -115,7 +116,7 @@ app = FastAPI(
         "Execute code, manage files, query large datasets, "
         "and run long-running analysis jobs without timeouts."
     ),
-    version="1.0.5",
+    version="1.0.6",
     lifespan=lifespan,
     docs_url="/docs",
     redoc_url="/redoc",
@@ -124,7 +125,7 @@ app = FastAPI(
 # CORS (allow SimTheory.ai)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Railway handles security at network level
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -132,148 +133,159 @@ app.add_middleware(
 
 
 # =============================================================================
-# DIRECT JSON-RPC HANDLER for SimTheory
+# DIRECT MCP JSON-RPC HANDLER (for SimTheory)
 # =============================================================================
-# SimTheory's MCP client doesn't use the SSE transport properly. It sends
-# JSON-RPC messages via POST to /mcp/sse without maintaining an SSE stream.
+# SimTheory POSTs JSON-RPC to /mcp/sse without maintaining an SSE stream.
+# The SSE transport sends responses via the stream, not the HTTP body.
+# SimTheory expects the response IN the HTTP body.
 #
-# Instead of trying to proxy through the SSE transport (which requires a
-# persistent bidirectional connection), we handle JSON-RPC directly:
+# This handler bypasses the SSE transport entirely:
+# 1. Parses the JSON-RPC request
+# 2. Routes to the correct handler
+# 3. Calls tool functions directly
+# 4. Returns JSON-RPC response in the HTTP body
 #
-# 1. Parse the incoming JSON-RPC request
-# 2. Route to the appropriate handler (initialize, tools/list, tools/call)
-# 3. Call the MCP tool functions directly
-# 4. Return the JSON-RPC response on the POST response body
-#
-# This MUST be defined before app.mount("/mcp", ...) so FastAPI matches
-# this route before the mounted sub-application.
+# MUST be defined BEFORE app.mount("/mcp", ...) so FastAPI matches it first.
+# GET /mcp/sse still goes to the SSE transport for standard MCP clients.
 # =============================================================================
 
-# Build a registry of MCP tools from the mcp server object
-def _get_tool_registry():
-    """Build a dict of tool_name -> tool_function from the MCP server."""
+
+def _build_tool_schema(tool) -> dict:
+    """Build the JSON Schema for a tool's input parameters."""
+    # Try to get schema from the tool object first
+    if hasattr(tool, 'parameters') and tool.parameters:
+        return tool.parameters
+
+    # Fall back to building from function signature
+    fn = tool.fn if hasattr(tool, 'fn') else tool
+    if not callable(fn):
+        return {"type": "object", "properties": {}}
+
+    sig = inspect.signature(fn)
+    properties = {}
+    required = []
+
+    for param_name, param in sig.parameters.items():
+        if param_name in ('self', 'cls'):
+            continue
+
+        prop = {"type": "string"}
+        if param.annotation != inspect.Parameter.empty:
+            type_map = {
+                int: "integer",
+                float: "number",
+                bool: "boolean",
+                str: "string",
+            }
+            ann = param.annotation
+            # Handle Optional types
+            origin = getattr(ann, '__origin__', None)
+            if origin is not None:
+                args = getattr(ann, '__args__', ())
+                if args:
+                    ann = args[0]
+            prop["type"] = type_map.get(ann, "string")
+
+        if param.default != inspect.Parameter.empty:
+            if param.default is not None:
+                prop["default"] = param.default
+        else:
+            required.append(param_name)
+
+        properties[param_name] = prop
+
+    schema = {"type": "object", "properties": properties}
+    if required:
+        schema["required"] = required
+    return schema
+
+
+def _get_tool_registry() -> dict:
+    """Get all registered MCP tools as {name: tool_object}."""
     tools = {}
-    # FastMCP stores tools in _tool_manager
+    # FastMCP stores tools in _tool_manager._tools
     if hasattr(mcp, '_tool_manager') and hasattr(mcp._tool_manager, '_tools'):
         for name, tool in mcp._tool_manager._tools.items():
             tools[name] = tool
     return tools
 
 
-def _get_tools_list():
-    """Get the list of tools in MCP format for tools/list response."""
-    tools = []
+def _get_tools_list() -> list:
+    """Build the tools/list response array."""
+    result = []
     registry = _get_tool_registry()
     for name, tool in registry.items():
-        tool_info = {
+        desc = ""
+        if hasattr(tool, 'description'):
+            desc = tool.description or ""
+        elif hasattr(tool, 'fn') and tool.fn.__doc__:
+            desc = tool.fn.__doc__.strip()
+
+        result.append({
             "name": name,
-            "description": tool.description if hasattr(tool, 'description') else "",
-        }
-        # Get input schema
-        if hasattr(tool, 'parameters') and tool.parameters:
-            tool_info["inputSchema"] = tool.parameters
-        elif hasattr(tool, 'fn'):
-            # Try to build schema from function signature
-            import inspect
-            sig = inspect.signature(tool.fn)
-            properties = {}
-            required = []
-            for param_name, param in sig.parameters.items():
-                if param_name == 'self':
-                    continue
-                prop = {"type": "string"}  # default
-                if param.annotation != inspect.Parameter.empty:
-                    if param.annotation == int:
-                        prop = {"type": "integer"}
-                    elif param.annotation == float:
-                        prop = {"type": "number"}
-                    elif param.annotation == bool:
-                        prop = {"type": "boolean"}
-                    elif param.annotation == str:
-                        prop = {"type": "string"}
-                if param.default != inspect.Parameter.empty:
-                    prop["default"] = param.default
-                else:
-                    required.append(param_name)
-                # Use parameter description from docstring if available
-                properties[param_name] = prop
-            
-            tool_info["inputSchema"] = {
-                "type": "object",
-                "properties": properties,
-            }
-            if required:
-                tool_info["inputSchema"]["required"] = required
-        
-        tools.append(tool_info)
-    return tools
+            "description": desc,
+            "inputSchema": _build_tool_schema(tool),
+        })
+    return result
 
 
 @app.post("/mcp/sse")
 async def handle_mcp_jsonrpc(request: Request):
     """
-    Direct JSON-RPC handler for SimTheory MCP client.
-    
-    Handles MCP protocol messages without requiring SSE transport:
-    - initialize: Return server capabilities
-    - tools/list: Return available tools
-    - tools/call: Execute a tool and return result
-    - notifications/initialized: Acknowledge (no response needed)
-    - ping: Respond with pong
+    Direct MCP JSON-RPC handler for SimTheory.
+
+    Handles: initialize, notifications/initialized, tools/list,
+    tools/call, ping, and unknown methods.
     """
+    # --- Parse body ---
     try:
         body = await request.body()
-        logger.info(f"MCP JSON-RPC: received {len(body)} bytes")
-        logger.info(f"MCP JSON-RPC: body = {body.decode('utf-8', errors='replace')[:500]}")
-        
-        data = json.loads(body)
-    except (json.JSONDecodeError, Exception) as e:
-        logger.error(f"MCP JSON-RPC: failed to parse body: {e}")
-        return JSONResponse(
-            content={
-                "jsonrpc": "2.0",
-                "error": {"code": -32700, "message": "Parse error"},
-                "id": None
-            },
-            status_code=400,
-        )
-    
-    # Handle batch requests
+        body_str = body.decode("utf-8", errors="replace")
+        logger.info(f"MCP direct: received {len(body)} bytes")
+        logger.info(f"MCP direct: {body_str[:500]}")
+        data = json.loads(body_str)
+    except Exception as e:
+        logger.error(f"MCP direct: parse error: {e}")
+        return JSONResponse(content={
+            "jsonrpc": "2.0",
+            "error": {"code": -32700, "message": f"Parse error: {e}"},
+            "id": None,
+        }, status_code=400)
+
+    # --- Batch ---
     if isinstance(data, list):
         responses = []
         for item in data:
-            resp = await _handle_single_jsonrpc(item)
-            if resp is not None:  # Notifications don't get responses
-                responses.append(resp)
+            r = await _handle_single_jsonrpc(item)
+            if r is not None:
+                responses.append(r)
         if responses:
             return JSONResponse(content=responses)
         return Response(status_code=204)
-    
-    # Handle single request
+
+    # --- Single ---
     result = await _handle_single_jsonrpc(data)
     if result is None:
-        # Notification - no response
         return Response(status_code=204)
-    
     return JSONResponse(content=result)
 
 
-async def _handle_single_jsonrpc(data: dict) -> dict | None:
-    """Handle a single JSON-RPC message and return the response dict."""
+async def _handle_single_jsonrpc(data: dict):
+    """Route a single JSON-RPC message. Returns dict or None for notifications."""
     method = data.get("method", "")
     msg_id = data.get("id")
     params = data.get("params", {})
-    
-    logger.info(f"MCP JSON-RPC: method={method}, id={msg_id}")
-    
-    # --- NOTIFICATIONS (no response expected) ---
+
+    logger.info(f"MCP direct: method={method}  id={msg_id}")
+
+    # ---- Notifications (no id or notification method) ----
     if msg_id is None or method.startswith("notifications/"):
-        logger.info(f"MCP JSON-RPC: notification '{method}' acknowledged")
+        logger.info(f"MCP direct: notification '{method}' ack")
         return None
-    
-    # --- INITIALIZE ---
+
+    # ---- initialize ----
     if method == "initialize":
-        logger.info("MCP JSON-RPC: handling initialize")
+        logger.info("MCP direct: -> initialize response")
         return {
             "jsonrpc": "2.0",
             "id": msg_id,
@@ -284,100 +296,84 @@ async def _handle_single_jsonrpc(data: dict) -> dict | None:
                 },
                 "serverInfo": {
                     "name": "Power Interpreter",
-                    "version": "1.0.5",
+                    "version": "1.0.6",
                 },
-            }
+            },
         }
-    
-    # --- PING ---
+
+    # ---- ping ----
     if method == "ping":
-        return {
-            "jsonrpc": "2.0",
-            "id": msg_id,
-            "result": {}
-        }
-    
-    # --- TOOLS/LIST ---
+        return {"jsonrpc": "2.0", "id": msg_id, "result": {}}
+
+    # ---- tools/list ----
     if method == "tools/list":
-        logger.info("MCP JSON-RPC: handling tools/list")
         tools = _get_tools_list()
-        logger.info(f"MCP JSON-RPC: returning {len(tools)} tools")
+        logger.info(f"MCP direct: -> {len(tools)} tools")
+        for t in tools:
+            logger.info(f"  tool: {t['name']}")
         return {
             "jsonrpc": "2.0",
             "id": msg_id,
-            "result": {
-                "tools": tools
-            }
+            "result": {"tools": tools},
         }
-    
-    # --- TOOLS/CALL ---
+
+    # ---- tools/call ----
     if method == "tools/call":
         tool_name = params.get("name", "")
         tool_args = params.get("arguments", {})
-        
-        logger.info(f"MCP JSON-RPC: calling tool '{tool_name}' with args: {json.dumps(tool_args)[:200]}")
-        
+        logger.info(f"MCP direct: -> tools/call '{tool_name}' args={json.dumps(tool_args)[:300]}")
+
         registry = _get_tool_registry()
-        
         if tool_name not in registry:
-            logger.error(f"MCP JSON-RPC: tool '{tool_name}' not found")
+            logger.error(f"MCP direct: tool '{tool_name}' not found. Available: {list(registry.keys())}")
             return {
                 "jsonrpc": "2.0",
                 "id": msg_id,
-                "error": {
-                    "code": -32601,
-                    "message": f"Tool not found: {tool_name}"
-                }
+                "error": {"code": -32601, "message": f"Tool not found: {tool_name}"},
             }
-        
+
         try:
             tool = registry[tool_name]
-            # Call the tool function directly
             fn = tool.fn if hasattr(tool, 'fn') else tool
+            logger.info(f"MCP direct: invoking {tool_name}...")
             result = await fn(**tool_args)
-            
-            logger.info(f"MCP JSON-RPC: tool '{tool_name}' returned {len(str(result))} chars")
-            
-            # Format as MCP tool result
-            # MCP expects content as an array of content blocks
+            result_str = str(result)
+            logger.info(f"MCP direct: {tool_name} returned {len(result_str)} chars")
+            logger.info(f"MCP direct: result preview: {result_str[:300]}")
+
+            # Format as MCP content blocks
             if isinstance(result, str):
                 content = [{"type": "text", "text": result}]
             elif isinstance(result, dict):
                 content = [{"type": "text", "text": json.dumps(result)}]
             elif isinstance(result, list):
-                content = result  # Assume already formatted
+                content = result
             else:
-                content = [{"type": "text", "text": str(result)}]
-            
+                content = [{"type": "text", "text": result_str}]
+
             return {
                 "jsonrpc": "2.0",
                 "id": msg_id,
-                "result": {
-                    "content": content,
-                    "isError": False
-                }
+                "result": {"content": content, "isError": False},
             }
-            
+
         except Exception as e:
-            logger.error(f"MCP JSON-RPC: tool '{tool_name}' failed: {e}", exc_info=True)
+            logger.error(f"MCP direct: {tool_name} error: {e}", exc_info=True)
             return {
                 "jsonrpc": "2.0",
                 "id": msg_id,
                 "result": {
-                    "content": [{"type": "text", "text": f"Error: {str(e)}"}],
-                    "isError": True
-                }
+                    "content": [{"type": "text", "text": f"Error executing {tool_name}: {e}"}],
+                    "isError": True,
+                },
             }
-    
-    # --- UNKNOWN METHOD ---
-    logger.warning(f"MCP JSON-RPC: unknown method '{method}'")
+
+    # ---- Unknown method ----
+    logger.warning(f"MCP direct: unknown method '{method}'")
     return {
         "jsonrpc": "2.0",
         "id": msg_id,
-        "error": {
-            "code": -32601,
-            "message": f"Method not found: {method}"
-        }
+        "error": {"code": -32601, "message": f"Method not found: {method}"},
     }
 
 
@@ -386,37 +382,37 @@ app.include_router(health.router, tags=["Health"])
 
 # --- PROTECTED ROUTES (API key required) ---
 app.include_router(
-    execute.router, 
-    prefix="/api", 
+    execute.router,
+    prefix="/api",
     tags=["Execute"],
-    dependencies=[Depends(verify_api_key)]
+    dependencies=[Depends(verify_api_key)],
 )
 app.include_router(
-    jobs.router, 
-    prefix="/api", 
+    jobs.router,
+    prefix="/api",
     tags=["Jobs"],
-    dependencies=[Depends(verify_api_key)]
+    dependencies=[Depends(verify_api_key)],
 )
 app.include_router(
-    files.router, 
-    prefix="/api", 
+    files.router,
+    prefix="/api",
     tags=["Files"],
-    dependencies=[Depends(verify_api_key)]
+    dependencies=[Depends(verify_api_key)],
 )
 app.include_router(
-    data.router, 
-    prefix="/api", 
+    data.router,
+    prefix="/api",
     tags=["Data"],
-    dependencies=[Depends(verify_api_key)]
+    dependencies=[Depends(verify_api_key)],
 )
 app.include_router(
-    sessions.router, 
-    prefix="/api", 
+    sessions.router,
+    prefix="/api",
     tags=["Sessions"],
-    dependencies=[Depends(verify_api_key)]
+    dependencies=[Depends(verify_api_key)],
 )
 
-# --- MCP SERVER (SSE transport - kept for standard MCP clients) ---
-# The SSE transport still works for clients that use it properly.
-# SimTheory uses the direct JSON-RPC handler above instead.
+# --- MCP SSE TRANSPORT (for standard MCP clients) ---
+# Still available at GET /mcp/sse for clients that use SSE properly.
+# POST /mcp/sse is intercepted by the direct handler above.
 app.mount("/mcp", mcp.sse_app())

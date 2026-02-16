@@ -20,12 +20,9 @@ COPY . .
 # Create sandbox directories
 RUN mkdir -p /app/sandbox_data /app/uploads /app/temp /app/logs
 
-# Expose port (Railway sets PORT dynamically)
+# Expose port
 EXPOSE 8000
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
-    CMD curl -f http://localhost:${PORT:-8000}/health || exit 1
-
+# No healthcheck in Dockerfile - Railway handles it via railway.toml
 # Use Python start script to properly read PORT env var
 CMD ["python", "start.py"]

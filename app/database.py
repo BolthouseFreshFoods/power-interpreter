@@ -2,13 +2,15 @@
 
 PostgreSQL connection management with async SQLAlchemy.
 Railway provides DATABASE_URL automatically when Postgres is attached.
+
+Gracefully handles missing database (app still starts for health checks).
 """
 
+import logging
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
 from sqlalchemy import text
 from app.config import settings
-import logging
 
 logger = logging.getLogger(__name__)
 
@@ -27,11 +29,15 @@ def get_engine():
     """Get or create async engine"""
     global _engine
     if _engine is None:
+        db_url = settings.async_database_url
+        if not db_url or 'None' in db_url:
+            raise RuntimeError("DATABASE_URL not configured")
+        
         _engine = create_async_engine(
-            settings.async_database_url,
+            db_url,
             echo=False,
-            pool_size=10,
-            max_overflow=20,
+            pool_size=5,
+            max_overflow=10,
             pool_timeout=30,
             pool_recycle=1800,
             pool_pre_ping=True,
@@ -60,6 +66,9 @@ async def get_session() -> AsyncSession:
 
 async def init_database():
     """Initialize database - create all tables"""
+    # Import models to register them with Base
+    from app import models  # noqa: F401
+    
     engine = get_engine()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -68,8 +77,8 @@ async def init_database():
 
 async def check_database():
     """Health check - verify database connection"""
-    engine = get_engine()
     try:
+        engine = get_engine()
         async with engine.connect() as conn:
             result = await conn.execute(text("SELECT 1"))
             return result.scalar() == 1

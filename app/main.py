@@ -11,11 +11,12 @@ Features:
 - Pre-installed data science libraries
 
 Author: Kaffer AI for Timothy Escamilla
-Version: 1.0.2
+Version: 1.0.4
 """
 
 import logging
 import asyncio
+import re
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Depends, Request
 from fastapi.responses import Response
@@ -35,13 +36,85 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# =============================================================================
+# SESSION CACHE for SSE proxy
+# =============================================================================
+# We cache the session_id so we don't have to open a new SSE connection
+# for every single POST from SimTheory. Sessions are created on first
+# request and reused until they expire or fail.
+# =============================================================================
+_cached_session_id = None
+_session_lock = asyncio.Lock()
+
+
+async def _get_or_create_session_id() -> str:
+    """
+    Get a cached session_id or create a new one by connecting to the
+    SSE endpoint and reading the 'endpoint' event.
+    
+    The SSE endpoint sends:
+        event: endpoint
+        data: /messages/?session_id=<uuid>
+    
+    We parse the session_id from that data line.
+    """
+    global _cached_session_id
+    
+    if _cached_session_id:
+        logger.info(f"SSE proxy: using cached session_id={_cached_session_id}")
+        return _cached_session_id
+    
+    async with _session_lock:
+        # Double-check after acquiring lock
+        if _cached_session_id:
+            return _cached_session_id
+        
+        port = 8080
+        sse_url = f"http://127.0.0.1:{port}/mcp/sse"
+        
+        logger.info(f"SSE proxy: creating new session via GET {sse_url}")
+        
+        try:
+            async with httpx.AsyncClient() as client:
+                # Stream the SSE response - we just need the first few events
+                async with client.stream("GET", sse_url, timeout=10.0) as response:
+                    buffer = ""
+                    async for chunk in response.aiter_text():
+                        buffer += chunk
+                        logger.info(f"SSE proxy: received SSE data chunk: {repr(chunk[:200])}")
+                        
+                        # Look for the endpoint event with session_id
+                        # Format: event: endpoint\ndata: /messages/?session_id=<uuid>\n\n
+                        match = re.search(r'session_id=([a-f0-9-]+)', buffer)
+                        if match:
+                            _cached_session_id = match.group(1)
+                            logger.info(f"SSE proxy: extracted session_id={_cached_session_id}")
+                            return _cached_session_id
+                        
+                        # Safety: don't read forever
+                        if len(buffer) > 4096:
+                            logger.error("SSE proxy: read 4KB without finding session_id")
+                            break
+                            
+        except Exception as e:
+            logger.error(f"SSE proxy: failed to create session: {e}")
+        
+        return None
+
+
+async def _invalidate_session():
+    """Clear the cached session so next request creates a new one."""
+    global _cached_session_id
+    _cached_session_id = None
+    logger.info("SSE proxy: session cache invalidated")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifecycle management"""
     # --- STARTUP ---
     logger.info("="*60)
-    logger.info("Power Interpreter MCP v1.0.2 starting...")
+    logger.info("Power Interpreter MCP v1.0.4 starting...")
     logger.info("="*60)
     
     # Ensure directories exist
@@ -75,7 +148,7 @@ async def lifespan(app: FastAPI):
     logger.info(f"  Max concurrent jobs: {settings.MAX_CONCURRENT_JOBS}")
     logger.info(f"  Job timeout: {settings.JOB_TIMEOUT}s")
     logger.info(f"  MCP server: mounted at /mcp (SSE transport)")
-    logger.info(f"  SSE POST proxy: enabled (POST /mcp/sse -> /mcp/messages/)")
+    logger.info(f"  SSE POST proxy: v2 with auto-session (POST /mcp/sse -> /mcp/messages/)")
     
     yield
     
@@ -115,7 +188,7 @@ app = FastAPI(
         "Execute code, manage files, query large datasets, "
         "and run long-running analysis jobs without timeouts."
     ),
-    version="1.0.2",
+    version="1.0.4",
     lifespan=lifespan,
     docs_url="/docs",
     redoc_url="/redoc",
@@ -132,14 +205,17 @@ app.add_middleware(
 
 
 # =============================================================================
-# SSE POST PROXY - Fix for SimTheory MCP client compatibility
+# SSE POST PROXY v2 - Auto-session for SimTheory MCP client
 # =============================================================================
-# SimTheory's MCP client POSTs tool call messages back to the same URL it
-# connected to (POST /mcp/sse) instead of reading the 'endpoint' event from
-# the SSE stream and POSTing to /mcp/messages/?session_id=xxx.
+# SimTheory's MCP client POSTs to /mcp/sse WITHOUT a session_id.
+# The MCP SDK requires session_id on /mcp/messages/.
 #
-# This proxy intercepts POST /mcp/sse and forwards the request internally
-# to /mcp/messages/ with the same query parameters and body.
+# This proxy:
+# 1. Creates an SSE session by connecting to GET /mcp/sse internally
+# 2. Extracts the session_id from the 'endpoint' event
+# 3. Caches the session_id for reuse
+# 4. Forwards the POST to /mcp/messages/?session_id=xxx
+# 5. If the session expires (400/404), creates a new one and retries
 #
 # This MUST be defined before app.mount("/mcp", ...) so FastAPI matches
 # this route before the mounted sub-application.
@@ -148,31 +224,34 @@ app.add_middleware(
 @app.post("/mcp/sse")
 async def proxy_mcp_sse_post(request: Request):
     """
-    Proxy POST /mcp/sse -> /mcp/messages/ for SimTheory compatibility.
+    Proxy POST /mcp/sse -> /mcp/messages/?session_id=xxx
     
-    SimTheory sends MCP JSON-RPC messages (tool calls, initialize, etc.)
-    to POST /mcp/sse instead of POST /mcp/messages/. This handler
-    forwards those requests to the correct MCP message endpoint.
+    Automatically creates and caches SSE sessions for SimTheory compatibility.
     """
-    # Read the incoming request
     body = await request.body()
-    query_string = str(request.url.query)
     
-    # Build the target URL - forward to /mcp/messages/ with same query params
-    target_path = f"/mcp/messages/"
-    if query_string:
-        target_path = f"{target_path}?{query_string}"
-    
-    # Get the port from the server
-    port = settings.PORT if hasattr(settings, 'PORT') else 8080
-    base_url = f"http://127.0.0.1:{port}"
-    target_url = f"{base_url}{target_path}"
-    
-    logger.info(f"SSE POST proxy: forwarding POST /mcp/sse -> {target_path}")
-    logger.info(f"  Query params: {query_string}")
+    logger.info(f"SSE POST proxy v2: received POST /mcp/sse")
     logger.info(f"  Body length: {len(body)} bytes")
+    logger.info(f"  Body preview: {body[:200]}")
     
-    # Forward headers (pass through content-type and other relevant headers)
+    # Get or create a session
+    session_id = await _get_or_create_session_id()
+    
+    if not session_id:
+        logger.error("SSE POST proxy: failed to obtain session_id")
+        return Response(
+            content=b'{"jsonrpc":"2.0","error":{"code":-32603,"message":"Failed to create MCP session"},"id":null}',
+            status_code=500,
+            media_type="application/json",
+        )
+    
+    # Forward to /mcp/messages/ with session_id
+    port = 8080
+    target_url = f"http://127.0.0.1:{port}/mcp/messages/?session_id={session_id}"
+    
+    logger.info(f"SSE POST proxy v2: forwarding to {target_url}")
+    
+    # Forward headers
     forward_headers = {}
     if "content-type" in request.headers:
         forward_headers["content-type"] = request.headers["content-type"]
@@ -185,36 +264,59 @@ async def proxy_mcp_sse_post(request: Request):
                 target_url,
                 content=body,
                 headers=forward_headers,
-                timeout=30.0,
+                timeout=60.0,
             )
         
-        logger.info(f"SSE POST proxy: response status={response.status_code}")
+        logger.info(f"SSE POST proxy v2: response status={response.status_code}")
+        logger.info(f"SSE POST proxy v2: response body={response.text[:500]}")
         
-        # Return the response from the MCP message handler
+        # If session expired or invalid, invalidate cache and retry once
+        if response.status_code in (400, 404):
+            logger.warning("SSE POST proxy v2: session may be expired, retrying with new session")
+            await _invalidate_session()
+            
+            # Get a fresh session
+            new_session_id = await _get_or_create_session_id()
+            if new_session_id:
+                retry_url = f"http://127.0.0.1:{port}/mcp/messages/?session_id={new_session_id}"
+                logger.info(f"SSE POST proxy v2: retrying with {retry_url}")
+                
+                async with httpx.AsyncClient() as client2:
+                    response = await client2.post(
+                        retry_url,
+                        content=body,
+                        headers=forward_headers,
+                        timeout=60.0,
+                    )
+                
+                logger.info(f"SSE POST proxy v2: retry response status={response.status_code}")
+                logger.info(f"SSE POST proxy v2: retry response body={response.text[:500]}")
+        
         return Response(
             content=response.content,
             status_code=response.status_code,
             headers=dict(response.headers),
             media_type=response.headers.get("content-type"),
         )
+        
     except httpx.ConnectError as e:
-        logger.error(f"SSE POST proxy: connection error: {e}")
+        logger.error(f"SSE POST proxy v2: connection error: {e}")
         return Response(
-            content=b'{"error": "Internal proxy connection failed"}',
+            content=b'{"jsonrpc":"2.0","error":{"code":-32603,"message":"Internal proxy connection failed"},"id":null}',
             status_code=502,
             media_type="application/json",
         )
     except httpx.TimeoutException as e:
-        logger.error(f"SSE POST proxy: timeout: {e}")
+        logger.error(f"SSE POST proxy v2: timeout: {e}")
         return Response(
-            content=b'{"error": "Internal proxy timeout"}',
+            content=b'{"jsonrpc":"2.0","error":{"code":-32603,"message":"Internal proxy timeout"},"id":null}',
             status_code=504,
             media_type="application/json",
         )
     except Exception as e:
-        logger.error(f"SSE POST proxy: unexpected error: {e}")
+        logger.error(f"SSE POST proxy v2: unexpected error: {e}")
         return Response(
-            content=b'{"error": "Internal proxy error"}',
+            content=b'{"jsonrpc":"2.0","error":{"code":-32603,"message":"Internal proxy error"},"id":null}',
             status_code=500,
             media_type="application/json",
         )

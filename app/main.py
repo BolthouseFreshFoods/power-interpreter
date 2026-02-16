@@ -11,14 +11,16 @@ Features:
 - Pre-installed data science libraries
 
 Author: Kaffer AI for Timothy Escamilla
-Version: 1.0.1
+Version: 1.0.2
 """
 
 import logging
 import asyncio
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Depends
+from fastapi import FastAPI, Depends, Request
+from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
+import httpx
 
 from app.config import settings
 from app.auth import verify_api_key
@@ -39,7 +41,7 @@ async def lifespan(app: FastAPI):
     """Application lifecycle management"""
     # --- STARTUP ---
     logger.info("="*60)
-    logger.info("Power Interpreter MCP v1.0.1 starting...")
+    logger.info("Power Interpreter MCP v1.0.2 starting...")
     logger.info("="*60)
     
     # Ensure directories exist
@@ -73,6 +75,7 @@ async def lifespan(app: FastAPI):
     logger.info(f"  Max concurrent jobs: {settings.MAX_CONCURRENT_JOBS}")
     logger.info(f"  Job timeout: {settings.JOB_TIMEOUT}s")
     logger.info(f"  MCP server: mounted at /mcp (SSE transport)")
+    logger.info(f"  SSE POST proxy: enabled (POST /mcp/sse -> /mcp/messages/)")
     
     yield
     
@@ -112,7 +115,7 @@ app = FastAPI(
         "Execute code, manage files, query large datasets, "
         "and run long-running analysis jobs without timeouts."
     ),
-    version="1.0.1",
+    version="1.0.2",
     lifespan=lifespan,
     docs_url="/docs",
     redoc_url="/redoc",
@@ -126,6 +129,96 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# =============================================================================
+# SSE POST PROXY - Fix for SimTheory MCP client compatibility
+# =============================================================================
+# SimTheory's MCP client POSTs tool call messages back to the same URL it
+# connected to (POST /mcp/sse) instead of reading the 'endpoint' event from
+# the SSE stream and POSTing to /mcp/messages/?session_id=xxx.
+#
+# This proxy intercepts POST /mcp/sse and forwards the request internally
+# to /mcp/messages/ with the same query parameters and body.
+#
+# This MUST be defined before app.mount("/mcp", ...) so FastAPI matches
+# this route before the mounted sub-application.
+# =============================================================================
+
+@app.post("/mcp/sse")
+async def proxy_mcp_sse_post(request: Request):
+    """
+    Proxy POST /mcp/sse -> /mcp/messages/ for SimTheory compatibility.
+    
+    SimTheory sends MCP JSON-RPC messages (tool calls, initialize, etc.)
+    to POST /mcp/sse instead of POST /mcp/messages/. This handler
+    forwards those requests to the correct MCP message endpoint.
+    """
+    # Read the incoming request
+    body = await request.body()
+    query_string = str(request.url.query)
+    
+    # Build the target URL - forward to /mcp/messages/ with same query params
+    target_path = f"/mcp/messages/"
+    if query_string:
+        target_path = f"{target_path}?{query_string}"
+    
+    # Get the port from the server
+    port = settings.PORT if hasattr(settings, 'PORT') else 8080
+    base_url = f"http://127.0.0.1:{port}"
+    target_url = f"{base_url}{target_path}"
+    
+    logger.info(f"SSE POST proxy: forwarding POST /mcp/sse -> {target_path}")
+    logger.info(f"  Query params: {query_string}")
+    logger.info(f"  Body length: {len(body)} bytes")
+    
+    # Forward headers (pass through content-type and other relevant headers)
+    forward_headers = {}
+    if "content-type" in request.headers:
+        forward_headers["content-type"] = request.headers["content-type"]
+    if "accept" in request.headers:
+        forward_headers["accept"] = request.headers["accept"]
+    
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                target_url,
+                content=body,
+                headers=forward_headers,
+                timeout=30.0,
+            )
+        
+        logger.info(f"SSE POST proxy: response status={response.status_code}")
+        
+        # Return the response from the MCP message handler
+        return Response(
+            content=response.content,
+            status_code=response.status_code,
+            headers=dict(response.headers),
+            media_type=response.headers.get("content-type"),
+        )
+    except httpx.ConnectError as e:
+        logger.error(f"SSE POST proxy: connection error: {e}")
+        return Response(
+            content=b'{"error": "Internal proxy connection failed"}',
+            status_code=502,
+            media_type="application/json",
+        )
+    except httpx.TimeoutException as e:
+        logger.error(f"SSE POST proxy: timeout: {e}")
+        return Response(
+            content=b'{"error": "Internal proxy timeout"}',
+            status_code=504,
+            media_type="application/json",
+        )
+    except Exception as e:
+        logger.error(f"SSE POST proxy: unexpected error: {e}")
+        return Response(
+            content=b'{"error": "Internal proxy error"}',
+            status_code=500,
+            media_type="application/json",
+        )
+
 
 # --- PUBLIC ROUTES (no auth) ---
 app.include_router(health.router, tags=["Health"])
@@ -166,4 +259,8 @@ app.include_router(
 # Mount the FastMCP SSE app at /mcp for MCP protocol support
 # This provides: tool discovery, tool execution, SSE streaming
 # Requires mcp>=1.6.0 for sse_app() support
+#
+# NOTE: The POST /mcp/sse proxy route above MUST be defined before this mount.
+# FastAPI checks explicit routes before mounted sub-applications, so the proxy
+# will intercept POST /mcp/sse while GET /mcp/sse still goes to the SSE app.
 app.mount("/mcp", mcp.sse_app())

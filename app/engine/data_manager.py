@@ -9,6 +9,7 @@ Manages large datasets in PostgreSQL:
 This is the key component for handling large data that won't fit in memory.
 """
 
+import os
 import uuid
 import logging
 from pathlib import Path
@@ -23,6 +24,63 @@ from app.models import Dataset
 from app.database import get_engine, get_session_factory
 
 logger = logging.getLogger(__name__)
+
+
+def resolve_file_path(file_path: str) -> str:
+    """Resolve a file path by searching multiple locations.
+    
+    The MCP client may pass paths like:
+      - 'intercompany_accounts.csv'
+      - 'default/intercompany_accounts.csv'
+    
+    But the actual file lives in the sandbox directory.
+    This function tries multiple candidate paths and returns
+    the first one that exists.
+    """
+    from app.config import settings as cfg
+    
+    raw_path = Path(file_path)
+    filename = raw_path.name
+    
+    # Build list of candidate paths to try
+    candidates = [
+        raw_path,                                          # As-is (absolute or relative)
+        cfg.SANDBOX_DIR / file_path,                       # /app/sandbox_data/default/file.csv
+        cfg.SANDBOX_DIR / "default" / filename,            # /app/sandbox_data/default/file.csv
+        cfg.SANDBOX_DIR / filename,                        # /app/sandbox_data/file.csv
+        cfg.UPLOAD_DIR / file_path,                        # /app/uploads/default/file.csv
+        cfg.UPLOAD_DIR / filename,                         # /app/uploads/file.csv
+    ]
+    
+    # Also walk the sandbox directory for the file
+    sandbox_root = cfg.SANDBOX_DIR
+    if sandbox_root.exists():
+        for root, dirs, files in os.walk(sandbox_root):
+            if filename in files:
+                candidates.append(Path(root) / filename)
+    
+    # Try each candidate
+    for candidate in candidates:
+        resolved = Path(candidate)
+        if resolved.exists() and resolved.is_file():
+            logger.info(f"Resolved file path: {file_path} -> {resolved}")
+            return str(resolved)
+    
+    # Log all candidates for debugging
+    logger.error(f"Could not resolve file path: {file_path}")
+    logger.error(f"Tried candidates: {[str(c) for c in candidates]}")
+    logger.error(f"SANDBOX_DIR={cfg.SANDBOX_DIR}, exists={cfg.SANDBOX_DIR.exists()}")
+    if cfg.SANDBOX_DIR.exists():
+        try:
+            all_files = list(cfg.SANDBOX_DIR.rglob('*'))
+            logger.error(f"Files in sandbox: {[str(f) for f in all_files[:20]]}")
+        except Exception:
+            pass
+    
+    raise FileNotFoundError(
+        f"File not found: {file_path}. "
+        f"Searched: {[str(c) for c in candidates]}"
+    )
 
 
 class DataManager:
@@ -49,7 +107,7 @@ class DataManager:
         Handles files with 1.5M+ rows by loading in chunks.
         
         Args:
-            file_path: Path to CSV file
+            file_path: Path to CSV file (can be relative - will be resolved)
             dataset_name: Logical name for the dataset
             session_id: Session to associate with
             delimiter: CSV delimiter
@@ -60,6 +118,15 @@ class DataManager:
         Returns:
             Dataset metadata dict
         """
+        # ============================================================
+        # FIX: Resolve file path against sandbox directory
+        # The MCP client passes relative paths, but the file lives
+        # in /app/sandbox_data/default/ or similar.
+        # ============================================================
+        resolved_path = resolve_file_path(file_path)
+        logger.info(f"Resolved '{file_path}' -> '{resolved_path}'")
+        file_path = resolved_path  # Use resolved path for everything below
+        
         dataset_id = str(uuid.uuid4())
         table_name = f"{self.TABLE_PREFIX}{dataset_id.replace('-', '_')}"
         

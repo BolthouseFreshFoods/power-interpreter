@@ -34,6 +34,34 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _get_mcp_app():
+    """Get the MCP ASGI app, trying multiple methods for compatibility.
+    
+    Different versions of the mcp package expose different methods:
+    - mcp >= 1.8: streamable_http_app()
+    - mcp >= 1.0: sse_app() 
+    - older: get_asgi_app()
+    """
+    # Try streamable_http_app first (mcp >= 1.8)
+    if hasattr(mcp, 'streamable_http_app'):
+        logger.info("MCP: using streamable_http_app()")
+        return mcp.streamable_http_app()
+    
+    # Try sse_app (mcp >= 1.0)
+    if hasattr(mcp, 'sse_app'):
+        logger.info("MCP: using sse_app()")
+        return mcp.sse_app()
+    
+    # Try get_asgi_app (older versions)
+    if hasattr(mcp, 'get_asgi_app'):
+        logger.info("MCP: using get_asgi_app()")
+        return mcp.get_asgi_app()
+    
+    # Last resort - try as ASGI app directly
+    logger.warning("MCP: no known app method found, attempting direct mount")
+    return mcp
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifecycle management"""
@@ -164,5 +192,6 @@ app.include_router(
 
 # --- MCP SERVER (SimTheory.ai tool discovery & execution) ---
 # Mount the FastMCP server so SimTheory can discover and call all 10 tools
-# This handles the MCP protocol: tool listing, tool execution, streaming
-app.mount("/mcp", mcp.streamable_http_app())
+# Uses compatibility wrapper to support multiple mcp package versions
+mcp_app = _get_mcp_app()
+app.mount("/mcp", mcp_app)

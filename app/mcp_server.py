@@ -16,10 +16,29 @@ MCP Tools (12):
 - list_datasets: List loaded datasets
 - create_session: Create workspace session
 
-Version: 1.4.0 - Inline chart rendering support
-                 Images returned as markdown ![alt](url) in text response
-                 AND as MCP Image content blocks for maximum compatibility
-                 Non-image files still use plain text download links
+Version: 1.5.0 - Return MCP content blocks (not JSON blobs)
+                 
+CRITICAL FIX: Previously, execute_code returned a JSON string containing
+the full ExecutionResult. main.py wrapped this in a single text block:
+  {"type": "text", "text": "{\"success\":true,\"stdout\":\"...![chart](url)...\"}"}
+
+SimTheory's AI had to mentally parse JSON to find image URLs buried inside.
+Charts and download links were invisible to the user.
+
+NEW APPROACH: execute_code now returns a LIST of MCP content blocks:
+  [
+    {"type": "text", "text": "DataFrame output here..."},
+    {"type": "text", "text": "![chart 001](https://...chart_001.png)"},
+    {"type": "text", "text": "📎 Download: team_performance.xlsx (6.0 KB)\nhttps://..."},
+    {"type": "text", "text": "Session: 3 variables persisted. Execution: 98ms."}
+  ]
+
+main.py's tools/call handler already handles list returns:
+  elif isinstance(result, list):
+      content = result
+
+This means each image URL and download link is a SEPARATE, PROMINENT
+content block that SimTheory's AI can easily surface to the user.
 """
 
 from mcp.server.fastmcp import FastMCP
@@ -50,66 +69,83 @@ def _headers():
     return {"X-API-Key": API_KEY, "Content-Type": "application/json"}
 
 
-def _reformat_execution_response(resp_text: str) -> str:
-    """Reformat execute_code response for SimTheory consumption.
+def _build_content_blocks(resp_text: str) -> list:
+    """Build MCP content blocks from execute_code API response.
     
-    Handles three types of generated content:
+    Returns a LIST of content blocks, not a JSON string.
+    main.py's tools/call handler will use these directly:
+      isinstance(result, list) → content = result
     
-    1. INLINE IMAGES (charts, plots):
-       - Formatted as markdown: ![alt text](url)
-       - Placed prominently so the AI agent renders them in chat
-       - Also strips from download_urls to avoid duplicate links
-    
-    2. DOWNLOAD FILES (xlsx, csv, pdf):
-       - Formatted as plain text URLs (not structured JSON)
-       - Prevents SimTheory's broken download widget
-    
-    3. MIXED (charts + files):
-       - Images rendered inline, files as download links
+    Content blocks:
+    1. Text block with stdout (the main output)
+    2. Separate text block for EACH inline image (markdown format)
+    3. Separate text block for download links
+    4. Metadata block (execution time, variables, errors)
     """
     try:
         data = json.loads(resp_text)
     except (json.JSONDecodeError, TypeError):
-        return resp_text
+        return [{"type": "text", "text": resp_text}]
+    
+    blocks = []
     
     # ================================================================
-    # Handle inline images (charts, plots)
+    # Block 1: Main output (stdout)
+    # Strip any previously appended URL sections from executor
     # ================================================================
-    inline_images = data.get('inline_images', [])
-    download_urls = data.get('download_urls', [])
+    stdout = data.get('stdout', '')
     
-    # Build the response text sections
-    current_stdout = data.get('stdout', '')
-    
-    # Remove any previously appended sections from executor
-    # (we'll rebuild them here with better formatting)
+    # Remove executor-appended sections (we handle them separately)
     for marker in [
         '\n\nGenerated files ready for download:',
         '\n\nGenerated charts:',
     ]:
-        idx = current_stdout.find(marker)
+        idx = stdout.find(marker)
         if idx >= 0:
-            current_stdout = current_stdout[:idx]
+            stdout = stdout[:idx]
+    
+    stdout = stdout.strip()
+    
+    if stdout:
+        blocks.append({"type": "text", "text": stdout})
     
     # ================================================================
-    # Section 1: Inline images as markdown
+    # Block 2: Error information (if execution failed)
     # ================================================================
-    if inline_images:
-        image_section = "\n\n"
-        for img in inline_images:
-            alt = img.get('alt_text', 'chart')
-            url = img.get('url', '')
-            image_section += f"![{alt}]({url})\n\n"
-        
-        current_stdout = current_stdout + image_section
-        
-        logger.info(f"Formatted {len(inline_images)} inline images as markdown")
+    if not data.get('success', False):
+        error_msg = data.get('error_message', 'Unknown error')
+        error_tb = data.get('error_traceback', '')
+        error_text = f"⚠️ Execution Error: {error_msg}"
+        if error_tb:
+            # Trim traceback to last 500 chars for readability
+            if len(error_tb) > 500:
+                error_tb = "..." + error_tb[-500:]
+            error_text += f"\n\nTraceback:\n{error_tb}"
+        blocks.append({"type": "text", "text": error_text})
     
     # ================================================================
-    # Section 2: Non-image download links as plain text
+    # Block 3: Inline images — EACH as its own content block
+    # This makes them maximally visible to the AI agent
     # ================================================================
-    # Get non-image downloads (exclude files that are already inline images)
+    inline_images = data.get('inline_images', [])
+    
+    for img in inline_images:
+        alt = img.get('alt_text', 'Generated chart')
+        url = img.get('url', '')
+        if url:
+            # Each image is its own block so the AI can't miss it
+            blocks.append({
+                "type": "text",
+                "text": f"![{alt}]({url})"
+            })
+            logger.info(f"Content block: inline image {alt} -> {url}")
+    
+    # ================================================================
+    # Block 4: Download links for non-image files
+    # ================================================================
+    download_urls = data.get('download_urls', [])
     image_filenames = {img.get('filename', '') for img in inline_images}
+    
     non_image_downloads = [
         d for d in download_urls
         if d.get('filename', '') not in image_filenames
@@ -117,45 +153,59 @@ def _reformat_execution_response(resp_text: str) -> str:
     ]
     
     if non_image_downloads:
-        download_text = "\n" + "=" * 50 + "\n"
-        download_text += "DOWNLOAD LINKS (copy URL or click):\n"
-        download_text += "=" * 50 + "\n"
+        download_lines = []
         for info in non_image_downloads:
             filename = info.get('filename', 'file')
             url = info.get('url', '')
             size = info.get('size', '')
-            download_text += f"\n  {filename} ({size})\n"
-            download_text += f"  {url}\n"
-        download_text += "\n" + "=" * 50
+            download_lines.append(f"📎 **{filename}** ({size})")
+            download_lines.append(f"Download: {url}")
+            download_lines.append("")
         
-        current_stdout = current_stdout + download_text
+        blocks.append({
+            "type": "text",
+            "text": "\n".join(download_lines).strip()
+        })
+        logger.info(f"Content block: {len(non_image_downloads)} download link(s)")
     
-    # Update stdout
-    data['stdout'] = current_stdout
+    # ================================================================
+    # Block 5: Metadata (execution info, variables)
+    # Only if there's useful info to report
+    # ================================================================
+    meta_parts = []
     
-    # Clear structured fields to prevent SimTheory widget issues
-    data['download_urls'] = []
-    data['inline_images'] = []
+    exec_time = data.get('execution_time_ms', 0)
+    if exec_time:
+        meta_parts.append(f"Execution: {exec_time}ms")
     
-    # Set result hint for the AI agent
-    parts = []
-    if inline_images:
-        parts.append(
-            f"{len(inline_images)} chart(s) generated. "
-            f"The chart images are in the output above as markdown images. "
-            f"Display them to the user — they should render inline."
-        )
-    if non_image_downloads:
-        parts.append(
-            f"{len(non_image_downloads)} file(s) generated. "
-            f"Download links are in the output above. "
-            f"Present the URLs to the user as clickable links."
-        )
+    kernel_info = data.get('kernel_info', {})
+    if kernel_info.get('session_persisted'):
+        var_count = kernel_info.get('variable_count', 0)
+        exec_count = kernel_info.get('execution_count', 0)
+        meta_parts.append(f"Session: {var_count} variables persisted (call #{exec_count})")
     
-    if parts:
-        data['result'] = ' '.join(parts)
+    files_created = data.get('files_created', [])
+    if files_created and not inline_images and not non_image_downloads:
+        # Only mention files if they weren't already covered above
+        meta_parts.append(f"Files created: {', '.join(files_created)}")
     
-    return json.dumps(data)
+    if meta_parts:
+        blocks.append({
+            "type": "text",
+            "text": " | ".join(meta_parts)
+        })
+    
+    # ================================================================
+    # Safety: ensure we always return at least one block
+    # ================================================================
+    if not blocks:
+        blocks.append({
+            "type": "text",
+            "text": "Code executed successfully (no output)."
+        })
+    
+    logger.info(f"Built {len(blocks)} content blocks for MCP response")
+    return blocks
 
 
 # ============================================================
@@ -167,7 +217,7 @@ async def execute_code(
     code: str,
     session_id: str = "default",
     timeout: int = 30
-) -> str:
+) -> list:
     """Execute Python code in a persistent sandboxed environment on Railway.
     
     SESSION PERSISTENCE - IMPORTANT:
@@ -189,13 +239,18 @@ async def execute_code(
     
     CHARTS AND VISUALIZATIONS:
     When code calls plt.show(), the chart is automatically captured as a PNG
-    image and a URL is returned. Display the chart inline using the markdown
-    image URL from the output. The chart will render directly in the chat.
+    image and returned as a separate content block with a markdown image URL.
+    DISPLAY THE IMAGE TO THE USER using the markdown syntax from the output.
+    The image URL is a direct link to the PNG — it will render inline in chat.
     
     Example:
       execute_code("import matplotlib.pyplot as plt; plt.bar(['A','B','C'], [1,2,3]); plt.show()")
-      → Returns markdown image: ![chart](https://...chart_001.png)
-      → Display this to the user - it renders inline!
+      → One of the returned content blocks will be: ![chart 001](https://...chart_001.png)
+      → Copy that markdown and include it in your response to render the chart!
+    
+    GENERATED FILES:
+    When code creates files (xlsx, csv, pdf), download URLs are returned as
+    separate content blocks. Present these URLs to the user as clickable links.
     
     REMOTE EXECUTION:
     This runs on a REMOTE server, NOT locally. You CANNOT reference
@@ -206,14 +261,8 @@ async def execute_code(
     2. Or use fetch_file (for files available at a URL)
     3. Then reference files by their sandbox path: just the filename like 'data.csv'
     
-    The sandbox directory is the working directory. Use relative paths only.
-    
     Pre-installed libraries: pandas, numpy, matplotlib, plotly, seaborn,
     scipy, scikit-learn, statsmodels, openpyxl, pdfplumber, requests, urllib.
-    
-    GENERATED FILES: When code creates files (xlsx, csv, png, etc.), download
-    URLs will appear in the stdout output. Present these URLs to the user
-    as clickable links so they can download the files.
     
     Use for quick operations (<60s). For longer tasks, use submit_job.
     
@@ -225,9 +274,8 @@ async def execute_code(
         timeout: Max seconds (max 60 for sync)
     
     Returns:
-        Execution result with stdout, result, errors, files created.
-        If charts were generated, markdown image URLs appear in stdout.
-        If files were generated, download URLs appear in stdout.
+        List of content blocks: stdout text, inline chart images (as markdown),
+        download links, and execution metadata. Each is a separate block.
     """
     url = f"{API_BASE}/api/execute"
     logger.info(f"execute_code: POST {url}")
@@ -240,11 +288,13 @@ async def execute_code(
             )
             logger.info(f"execute_code: response status={resp.status_code}")
             
-            # Reformat response: inline images as markdown, downloads as text
-            return _reformat_execution_response(resp.text)
+            # Build structured content blocks (not a JSON blob)
+            blocks = _build_content_blocks(resp.text)
+            logger.info(f"execute_code: returning {len(blocks)} content blocks")
+            return blocks
     except Exception as e:
         logger.error(f"execute_code: error: {e}", exc_info=True)
-        return f"Error calling execute API: {e}"
+        return [{"type": "text", "text": f"Error calling execute API: {e}"}]
 
 
 @mcp.tool()
@@ -338,7 +388,9 @@ async def get_job_result(job_id: str) -> str:
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.get(url, headers=_headers())
-            return _reformat_execution_response(resp.text)
+            # Use same content block builder for job results
+            blocks = _build_content_blocks(resp.text)
+            return blocks
     except Exception as e:
         logger.error(f"get_job_result: error: {e}", exc_info=True)
         return f"Error calling get_job_result API: {e}"

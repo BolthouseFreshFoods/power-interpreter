@@ -8,7 +8,7 @@ Executes Python code in a controlled environment with:
 - Structured result extraction
 - PERSISTENT SESSION STATE (v2.0) - variables survive across calls
 - AUTO FILE STORAGE (v2.1) - generated files stored in Postgres with download URLs
-- INLINE CHART RENDERING (v2.4) - matplotlib/plotly charts auto-captured and
+- INLINE CHART RENDERING (v2.5) - matplotlib/plotly charts auto-captured and
   returned as inline image URLs for rendering directly in chat
 
 Design: Uses in-process isolation with restricted globals.
@@ -23,12 +23,16 @@ Generated files (xlsx, png, csv, etc.) are automatically stored in
 Postgres (sandbox_files table) and download URLs are returned so they
 survive Railway container redeployments.
 
-Chart auto-capture: plt.show() is monkey-patched to save the current
-figure as PNG, store it in Postgres, and return the URL. This means
-any matplotlib code that calls plt.show() will produce an inline image.
+Chart auto-capture (v2.5):
+  1. plt.show() is monkey-patched to save figures as PNG
+  2. matplotlib.use() calls in user code are silently stripped (we set Agg)
+  3. After execution, any UNCLOSED figures are auto-captured as a safety net
+  4. plt.savefig() is tracked so explicit saves also get inline URLs
+  This means ANY matplotlib code produces an inline image, whether the user
+  calls plt.show(), plt.savefig(), or neither.
 
-Version: 2.4.0 - Inline chart rendering via plt.show() auto-capture
-                 Plotly figures also auto-captured via pio.write_image fallback
+Version: 2.5.0 - Robust chart capture: strip matplotlib.use(), auto-capture
+                 unclosed figures, handle all chart generation patterns
 """
 
 import asyncio
@@ -45,6 +49,7 @@ from typing import Dict, Any, Optional, Tuple, List
 from contextlib import redirect_stdout, redirect_stderr
 import logging
 import uuid
+import re as re_module
 from urllib.parse import quote
 
 from app.config import settings
@@ -73,6 +78,12 @@ STORABLE_EXTENSIONS = {
 
 # Image extensions for inline rendering
 IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.svg'}
+
+# Patterns to strip from user code (we handle these internally)
+MATPLOTLIB_USE_PATTERN = re_module.compile(
+    r'^\s*matplotlib\s*\.\s*use\s*\(\s*[\'"][^\'"]*[\'"]\s*\)\s*$',
+    re_module.MULTILINE
+)
 
 
 class ExecutionResult:
@@ -124,10 +135,10 @@ class ExecutionResult:
 class ChartCapture:
     """Captures matplotlib figures when plt.show() is called.
     
-    This replaces plt.show() with a function that:
-    1. Saves the current figure as a high-quality PNG
-    2. Adds the path to a capture list
-    3. Closes the figure to free memory
+    Three capture mechanisms:
+    1. plt.show() replacement - captures all open figures
+    2. Figure.savefig() wrapper - tracks explicitly saved images
+    3. Post-execution sweep - captures any unclosed figures (safety net)
     
     The executor then stores these PNGs in Postgres and returns
     inline image URLs.
@@ -137,6 +148,7 @@ class ChartCapture:
         self.session_dir = session_dir
         self.captured_charts: List[str] = []  # List of file paths
         self._chart_counter = 0
+        self._savefig_tracked: set = set()  # Track files from savefig
     
     def make_show_replacement(self, plt_module):
         """Create a replacement for plt.show() that captures figures."""
@@ -171,22 +183,70 @@ class ChartCapture:
                     )
                     
                     capture.captured_charts.append(chart_name)
-                    logger.info(f"Chart captured: {chart_name} (figure {fig_num})")
+                    logger.info(f"Chart captured via plt.show(): {chart_name} (figure {fig_num})")
                 
                 # Close all figures to free memory
                 plt_module.close('all')
                 
             except Exception as e:
-                logger.error(f"Chart capture failed: {e}", exc_info=True)
+                logger.error(f"Chart capture via plt.show() failed: {e}", exc_info=True)
                 # Don't raise - let the code continue even if capture fails
         
         return _capturing_show
     
-    def make_savefig_wrapper(self, original_savefig, plt_module):
-        """Wrap plt.savefig() to also track saved figures.
+    def capture_unclosed_figures(self, plt_module):
+        """Safety net: capture any figures that weren't closed by plt.show().
         
-        Users who call plt.savefig() explicitly still get their file,
-        but we also track it for inline rendering.
+        Called AFTER code execution completes. This handles cases where:
+        - User code creates a figure but doesn't call plt.show()
+        - User code calls plt.savefig() but we want inline rendering too
+        - User code creates multiple figures and only shows some
+        """
+        try:
+            fig_nums = plt_module.get_fignums()
+            if not fig_nums:
+                return
+            
+            captured_count = 0
+            for fig_num in fig_nums:
+                fig = plt_module.figure(fig_num)
+                self._chart_counter += 1
+                
+                chart_name = f"chart_{self._chart_counter:03d}.png"
+                chart_path = self.session_dir / chart_name
+                
+                # Don't re-capture if already captured
+                if chart_name in self.captured_charts:
+                    continue
+                
+                fig.savefig(
+                    str(chart_path),
+                    format='png',
+                    dpi=150,
+                    bbox_inches='tight',
+                    facecolor='white',
+                    edgecolor='none',
+                    pad_inches=0.1,
+                )
+                
+                self.captured_charts.append(chart_name)
+                captured_count += 1
+                logger.info(f"Chart auto-captured (unclosed figure): {chart_name} (figure {fig_num})")
+            
+            # Close all figures to free memory
+            plt_module.close('all')
+            
+            if captured_count > 0:
+                logger.info(f"Auto-captured {captured_count} unclosed figure(s)")
+                
+        except Exception as e:
+            logger.error(f"Auto-capture of unclosed figures failed: {e}", exc_info=True)
+    
+    def make_savefig_wrapper(self, original_savefig):
+        """Wrap Figure.savefig() to also track saved figures.
+        
+        Users who call fig.savefig() or plt.savefig() explicitly still get
+        their file, but we also track it for inline rendering.
         """
         capture = self
         
@@ -197,12 +257,16 @@ class ChartCapture:
             
             # Track the file if it's an image
             try:
-                fname_path = Path(fname)
+                fname_str = str(fname)
+                fname_path = Path(fname_str)
                 if fname_path.suffix.lower() in IMAGE_EXTENSIONS:
                     # If relative path, it's in session_dir (because we chdir)
                     if not fname_path.is_absolute():
-                        capture.captured_charts.append(str(fname_path))
-                        logger.info(f"Tracked savefig: {fname}")
+                        rel_name = str(fname_path)
+                        if rel_name not in capture._savefig_tracked:
+                            capture._savefig_tracked.add(rel_name)
+                            capture.captured_charts.append(rel_name)
+                            logger.info(f"Tracked explicit savefig: {fname_str}")
             except Exception as e:
                 logger.debug(f"Could not track savefig: {e}")
             
@@ -454,7 +518,7 @@ class SandboxExecutor:
         """Install matplotlib hooks for auto-capturing charts.
         
         This replaces plt.show() with our capturing version and wraps
-        plt.savefig() to track explicitly saved images.
+        Figure.savefig() to track explicitly saved images.
         
         Called AFTER _lazy_import loads matplotlib, and EVERY execution
         (because the user might have reassigned plt in their code).
@@ -472,12 +536,29 @@ class SandboxExecutor:
             if not hasattr(matplotlib.figure.Figure, '_original_savefig'):
                 matplotlib.figure.Figure._original_savefig = matplotlib.figure.Figure.savefig
             matplotlib.figure.Figure.savefig = chart_capture.make_savefig_wrapper(
-                matplotlib.figure.Figure._original_savefig, plt
+                matplotlib.figure.Figure._original_savefig
             )
         except Exception as e:
             logger.debug(f"Could not wrap Figure.savefig: {e}")
         
         logger.debug("Chart capture hooks installed")
+
+    def _strip_matplotlib_use(self, code: str) -> str:
+        """Strip matplotlib.use() calls from user code.
+        
+        We already set matplotlib.use('Agg') during lazy import.
+        If user code also calls matplotlib.use(), it can cause:
+        - Warnings about switching backends
+        - Errors if called after pyplot is imported
+        - Confusion for the AI agent
+        
+        We silently replace these with a comment.
+        """
+        def _replace_use(match):
+            original = match.group(0).strip()
+            return f"# [sandbox] {original} -> already set (Agg backend)"
+        
+        return MATPLOTLIB_USE_PATTERN.sub(_replace_use, code)
 
     def _lazy_import(self, name: str, sandbox_globals: Dict):
         """Lazily import allowed libraries into sandbox.
@@ -653,16 +734,15 @@ class SandboxExecutor:
     def _preprocess_code(self, code: str, sandbox_globals: Dict) -> str:
         """Preprocess code to handle imports and add safety wrappers.
 
-        Key behavior for 'from X.Y import A, B, C':
-        - If base module X is loaded (via _lazy_import), we convert the
-          from-import into direct attribute assignments:
-            A = X.Y.A
-            B = X.Y.B
-            C = X.Y.C
-        - This works because _lazy_import ensures submodules are imported,
-          so attribute access resolves correctly.
-        - This avoids needing __import__ (which is blocked in sandbox).
+        Key behaviors:
+        1. 'from X.Y import A, B, C' → resolved via attribute access
+        2. 'import X' → lazy-loaded into sandbox globals
+        3. matplotlib.use('...') → silently stripped (we set Agg)
+        4. Unknown imports → blocked with comment
         """
+        # First: strip matplotlib.use() calls
+        code = self._strip_matplotlib_use(code)
+        
         lines = code.split('\n')
         processed_lines = []
 
@@ -952,9 +1032,10 @@ class SandboxExecutor:
         Generated files are automatically stored in Postgres and
         download URLs are included in the result.
 
-        Charts created with matplotlib are auto-captured when plt.show()
-        is called. The resulting PNG URLs are returned as inline_images
-        for rendering directly in the chat.
+        Charts created with matplotlib are auto-captured via three mechanisms:
+        1. plt.show() interception → saves all open figures
+        2. Figure.savefig() tracking → tracks explicitly saved images
+        3. Post-execution sweep → captures any unclosed figures
 
         Args:
             code: Python code to execute
@@ -1006,7 +1087,7 @@ class SandboxExecutor:
         if context:
             sandbox_globals.update(context)
 
-        # Preprocess code (handle imports, add safety)
+        # Preprocess code (handle imports, strip matplotlib.use(), add safety)
         try:
             processed_code = self._preprocess_code(code, sandbox_globals)
         except Exception as e:
@@ -1077,6 +1158,17 @@ class SandboxExecutor:
 
             result.success = True
             logger.info("Code execution succeeded")
+
+            # =====================================================================
+            # POST-EXECUTION: Auto-capture any unclosed matplotlib figures
+            # This is the safety net - catches charts even if plt.show() wasn't called
+            # =====================================================================
+            if 'plt' in sandbox_globals:
+                try:
+                    plt = sandbox_globals['plt']
+                    chart_capture.capture_unclosed_figures(plt)
+                except Exception as e:
+                    logger.debug(f"Post-execution figure capture failed: {e}")
 
             # Extract RESULT variable if set
             if 'RESULT' in sandbox_globals and sandbox_globals['RESULT'] is not None:

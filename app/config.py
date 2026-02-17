@@ -38,11 +38,42 @@ class Settings:
             url = url.replace("postgres://", "postgresql://", 1)
         return url
     
+    # --- Public URL (for generating download links) ---
+    # Railway sets RAILWAY_PUBLIC_DOMAIN automatically.
+    # Override with PUBLIC_URL env var if needed (e.g. custom domain).
+    # Used to build download URLs like: https://{domain}/dl/{file_id}
+    PUBLIC_URL: str = os.getenv("PUBLIC_URL", "")
+    
+    @property
+    def public_base_url(self) -> str:
+        """Get the public base URL for generating download links.
+        
+        Priority:
+        1. PUBLIC_URL env var (explicit override)
+        2. RAILWAY_PUBLIC_DOMAIN (auto-set by Railway)
+        3. Empty string (download URLs will be relative paths)
+        """
+        if self.PUBLIC_URL:
+            return self.PUBLIC_URL.rstrip("/")
+        
+        railway_domain = os.getenv("RAILWAY_PUBLIC_DOMAIN", "")
+        if railway_domain:
+            return f"https://{railway_domain}"
+        
+        return ""
+    
     # --- Sandbox Limits ---
     MAX_EXECUTION_TIME: int = int(os.getenv("MAX_EXECUTION_TIME", "300"))  # 5 min default
     MAX_MEMORY_MB: int = int(os.getenv("MAX_MEMORY_MB", "4096"))  # 4 GB default
     MAX_FILE_SIZE_MB: int = int(os.getenv("MAX_FILE_SIZE_MB", "500"))  # 500 MB max upload
     MAX_OUTPUT_SIZE: int = int(os.getenv("MAX_OUTPUT_SIZE", "1048576"))  # 1 MB max output text
+    
+    # --- Sandbox File Storage (Postgres BYTEA) ---
+    # Max file size to store in Postgres. Files larger than this
+    # will still be saved to disk but won't get a download URL.
+    # Recommended: keep under 50MB to avoid Postgres performance issues.
+    SANDBOX_FILE_MAX_MB: int = int(os.getenv("SANDBOX_FILE_MAX_MB", "50"))
+    SANDBOX_FILE_TTL_HOURS: int = int(os.getenv("SANDBOX_FILE_TTL_HOURS", "72"))  # 3 days default
     
     # --- Directories ---
     BASE_DIR: Path = Path("/app")

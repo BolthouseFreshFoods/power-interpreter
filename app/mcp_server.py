@@ -16,8 +16,10 @@ MCP Tools (12):
 - list_datasets: List loaded datasets
 - create_session: Create workspace session
 
-Version: 1.2.0 - Fix: Strip download_urls from JSON to prevent SimTheory
-                 broken widget; present URLs as plain text for AI agent
+Version: 1.3.0 - Fix: Instruct AI to reuse session_id for persistent state
+                 Root cause: AI was choosing new session_id per call,
+                 defeating kernel persistence. Now defaults to "default"
+                 with strong instructions to reuse.
 """
 
 from mcp.server.fastmcp import FastMCP
@@ -124,9 +126,27 @@ async def execute_code(
     session_id: str = "default",
     timeout: int = 30
 ) -> str:
-    """Execute Python code in a remote sandboxed environment on Railway.
+    """Execute Python code in a persistent sandboxed environment on Railway.
     
-    IMPORTANT: This runs on a REMOTE server, NOT locally. You CANNOT reference
+    SESSION PERSISTENCE - IMPORTANT:
+    This environment works like a Jupyter notebook. Variables, DataFrames,
+    imports, and objects persist across calls WITHIN THE SAME session_id.
+    
+    ALWAYS use session_id="default" unless you have a specific reason to
+    isolate work (e.g., separate projects). DO NOT create new session IDs
+    for each call — that defeats persistence and forces a fresh environment.
+    
+    Example of persistence:
+      Call 1: execute_code("import pandas as pd; df = pd.read_csv('data.csv')", session_id="default")
+      Call 2: execute_code("print(df.shape)", session_id="default")  # df still exists!
+      Call 3: execute_code("summary = df.describe(); print(summary)", session_id="default")  # works!
+    
+    WRONG (breaks persistence):
+      Call 1: execute_code("df = pd.read_csv('data.csv')", session_id="analysis_1")
+      Call 2: execute_code("print(df.shape)", session_id="analysis_2")  # ERROR: df doesn't exist!
+    
+    REMOTE EXECUTION:
+    This runs on a REMOTE server, NOT locally. You CANNOT reference
     local file paths like /home/ubuntu/... or /tmp/uploads/...
     
     To work with files:
@@ -134,17 +154,10 @@ async def execute_code(
     2. Or use fetch_file (for files available at a URL)
     3. Then reference files by their sandbox path: just the filename like 'data.csv'
     
-    Example workflow for analyzing a CSV:
-    1. fetch_file(url="https://example.com/data.csv", filename="data.csv")
-    2. execute_code(code="import pandas as pd; df = pd.read_csv('data.csv'); print(df.head())")
-    
-    Or for files already in the sandbox:
-    - execute_code(code="import pandas as pd; df = pd.read_csv('data.csv'); print(df.describe())")
-    
     The sandbox directory is the working directory. Use relative paths only.
     
     Pre-installed libraries: pandas, numpy, matplotlib, plotly, seaborn,
-    scipy, scikit-learn, statsmodels, openpyxl, pdfplumber.
+    scipy, scikit-learn, statsmodels, openpyxl, pdfplumber, requests, urllib.
     
     GENERATED FILES: When code creates files (xlsx, csv, png, etc.), download
     URLs will appear in the stdout output. Present these URLs to the user
@@ -154,7 +167,9 @@ async def execute_code(
     
     Args:
         code: Python code to execute. Do NOT use absolute file paths.
-        session_id: Session ID for file isolation
+        session_id: Session ID for state persistence. Use "default" to maintain
+                    variables across calls. Only change this if you need isolated
+                    workspaces for separate projects.
         timeout: Max seconds (max 60 for sync)
     
     Returns:
@@ -182,13 +197,17 @@ async def execute_code(
 @mcp.tool()
 async def submit_job(
     code: str,
-    session_id: str = None,
+    session_id: str = "default",
     timeout: int = 600
 ) -> str:
     """Submit a long-running job for async execution on the remote server.
     
     IMPORTANT: This runs on a REMOTE server. You CANNOT reference local file paths.
     Files must be uploaded first using upload_file or fetch_file.
+    
+    SESSION PERSISTENCE: Use session_id="default" to share state with
+    execute_code calls. Variables created in execute_code will be available
+    in the job, and vice versa.
     
     Returns immediately with a job_id. Use get_job_status to check progress.
     Use get_job_result to get output when complete.
@@ -200,7 +219,8 @@ async def submit_job(
     
     Args:
         code: Python code to execute. Use relative paths for sandbox files.
-        session_id: Session ID for file isolation
+        session_id: Session ID for state persistence. Use "default" to share
+                    state with execute_code calls.
         timeout: Max seconds (default 600 = 10 min)
     
     Returns:
@@ -289,12 +309,12 @@ async def upload_file(
     After uploading, the file is available in the sandbox by its filename.
     
     Complete workflow example:
-    1. upload_file("invoices.csv", "<base64 content>")
-    2. execute_code("import pandas as pd; df = pd.read_csv('invoices.csv'); print(df.head())")
+    1. upload_file("invoices.csv", "<base64 content>", session_id="default")
+    2. execute_code("import pandas as pd; df = pd.read_csv('invoices.csv'); print(df.head())", session_id="default")
     
     Or load into PostgreSQL for SQL queries:
-    1. upload_file("data.csv", "<base64 content>")
-    2. load_dataset("data.csv", "my_dataset")
+    1. upload_file("data.csv", "<base64 content>", session_id="default")
+    2. load_dataset("data.csv", "my_dataset", session_id="default")
     3. query_dataset("SELECT * FROM my_dataset LIMIT 10")
     
     Args:
@@ -342,10 +362,11 @@ async def fetch_file(
     - Any direct download link
     
     After fetching, the file is available in the sandbox by its filename.
+    Use session_id="default" to keep files accessible to execute_code calls.
     
     Example workflow:
-    1. fetch_file(url="https://example.com/big_data.csv", filename="data.csv")
-    2. execute_code("import pandas as pd; df = pd.read_csv('data.csv'); print(df.shape)")
+    1. fetch_file(url="https://example.com/big_data.csv", filename="data.csv", session_id="default")
+    2. execute_code("import pandas as pd; df = pd.read_csv('data.csv'); print(df.shape)", session_id="default")
     
     Args:
         url: Public URL to download from
@@ -382,7 +403,7 @@ async def list_files(session_id: str = None) -> str:
     Use this to see what files are available before running code.
     
     Args:
-        session_id: Optional session filter
+        session_id: Optional session filter (use "default" to see main workspace files)
     
     Returns:
         List of files with metadata
@@ -410,7 +431,7 @@ async def list_files(session_id: str = None) -> str:
 async def load_dataset(
     file_path: str,
     dataset_name: str,
-    session_id: str = None,
+    session_id: str = "default",
     delimiter: str = ","
 ) -> str:
     """Load a CSV file from the sandbox into PostgreSQL for fast SQL querying.
@@ -424,7 +445,7 @@ async def load_dataset(
     Args:
         file_path: Filename in sandbox (e.g., 'invoices.csv' - NOT a local path)
         dataset_name: Logical name for SQL queries (e.g., 'vestis_invoices')
-        session_id: Optional session
+        session_id: Session for file isolation (default: 'default')
         delimiter: CSV delimiter (default comma)
     
     Returns:
@@ -523,6 +544,10 @@ async def create_session(
     description: str = ""
 ) -> str:
     """Create a new workspace session for file/data isolation.
+    
+    Most of the time you should use session_id="default" which is
+    automatically available. Only create new sessions when you need
+    to isolate work between separate projects.
     
     Use session_id in other tools to scope operations.
     Each session has its own sandbox directory and file space.

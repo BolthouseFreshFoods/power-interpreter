@@ -6,12 +6,17 @@ Executes Python code in a controlled environment with:
 - Safe file I/O (sandbox directory only)
 - Captured stdout/stderr
 - Structured result extraction
+- PERSISTENT SESSION STATE (v2.0) - variables survive across calls
 
 Design: Uses in-process isolation with restricted globals.
 The sandbox has access to pandas, numpy, matplotlib, etc.
 but cannot access the network, filesystem outside sandbox, or system commands.
 
-Version: 1.0.6 - Fixed __builtins__ handling and resource limits for containers
+Session state is managed by KernelManager - globals dicts are persisted
+per session_id and reused across execute() calls, giving notebook-like
+continuity.
+
+Version: 2.0.0 - Persistent kernel architecture
 """
 
 import asyncio
@@ -29,6 +34,7 @@ from contextlib import redirect_stdout, redirect_stderr
 import logging
 
 from app.config import settings
+from app.engine.kernel_manager import kernel_manager
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +61,8 @@ class ExecutionResult:
         self.memory_used_mb: float = 0.0
         self.files_created: list = []
         self.variables: Dict[str, str] = {}  # Variable name -> type string
-    
+        self.kernel_info: Dict[str, Any] = {}  # Kernel session metadata
+
     def to_dict(self) -> Dict:
         return {
             'success': self.success,
@@ -68,8 +75,9 @@ class ExecutionResult:
             'memory_used_mb': round(self.memory_used_mb, 2),
             'files_created': self.files_created,
             'variables': self.variables,
+            'kernel_info': self.kernel_info,
         }
-    
+
     def _serialize_result(self) -> Any:
         """Safely serialize the result"""
         if self.result is None:
@@ -83,25 +91,25 @@ class ExecutionResult:
 
 
 class SandboxExecutor:
-    """Executes Python code in a sandboxed environment"""
-    
+    """Executes Python code in a sandboxed environment with persistent state"""
+
     def __init__(self, sandbox_dir: Path = None):
         self.sandbox_dir = sandbox_dir or settings.SANDBOX_DIR
         self.sandbox_dir.mkdir(parents=True, exist_ok=True)
         logger.info(f"SandboxExecutor initialized: sandbox_dir={self.sandbox_dir}")
-    
+
     def _get_safe_builtins(self) -> Dict:
         """Build a safe builtins dict, handling both dict and module forms."""
         safe = {}
-        
+
         # Get the actual builtins dict regardless of form
         import builtins as builtins_module
-        
+
         blocked = set(settings.BLOCKED_BUILTINS) if hasattr(settings, 'BLOCKED_BUILTINS') else {
             'eval', 'exec', 'compile', '__import__', 'globals', 'locals',
             'exit', 'quit', 'breakpoint', 'input',
         }
-        
+
         for name in dir(builtins_module):
             if name.startswith('_'):
                 continue
@@ -111,7 +119,7 @@ class SandboxExecutor:
                 safe[name] = getattr(builtins_module, name)
             except AttributeError:
                 pass
-        
+
         # Always include these essentials
         safe['True'] = True
         safe['False'] = False
@@ -182,25 +190,25 @@ class SandboxExecutor:
         safe['PermissionError'] = PermissionError
         safe['NotImplementedError'] = NotImplementedError
         safe['OverflowError'] = OverflowError
-        
+
         return safe
-    
+
     def _build_safe_globals(self, session_dir: Path) -> Dict:
         """Build the globals dict for sandboxed execution"""
         logger.info("Building safe globals...")
-        
+
         try:
             import pandas as pd
         except ImportError:
             pd = None
             logger.warning("pandas not available")
-        
+
         try:
             import numpy as np
         except ImportError:
             np = None
             logger.warning("numpy not available")
-        
+
         import json
         import csv
         import math
@@ -217,7 +225,7 @@ class SandboxExecutor:
         from decimal import Decimal
         from fractions import Fraction
         from pathlib import Path as PathLib
-        
+
         # Try dataclasses
         try:
             from dataclasses import dataclass, field, asdict
@@ -225,30 +233,30 @@ class SandboxExecutor:
             dataclass = None
             field = None
             asdict = None
-        
+
         from typing import Dict, List, Optional, Tuple, Set, Any
-        
+
         # Get safe builtins
         safe_builtins = self._get_safe_builtins()
-        
+
         # Add safe file operations
         safe_builtins['open'] = self._make_safe_open(session_dir)
-        
+
         # Build globals
         sandbox_globals = {
             '__builtins__': safe_builtins,
             '__name__': '__sandbox__',
-            
+
             # Data libraries
             'json': json,
             'csv': csv,
-            
+
             # Math & stats
             'math': math,
             'statistics': statistics,
             'Decimal': Decimal,
             'Fraction': Fraction,
-            
+
             # Standard library
             'datetime': dt_module,
             'collections': collections,
@@ -260,7 +268,7 @@ class SandboxExecutor:
             'hashlib': hashlib_module,
             'base64': base64,
             'Path': PathLib,
-            
+
             # Typing
             'Dict': Dict,
             'List': List,
@@ -268,12 +276,12 @@ class SandboxExecutor:
             'Tuple': Tuple,
             'Set': Set,
             'Any': Any,
-            
+
             # Sandbox info
             'SANDBOX_DIR': str(session_dir),
             'RESULT': None,  # User can set this for structured output
         }
-        
+
         # Add pandas/numpy if available
         if pd is not None:
             sandbox_globals['pd'] = pd
@@ -281,16 +289,16 @@ class SandboxExecutor:
         if np is not None:
             sandbox_globals['np'] = np
             sandbox_globals['numpy'] = np
-        
+
         # Add dataclasses if available
         if dataclass is not None:
             sandbox_globals['dataclass'] = dataclass
             sandbox_globals['field'] = field
             sandbox_globals['asdict'] = asdict
-        
+
         logger.info("Safe globals built successfully")
         return sandbox_globals
-    
+
     def _make_safe_open(self, session_dir: Path):
         """Create a safe open() that only allows access within session directory"""
         def safe_open(filepath, mode='r', *args, **kwargs):
@@ -298,7 +306,7 @@ class SandboxExecutor:
             path = Path(filepath)
             if not path.is_absolute():
                 path = session_dir / path
-            
+
             # Ensure it's within the sandbox
             try:
                 resolved = path.resolve()
@@ -312,15 +320,15 @@ class SandboxExecutor:
                 raise
             except Exception as e:
                 raise PermissionError(f"Invalid file path: {e}")
-            
+
             # Create parent directories if writing
             if 'w' in mode or 'a' in mode:
                 resolved.parent.mkdir(parents=True, exist_ok=True)
-            
+
             return open(resolved, mode, *args, **kwargs)
-        
+
         return safe_open
-    
+
     def _lazy_import(self, name: str, sandbox_globals: Dict):
         """Lazily import allowed libraries into sandbox"""
         try:
@@ -379,15 +387,15 @@ class SandboxExecutor:
             logger.warning(f"Failed to import {name}: {e}")
             return False
         return False
-    
+
     def _preprocess_code(self, code: str, sandbox_globals: Dict) -> str:
         """Preprocess code to handle imports and add safety wrappers"""
         lines = code.split('\n')
         processed_lines = []
-        
+
         for line in lines:
             stripped = line.strip()
-            
+
             # Handle import statements
             if stripped.startswith('import ') or stripped.startswith('from '):
                 # Extract module name
@@ -395,7 +403,7 @@ class SandboxExecutor:
                     module = stripped.split()[1].split('.')[0].split(',')[0]
                 else:
                     module = stripped.split()[1].split('.')[0]
-                
+
                 # Try to lazy-load it
                 if self._lazy_import(module, sandbox_globals):
                     # Handle 'from X import Y' and 'import X as Y'
@@ -414,53 +422,69 @@ class SandboxExecutor:
                         f"# [sandbox] BLOCKED: {stripped} (not in allowed list)"
                     )
                     continue
-            
+
             processed_lines.append(line)
-        
+
         return '\n'.join(processed_lines)
-    
+
     async def execute(
-        self, 
-        code: str, 
+        self,
+        code: str,
         session_id: str = "default",
         timeout: int = None,
         context: Dict = None
     ) -> ExecutionResult:
-        """Execute Python code in sandbox
-        
+        """Execute Python code in sandbox with PERSISTENT STATE.
+
+        Variables, dataframes, and imports persist across calls
+        within the same session_id. Like a Jupyter notebook.
+
         Args:
             code: Python code to execute
-            session_id: Session ID for file isolation
+            session_id: Session ID for state + file isolation
             timeout: Max execution time in seconds
             context: Additional variables to inject
-        
+
         Returns:
             ExecutionResult with stdout, stderr, result, etc.
         """
         result = ExecutionResult()
         timeout = timeout or settings.MAX_EXECUTION_TIME
-        
+
         logger.info(f"Executing code: session={session_id}, timeout={timeout}s")
         logger.info(f"Code preview: {code[:200]}")
-        
+
         # Create session directory
         session_dir = self.sandbox_dir / session_id
         session_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Build sandbox environment
+
+        # =====================================================================
+        # PERSISTENT KERNEL: get_or_create replaces fresh _build_safe_globals
+        #
+        # First call for a session: builds fresh globals, stores them
+        # Subsequent calls: returns the SAME globals dict (state preserved!)
+        # =====================================================================
         try:
-            sandbox_globals = self._build_safe_globals(session_dir)
+            fresh_globals = self._build_safe_globals(session_dir)
+            sandbox_globals = kernel_manager.get_or_create(
+                session_id=session_id,
+                sandbox_globals=fresh_globals,
+                session_dir=session_dir,
+            )
         except Exception as e:
-            logger.error(f"Failed to build sandbox globals: {e}", exc_info=True)
+            logger.error(f"Failed to get/create kernel: {e}", exc_info=True)
             result.success = False
-            result.error_message = f"Sandbox initialization failed: {e}"
+            result.error_message = f"Kernel initialization failed: {e}"
             result.error_traceback = traceback.format_exc()
             return result
-        
+
+        # Reset RESULT for this execution (don't carry over from last call)
+        sandbox_globals['RESULT'] = None
+
         # Inject context variables
         if context:
             sandbox_globals.update(context)
-        
+
         # Preprocess code (handle imports, add safety)
         try:
             processed_code = self._preprocess_code(code, sandbox_globals)
@@ -470,13 +494,13 @@ class SandboxExecutor:
             result.error_message = f"Code preprocessing failed: {e}"
             result.error_traceback = traceback.format_exc()
             return result
-        
+
         logger.info(f"Processed code: {processed_code[:200]}")
-        
+
         # Capture stdout/stderr
         stdout_capture = io.StringIO()
         stderr_capture = io.StringIO()
-        
+
         # Track files before execution
         files_before = set()
         if session_dir.exists():
@@ -484,14 +508,14 @@ class SandboxExecutor:
                 files_before = set(str(p) for p in session_dir.rglob('*') if p.is_file())
             except Exception:
                 pass
-        
+
         # Execute
         start_time = time.time()
-        
+
         try:
             # Run in thread pool to not block event loop
             loop = asyncio.get_event_loop()
-            
+
             def _execute():
                 with redirect_stdout(stdout_capture), redirect_stderr(stderr_capture):
                     # Try to set resource limits (may fail in containers)
@@ -499,85 +523,74 @@ class SandboxExecutor:
                         try:
                             mem_bytes = settings.MAX_MEMORY_MB * 1024 * 1024
                             resource_module.setrlimit(
-                                resource_module.RLIMIT_AS, 
+                                resource_module.RLIMIT_AS,
                                 (mem_bytes, mem_bytes)
                             )
                         except (ValueError, OSError, resource_module.error) as e:
                             # This is expected in many container environments
                             logger.debug(f"Could not set memory limit: {e}")
-                    
+
                     # Execute the code
                     compiled = compile(processed_code, '<sandbox>', 'exec')
                     exec(compiled, sandbox_globals)
-            
+
             # Run with timeout
             await asyncio.wait_for(
                 loop.run_in_executor(None, _execute),
                 timeout=timeout
             )
-            
+
             result.success = True
             logger.info("Code execution succeeded")
-            
+
             # Extract RESULT variable if set
             if 'RESULT' in sandbox_globals and sandbox_globals['RESULT'] is not None:
                 result.result = sandbox_globals['RESULT']
-            
-            # Extract user-defined variables for inspection
-            skip_vars = {
-                'pd', 'pandas', 'np', 'numpy', 'json', 'csv', 
-                'math', 'statistics', 'datetime', 'collections',
-                'itertools', 'functools', 're', 'io', 'copy',
-                'hashlib', 'base64', 'Path', 'dataclass', 'field',
-                'asdict', 'Dict', 'List', 'Optional', 'Tuple',
-                'Set', 'Any', 'SANDBOX_DIR', 'RESULT',
-                'plt', 'matplotlib', 'sns', 'seaborn',
-                'plotly', 'px', 'go', 'scipy', 'sklearn',
-                'statsmodels', 'sm', 'openpyxl', 'pdfplumber',
-                'tabulate', 'xlsxwriter', 'Decimal', 'Fraction',
-                '__builtins__', '__name__',
-            }
-            for key, value in sandbox_globals.items():
-                if not key.startswith('_') and key not in skip_vars:
-                    try:
-                        result.variables[key] = type(value).__name__
-                    except Exception:
-                        pass
-        
+
+            # Get variables from kernel session (uses KernelManager's tracking)
+            session_info = kernel_manager.get_session_info(session_id)
+            if session_info:
+                result.variables = session_info['variables']
+                result.kernel_info = {
+                    'execution_count': session_info['execution_count'],
+                    'variable_count': session_info['variable_count'],
+                    'session_persisted': True,
+                }
+
         except asyncio.TimeoutError:
             result.success = False
             result.error_message = f"Execution timed out after {timeout} seconds"
             result.error_traceback = ""
             logger.warning(f"Execution timed out after {timeout}s")
-        
+
         except MemoryError:
             result.success = False
             result.error_message = f"Memory limit exceeded ({settings.MAX_MEMORY_MB} MB)"
             result.error_traceback = ""
             logger.warning("Memory limit exceeded")
-        
+
         except Exception as e:
             result.success = False
             result.error_message = str(e)
             result.error_traceback = traceback.format_exc()
             logger.error(f"Execution error: {e}", exc_info=True)
-        
+
         finally:
             end_time = time.time()
             result.execution_time_ms = int((end_time - start_time) * 1000)
             result.stdout = stdout_capture.getvalue()
             result.stderr = stderr_capture.getvalue()
-            
+
             logger.info(f"Execution completed: success={result.success}, "
                        f"time={result.execution_time_ms}ms, "
                        f"stdout_len={len(result.stdout)}, "
                        f"stderr_len={len(result.stderr)}")
-            
+
             if result.stdout:
                 logger.info(f"stdout preview: {result.stdout[:200]}")
             if result.error_message:
                 logger.error(f"error: {result.error_message}")
-            
+
             # Track memory usage
             if HAS_RESOURCE:
                 try:
@@ -585,7 +598,7 @@ class SandboxExecutor:
                     result.memory_used_mb = usage.ru_maxrss / 1024  # Convert KB to MB
                 except Exception:
                     result.memory_used_mb = 0.0
-            
+
             # Track new files created
             if session_dir.exists():
                 try:
@@ -596,7 +609,7 @@ class SandboxExecutor:
                     ]
                 except Exception:
                     pass
-        
+
         return result
 
 

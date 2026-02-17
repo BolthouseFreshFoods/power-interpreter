@@ -14,8 +14,10 @@ Features:
 - Max concurrent kernels cap
 - Session metadata tracking (variable count, last activity, execution count)
 - Manual reset capability
+- has_session() check to avoid unnecessary globals rebuilds
 
-Version: 2.0.0 - Persistent kernel architecture
+Version: 2.1.0 - Add has_session() for executor optimization
+                 Skip _build_safe_globals when kernel already exists
 """
 
 import time
@@ -62,6 +64,10 @@ class KernelSession:
             'statsmodels', 'sm', 'openpyxl', 'pdfplumber',
             'tabulate', 'xlsxwriter', 'Decimal', 'Fraction',
             '__builtins__', '__name__',
+            'textwrap', 'string', 'struct', 'decimal',
+            'fractions', 'random', 'time', 'calendar',
+            'pprint', 'dataclasses', 'typing', 'pathlib', 'os',
+            'urllib', 'requests',
         }
         result = {}
         for key, value in self.sandbox_globals.items():
@@ -106,6 +112,19 @@ class KernelManager:
             f"idle_timeout={idle_timeout_seconds}s"
         )
 
+    def has_session(self, session_id: str) -> bool:
+        """Check if a session kernel exists (without modifying it).
+        
+        Used by executor to skip _build_safe_globals() when a kernel
+        already exists — significant performance optimization since
+        building globals imports pandas, numpy, etc.
+        
+        Thread-safe. Also cleans up expired sessions.
+        """
+        with self._lock:
+            self._cleanup_expired()
+            return session_id in self._sessions
+
     def get_or_create(
         self,
         session_id: str,
@@ -134,9 +153,10 @@ class KernelManager:
                 session = self._sessions[session_id]
                 session.touch()
                 logger.info(
-                    f"Kernel reused: session={session_id}, "
+                    f"Kernel REUSED: session={session_id}, "
                     f"exec_count={session.execution_count}, "
-                    f"vars={len(session.user_variables)}"
+                    f"user_vars={len(session.user_variables)}, "
+                    f"idle={round(session.idle_seconds)}s"
                 )
                 return session.sandbox_globals
 
@@ -153,10 +173,30 @@ class KernelManager:
             session.touch()
             self._sessions[session_id] = session
             logger.info(
-                f"Kernel created: session={session_id}, "
+                f"Kernel CREATED: session={session_id}, "
                 f"active_kernels={len(self._sessions)}/{self.max_kernels}"
             )
             return session.sandbox_globals
+
+    def get_existing(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Get existing session globals WITHOUT creating a new session.
+        
+        Returns None if session doesn't exist.
+        Used by executor to get persisted globals and skip _build_safe_globals.
+        """
+        with self._lock:
+            self._cleanup_expired()
+            session = self._sessions.get(session_id)
+            if session:
+                session.touch()
+                logger.info(
+                    f"Kernel REUSED: session={session_id}, "
+                    f"exec_count={session.execution_count}, "
+                    f"user_vars={len(session.user_variables)}, "
+                    f"idle={round(session.idle_seconds)}s"
+                )
+                return session.sandbox_globals
+            return None
 
     def reset_session(self, session_id: str) -> bool:
         """Destroy a session's kernel (next execute will start fresh).

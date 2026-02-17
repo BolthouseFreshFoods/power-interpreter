@@ -8,31 +8,19 @@ Executes Python code in a controlled environment with:
 - Structured result extraction
 - PERSISTENT SESSION STATE (v2.0) - variables survive across calls
 - AUTO FILE STORAGE (v2.1) - generated files stored in Postgres with download URLs
-- INLINE CHART RENDERING (v2.5) - matplotlib/plotly charts auto-captured and
-  returned as inline image URLs for rendering directly in chat
+- INLINE CHART RENDERING (v2.6) - matplotlib/plotly charts auto-captured
 
-Design: Uses in-process isolation with restricted globals.
-The sandbox has access to pandas, numpy, matplotlib, etc.
-but cannot access the network, filesystem outside sandbox, or system commands.
+CRITICAL BUG FIX (v2.6):
+  'import matplotlib.pyplot as plt' was broken because:
+  1. _lazy_import('matplotlib') correctly set plt = matplotlib.pyplot
+  2. Then alias logic OVERWROTE it: plt = matplotlib (base module!)
+  3. So plt.subplots() → matplotlib.subplots() → AttributeError
+  
+  Fix: When _lazy_import returns True, skip alias override if the
+  alias already exists in sandbox_globals (lazy_import set it correctly).
+  Same fix applies to plotly.graph_objects as go, scipy.stats, etc.
 
-Session state is managed by KernelManager - globals dicts are persisted
-per session_id and reused across execute() calls, giving notebook-like
-continuity.
-
-Generated files (xlsx, png, csv, etc.) are automatically stored in
-Postgres (sandbox_files table) and download URLs are returned so they
-survive Railway container redeployments.
-
-Chart auto-capture (v2.5):
-  1. plt.show() is monkey-patched to save figures as PNG
-  2. matplotlib.use() calls in user code are silently stripped (we set Agg)
-  3. After execution, any UNCLOSED figures are auto-captured as a safety net
-  4. plt.savefig() is tracked so explicit saves also get inline URLs
-  This means ANY matplotlib code produces an inline image, whether the user
-  calls plt.show(), plt.savefig(), or neither.
-
-Version: 2.5.0 - Robust chart capture: strip matplotlib.use(), auto-capture
-                 unclosed figures, handle all chart generation patterns
+Version: 2.6.0 - Fix import alias override bug + robust chart capture
 """
 
 import asyncio
@@ -133,31 +121,25 @@ class ExecutionResult:
 
 
 class ChartCapture:
-    """Captures matplotlib figures when plt.show() is called.
-    
-    Three capture mechanisms:
+    """Captures matplotlib figures via three mechanisms:
     1. plt.show() replacement - captures all open figures
     2. Figure.savefig() wrapper - tracks explicitly saved images
     3. Post-execution sweep - captures any unclosed figures (safety net)
-    
-    The executor then stores these PNGs in Postgres and returns
-    inline image URLs.
     """
     
     def __init__(self, session_dir: Path):
         self.session_dir = session_dir
-        self.captured_charts: List[str] = []  # List of file paths
+        self.captured_charts: List[str] = []
         self._chart_counter = 0
-        self._savefig_tracked: set = set()  # Track files from savefig
+        self._savefig_tracked: set = set()
     
     def make_show_replacement(self, plt_module):
         """Create a replacement for plt.show() that captures figures."""
-        capture = self  # closure reference
+        capture = self
         
         def _capturing_show(*args, **kwargs):
             """Replacement for plt.show() that saves figures as PNG."""
             try:
-                # Get all open figures
                 fig_nums = plt_module.get_fignums()
                 if not fig_nums:
                     logger.debug("plt.show() called but no figures to capture")
@@ -167,11 +149,9 @@ class ChartCapture:
                     fig = plt_module.figure(fig_num)
                     capture._chart_counter += 1
                     
-                    # Generate filename
                     chart_name = f"chart_{capture._chart_counter:03d}.png"
                     chart_path = capture.session_dir / chart_name
                     
-                    # Save high-quality PNG
                     fig.savefig(
                         str(chart_path),
                         format='png',
@@ -185,23 +165,15 @@ class ChartCapture:
                     capture.captured_charts.append(chart_name)
                     logger.info(f"Chart captured via plt.show(): {chart_name} (figure {fig_num})")
                 
-                # Close all figures to free memory
                 plt_module.close('all')
                 
             except Exception as e:
                 logger.error(f"Chart capture via plt.show() failed: {e}", exc_info=True)
-                # Don't raise - let the code continue even if capture fails
         
         return _capturing_show
     
     def capture_unclosed_figures(self, plt_module):
-        """Safety net: capture any figures that weren't closed by plt.show().
-        
-        Called AFTER code execution completes. This handles cases where:
-        - User code creates a figure but doesn't call plt.show()
-        - User code calls plt.savefig() but we want inline rendering too
-        - User code creates multiple figures and only shows some
-        """
+        """Safety net: capture any figures that weren't closed by plt.show()."""
         try:
             fig_nums = plt_module.get_fignums()
             if not fig_nums:
@@ -215,7 +187,6 @@ class ChartCapture:
                 chart_name = f"chart_{self._chart_counter:03d}.png"
                 chart_path = self.session_dir / chart_name
                 
-                # Don't re-capture if already captured
                 if chart_name in self.captured_charts:
                     continue
                 
@@ -231,9 +202,8 @@ class ChartCapture:
                 
                 self.captured_charts.append(chart_name)
                 captured_count += 1
-                logger.info(f"Chart auto-captured (unclosed figure): {chart_name} (figure {fig_num})")
+                logger.info(f"Chart auto-captured (unclosed): {chart_name} (figure {fig_num})")
             
-            # Close all figures to free memory
             plt_module.close('all')
             
             if captured_count > 0:
@@ -243,24 +213,17 @@ class ChartCapture:
             logger.error(f"Auto-capture of unclosed figures failed: {e}", exc_info=True)
     
     def make_savefig_wrapper(self, original_savefig):
-        """Wrap Figure.savefig() to also track saved figures.
-        
-        Users who call fig.savefig() or plt.savefig() explicitly still get
-        their file, but we also track it for inline rendering.
-        """
+        """Wrap Figure.savefig() to track saved figures for inline rendering."""
         capture = self
         
         def _tracking_savefig(self_fig, fname, *args, **kwargs):
             """Wrapper around Figure.savefig that tracks output files."""
-            # Call original savefig
             result = original_savefig(self_fig, fname, *args, **kwargs)
             
-            # Track the file if it's an image
             try:
                 fname_str = str(fname)
                 fname_path = Path(fname_str)
                 if fname_path.suffix.lower() in IMAGE_EXTENSIONS:
-                    # If relative path, it's in session_dir (because we chdir)
                     if not fname_path.is_absolute():
                         rel_name = str(fname_path)
                         if rel_name not in capture._savefig_tracked:
@@ -287,7 +250,6 @@ class SandboxExecutor:
         """Build a safe builtins dict, handling both dict and module forms."""
         safe = {}
 
-        # Get the actual builtins dict regardless of form
         import builtins as builtins_module
 
         blocked = set(settings.BLOCKED_BUILTINS) if hasattr(settings, 'BLOCKED_BUILTINS') else {
@@ -411,7 +373,6 @@ class SandboxExecutor:
         from fractions import Fraction
         from pathlib import Path as PathLib
 
-        # Try dataclasses
         try:
             from dataclasses import dataclass, field, asdict
         except ImportError:
@@ -421,13 +382,9 @@ class SandboxExecutor:
 
         from typing import Dict, List, Optional, Tuple, Set, Any
 
-        # Get safe builtins
         safe_builtins = self._get_safe_builtins()
-
-        # Add safe file operations
         safe_builtins['open'] = self._make_safe_open(session_dir)
 
-        # Build globals
         sandbox_globals = {
             '__builtins__': safe_builtins,
             '__name__': '__sandbox__',
@@ -464,10 +421,9 @@ class SandboxExecutor:
 
             # Sandbox info
             'SANDBOX_DIR': str(session_dir),
-            'RESULT': None,  # User can set this for structured output
+            'RESULT': None,
         }
 
-        # Add pandas/numpy if available
         if pd is not None:
             sandbox_globals['pd'] = pd
             sandbox_globals['pandas'] = pd
@@ -475,7 +431,6 @@ class SandboxExecutor:
             sandbox_globals['np'] = np
             sandbox_globals['numpy'] = np
 
-        # Add dataclasses if available
         if dataclass is not None:
             sandbox_globals['dataclass'] = dataclass
             sandbox_globals['field'] = field
@@ -487,12 +442,10 @@ class SandboxExecutor:
     def _make_safe_open(self, session_dir: Path):
         """Create a safe open() that only allows access within session directory"""
         def safe_open(filepath, mode='r', *args, **kwargs):
-            # Resolve the path
             path = Path(filepath)
             if not path.is_absolute():
                 path = session_dir / path
 
-            # Ensure it's within the sandbox
             try:
                 resolved = path.resolve()
                 session_resolved = session_dir.resolve()
@@ -506,7 +459,6 @@ class SandboxExecutor:
             except Exception as e:
                 raise PermissionError(f"Invalid file path: {e}")
 
-            # Create parent directories if writing
             if 'w' in mode or 'a' in mode:
                 resolved.parent.mkdir(parents=True, exist_ok=True)
 
@@ -515,22 +467,13 @@ class SandboxExecutor:
         return safe_open
 
     def _install_chart_hooks(self, sandbox_globals: Dict, chart_capture: ChartCapture):
-        """Install matplotlib hooks for auto-capturing charts.
-        
-        This replaces plt.show() with our capturing version and wraps
-        Figure.savefig() to track explicitly saved images.
-        
-        Called AFTER _lazy_import loads matplotlib, and EVERY execution
-        (because the user might have reassigned plt in their code).
-        """
+        """Install matplotlib hooks for auto-capturing charts."""
         plt = sandbox_globals.get('plt')
         if plt is None:
             return
         
-        # Replace plt.show() with our capturing version
         plt.show = chart_capture.make_show_replacement(plt)
         
-        # Wrap Figure.savefig to track explicit saves
         try:
             import matplotlib.figure
             if not hasattr(matplotlib.figure.Figure, '_original_savefig'):
@@ -544,16 +487,7 @@ class SandboxExecutor:
         logger.debug("Chart capture hooks installed")
 
     def _strip_matplotlib_use(self, code: str) -> str:
-        """Strip matplotlib.use() calls from user code.
-        
-        We already set matplotlib.use('Agg') during lazy import.
-        If user code also calls matplotlib.use(), it can cause:
-        - Warnings about switching backends
-        - Errors if called after pyplot is imported
-        - Confusion for the AI agent
-        
-        We silently replace these with a comment.
-        """
+        """Strip matplotlib.use() calls from user code (we already set Agg)."""
         def _replace_use(match):
             original = match.group(0).strip()
             return f"# [sandbox] {original} -> already set (Agg backend)"
@@ -564,13 +498,14 @@ class SandboxExecutor:
         """Lazily import allowed libraries into sandbox.
 
         Returns True if the module was loaded (or already available).
-        When loading, also imports common submodules so that
-        'from X.Y import Z' can be resolved via attribute access.
+        When loading, also imports common submodules AND sets the
+        correct aliases (plt, go, px, sns, sm, etc.) so that the
+        preprocessor doesn't need to override them.
         """
         try:
             if name == 'matplotlib' or name == 'matplotlib.pyplot':
                 import matplotlib
-                matplotlib.use('Agg')  # Non-interactive backend
+                matplotlib.use('Agg')
                 import matplotlib.pyplot as plt
                 import matplotlib.patches
                 import matplotlib.gridspec
@@ -585,9 +520,13 @@ class SandboxExecutor:
                     import matplotlib.image
                 except ImportError:
                     pass
+                try:
+                    import matplotlib.backends.backend_agg
+                except ImportError:
+                    pass
                 sandbox_globals['matplotlib'] = matplotlib
                 sandbox_globals['plt'] = plt
-                # NOTE: Chart hooks are installed in execute() after preprocessing
+                logger.info("Loaded matplotlib + pyplot (plt)")
                 return True
             elif name == 'seaborn':
                 import seaborn as sns
@@ -598,9 +537,14 @@ class SandboxExecutor:
                 import plotly
                 import plotly.express as px
                 import plotly.graph_objects as go
+                try:
+                    import plotly.io as pio
+                except ImportError:
+                    pass
                 sandbox_globals['plotly'] = plotly
                 sandbox_globals['px'] = px
                 sandbox_globals['go'] = go
+                logger.info("Loaded plotly + express (px) + graph_objects (go)")
                 return True
             elif name == 'scipy' or name == 'scipy.stats':
                 import scipy
@@ -705,12 +649,10 @@ class SandboxExecutor:
                 sandbox_globals['pathlib'] = pathlib
                 return True
             elif name == 'os':
-                # Provide limited os functionality
                 import os as os_module
                 sandbox_globals['os'] = os_module
                 return True
             elif name == 'urllib':
-                # Allow urllib for HTTP operations within sandbox
                 import urllib
                 import urllib.request
                 import urllib.parse
@@ -718,7 +660,6 @@ class SandboxExecutor:
                 sandbox_globals['urllib'] = urllib
                 return True
             elif name == 'requests':
-                # Allow requests if installed
                 try:
                     import requests as requests_module
                     sandbox_globals['requests'] = requests_module
@@ -734,11 +675,14 @@ class SandboxExecutor:
     def _preprocess_code(self, code: str, sandbox_globals: Dict) -> str:
         """Preprocess code to handle imports and add safety wrappers.
 
-        Key behaviors:
-        1. 'from X.Y import A, B, C' → resolved via attribute access
-        2. 'import X' → lazy-loaded into sandbox globals
-        3. matplotlib.use('...') → silently stripped (we set Agg)
-        4. Unknown imports → blocked with comment
+        CRITICAL FIX (v2.6): For 'import X.Y as Z', do NOT override Z
+        if _lazy_import already set it correctly. Previously:
+          import matplotlib.pyplot as plt
+          → _lazy_import sets plt = matplotlib.pyplot  ✓
+          → alias logic sets plt = matplotlib           ✗ (OVERWRITES!)
+        
+        Now: if the alias already exists in sandbox_globals after
+        _lazy_import, we skip the alias override.
         """
         # First: strip matplotlib.use() calls
         code = self._strip_matplotlib_use(code)
@@ -762,19 +706,16 @@ class SandboxExecutor:
                 # ============================================================
                 if stripped.startswith('from '):
                     try:
-                        # Parse: from <module_path> import <names>
                         parts = stripped.split(' import ', 1)
                         if len(parts) == 2:
                             module_path = parts[0].replace('from ', '').strip()
                             import_names_str = parts[1].strip()
                             base_module = module_path.split('.')[0]
 
-                            # Try to lazy-load the base module
                             if base_module not in sandbox_globals:
                                 self._lazy_import(base_module, sandbox_globals)
 
                             if base_module in sandbox_globals:
-                                # Parse the imported names (handle 'A, B, C' and 'A as X')
                                 import_items = [n.strip() for n in import_names_str.split(',')]
                                 assignment_lines = []
 
@@ -783,7 +724,6 @@ class SandboxExecutor:
                                     if not item:
                                         continue
 
-                                    # Handle 'Name as Alias'
                                     if ' as ' in item:
                                         original, alias = item.split(' as ', 1)
                                         original = original.strip()
@@ -792,8 +732,6 @@ class SandboxExecutor:
                                         original = item
                                         alias = item
 
-                                    # Build assignment: alias = module_path.original
-                                    # e.g. Font = openpyxl.styles.Font
                                     assignment_lines.append(
                                         f"{alias} = {module_path}.{original}"
                                     )
@@ -808,13 +746,11 @@ class SandboxExecutor:
                                     processed_lines.append(f"# [sandbox] {stripped} -> pre-loaded")
                                     continue
                             else:
-                                # Base module not available
                                 processed_lines.append(
                                     f"# [sandbox] BLOCKED: {stripped} (module {base_module} not in allowed list)"
                                 )
                                 continue
                         else:
-                            # Malformed from-import
                             module = stripped.split()[1].split('.')[0]
                             if self._lazy_import(module, sandbox_globals):
                                 processed_lines.append(f"# [sandbox] {stripped} -> pre-loaded")
@@ -829,7 +765,6 @@ class SandboxExecutor:
                                 continue
                     except Exception as e:
                         logger.warning(f"Failed to parse from-import '{stripped}': {e}")
-                        # Fall through to simple handling
                         try:
                             module = stripped.split()[1].split('.')[0]
                             if self._lazy_import(module, sandbox_globals):
@@ -846,29 +781,67 @@ class SandboxExecutor:
                         continue
 
                 # ============================================================
-                # Case 2: 'import X' or 'import X as Y' or 'import X.Y'
+                # Case 2: 'import X' or 'import X as Y' or 'import X.Y as Z'
+                #
+                # CRITICAL FIX (v2.6): For 'import X.Y as Z':
+                #   _lazy_import('X') already sets the correct aliases
+                #   (e.g., plt for matplotlib.pyplot, go for plotly.graph_objects)
+                #   Do NOT override Z with X if Z already exists in globals.
                 # ============================================================
                 else:
-                    # Extract module name
                     module = stripped.split()[1].split('.')[0].split(',')[0]
 
-                    # Try to lazy-load it
                     if self._lazy_import(module, sandbox_globals):
-                        # Handle 'import X as Y'
+                        # Handle 'import X as Y' or 'import X.Y as Z'
                         if ' as ' in stripped:
                             alias = stripped.split(' as ')[-1].strip()
-                            if module in sandbox_globals:
-                                sandbox_globals[alias] = sandbox_globals[module]
+                            # CRITICAL FIX: Only set alias if it's NOT already
+                            # in sandbox_globals. _lazy_import may have already
+                            # set it to the correct submodule (e.g., plt = pyplot,
+                            # go = graph_objects). Don't overwrite with base module!
+                            if alias not in sandbox_globals:
+                                # Try to resolve the full dotted path
+                                full_module = stripped.split()[1].split(' as ')[0].strip() if ' as ' in stripped.split()[1] else stripped.split()[1]
+                                parts = full_module.split('.')
+                                obj = sandbox_globals.get(parts[0])
+                                if obj and len(parts) > 1:
+                                    try:
+                                        for part in parts[1:]:
+                                            obj = getattr(obj, part)
+                                        sandbox_globals[alias] = obj
+                                        logger.info(f"Alias resolved: {alias} = {full_module}")
+                                    except AttributeError:
+                                        # Fallback: set to base module
+                                        sandbox_globals[alias] = sandbox_globals[module]
+                                        logger.warning(f"Alias fallback: {alias} = {module}")
+                                elif obj:
+                                    sandbox_globals[alias] = obj
+                            else:
+                                logger.debug(f"Alias '{alias}' already set by _lazy_import, skipping override")
                         processed_lines.append(f"# [sandbox] {stripped} -> pre-loaded")
                         continue
                     elif module in sandbox_globals:
                         if ' as ' in stripped:
                             alias = stripped.split(' as ')[-1].strip()
-                            sandbox_globals[alias] = sandbox_globals[module]
+                            if alias not in sandbox_globals:
+                                # Same resolution logic for already-loaded modules
+                                full_module = stripped.split()[1]
+                                if ' as ' in full_module:
+                                    full_module = full_module.split(' as ')[0].strip()
+                                parts = full_module.split('.')
+                                obj = sandbox_globals.get(parts[0])
+                                if obj and len(parts) > 1:
+                                    try:
+                                        for part in parts[1:]:
+                                            obj = getattr(obj, part)
+                                        sandbox_globals[alias] = obj
+                                    except AttributeError:
+                                        sandbox_globals[alias] = sandbox_globals[module]
+                                elif obj:
+                                    sandbox_globals[alias] = obj
                         processed_lines.append(f"# [sandbox] {stripped} -> already available")
                         continue
                     else:
-                        # Block unknown imports
                         processed_lines.append(
                             f"# [sandbox] BLOCKED: {stripped} (not in allowed list)"
                         )
@@ -879,7 +852,7 @@ class SandboxExecutor:
         return '\n'.join(processed_lines)
 
     # ================================================================
-    # File Storage: Store generated files in Postgres for download URLs
+    # File Storage
     # ================================================================
 
     async def _store_files_in_postgres(
@@ -888,16 +861,7 @@ class SandboxExecutor:
         session_id: str,
         session_dir: Path,
     ) -> List[Dict[str, str]]:
-        """Store newly created files in Postgres and return download URL info.
-
-        For each new file:
-        1. Read bytes from disk
-        2. Check size is under SANDBOX_FILE_MAX_MB
-        3. Insert into sandbox_files table
-        4. Build public download URL with filename in path
-
-        Returns list of dicts: [{filename, url, size_human, is_image}]
-        """
+        """Store newly created files in Postgres and return download URL info."""
         if not new_file_paths:
             return []
 
@@ -919,40 +883,28 @@ class SandboxExecutor:
                         if not file_path.exists() or not file_path.is_file():
                             continue
 
-                        # Check extension
                         ext = file_path.suffix.lower()
                         if ext not in STORABLE_EXTENSIONS:
                             logger.debug(f"Skipping {rel_path}: extension {ext} not storable")
                             continue
 
-                        # Check size
                         file_size = file_path.stat().st_size
                         if file_size > max_bytes:
-                            logger.warning(
-                                f"Skipping {rel_path}: {file_size} bytes exceeds "
-                                f"{settings.SANDBOX_FILE_MAX_MB}MB limit"
-                            )
+                            logger.warning(f"Skipping {rel_path}: {file_size} bytes exceeds limit")
                             continue
 
                         if file_size == 0:
                             logger.debug(f"Skipping {rel_path}: empty file")
                             continue
 
-                        # Read file bytes
                         file_bytes = file_path.read_bytes()
-
-                        # Compute checksum
                         checksum = hashlib.sha256(file_bytes).hexdigest()
-
-                        # Determine MIME type
                         mime_type = get_mime_type(file_path.name)
 
-                        # Compute expiry
                         expires_at = None
                         if ttl_hours > 0:
                             expires_at = datetime.utcnow() + timedelta(hours=ttl_hours)
 
-                        # Create SandboxFile record
                         file_id = uuid.uuid4()
                         sandbox_file = SandboxFile(
                             id=file_id,
@@ -966,14 +918,12 @@ class SandboxExecutor:
                         )
                         db_session.add(sandbox_file)
 
-                        # Build download URL WITH FILENAME IN PATH
                         encoded_filename = quote(file_path.name)
                         if base_url:
                             url = f"{base_url}/dl/{file_id}/{encoded_filename}"
                         else:
                             url = f"/dl/{file_id}/{encoded_filename}"
 
-                        # Human-readable size
                         if file_size < 1024:
                             size_human = f"{file_size} B"
                         elif file_size < 1024 * 1024:
@@ -981,7 +931,6 @@ class SandboxExecutor:
                         else:
                             size_human = f"{file_size / (1024 * 1024):.1f} MB"
 
-                        # Flag images for inline rendering
                         is_image = ext in IMAGE_EXTENSIONS
 
                         download_info.append({
@@ -994,16 +943,12 @@ class SandboxExecutor:
                             'expires_at': expires_at.isoformat() if expires_at else None,
                         })
 
-                        logger.info(
-                            f"Stored in Postgres: {file_path.name} "
-                            f"({size_human}, image={is_image}) -> {url}"
-                        )
+                        logger.info(f"Stored in Postgres: {file_path.name} ({size_human}, image={is_image}) -> {url}")
 
                     except Exception as e:
                         logger.error(f"Failed to store {rel_path}: {e}")
                         continue
 
-                # Commit all files at once
                 if download_info:
                     await db_session.commit()
                     logger.info(f"Committed {len(download_info)} files to Postgres")
@@ -1026,26 +971,10 @@ class SandboxExecutor:
     ) -> ExecutionResult:
         """Execute Python code in sandbox with PERSISTENT STATE.
 
-        Variables, dataframes, and imports persist across calls
-        within the same session_id. Like a Jupyter notebook.
-
-        Generated files are automatically stored in Postgres and
-        download URLs are included in the result.
-
-        Charts created with matplotlib are auto-captured via three mechanisms:
-        1. plt.show() interception → saves all open figures
-        2. Figure.savefig() tracking → tracks explicitly saved images
-        3. Post-execution sweep → captures any unclosed figures
-
-        Args:
-            code: Python code to execute
-            session_id: Session ID for state + file isolation
-            timeout: Max execution time in seconds
-            context: Additional variables to inject
-
-        Returns:
-            ExecutionResult with stdout, stderr, result, download_urls,
-            inline_images, etc.
+        Charts are auto-captured via three mechanisms:
+        1. plt.show() interception
+        2. Figure.savefig() tracking
+        3. Post-execution unclosed figure sweep
         """
         result = ExecutionResult()
         timeout = timeout or settings.MAX_EXECUTION_TIME
@@ -1053,13 +982,10 @@ class SandboxExecutor:
         logger.info(f"Executing code: session={session_id}, timeout={timeout}s")
         logger.info(f"Code preview: {code[:200]}")
 
-        # Create session directory
         session_dir = self.sandbox_dir / session_id
         session_dir.mkdir(parents=True, exist_ok=True)
 
-        # =====================================================================
-        # PERSISTENT KERNEL: Check if kernel exists BEFORE building globals
-        # =====================================================================
+        # PERSISTENT KERNEL
         try:
             sandbox_globals = kernel_manager.get_existing(session_id)
             
@@ -1080,14 +1006,12 @@ class SandboxExecutor:
             result.error_traceback = traceback.format_exc()
             return result
 
-        # Reset RESULT for this execution (don't carry over from last call)
         sandbox_globals['RESULT'] = None
 
-        # Inject context variables
         if context:
             sandbox_globals.update(context)
 
-        # Preprocess code (handle imports, strip matplotlib.use(), add safety)
+        # Preprocess code
         try:
             processed_code = self._preprocess_code(code, sandbox_globals)
         except Exception as e:
@@ -1099,18 +1023,11 @@ class SandboxExecutor:
 
         logger.info(f"Processed code preview: {processed_code[:300]}")
 
-        # =====================================================================
-        # CHART CAPTURE: Set up matplotlib hooks BEFORE execution
-        #
-        # Create a fresh ChartCapture for each execution. Install hooks
-        # on plt.show() so that any charts are saved as PNG and tracked.
-        # This happens AFTER preprocessing (which may have loaded matplotlib).
-        # =====================================================================
+        # CHART CAPTURE setup
         chart_capture = ChartCapture(session_dir)
         if 'plt' in sandbox_globals or 'matplotlib' in sandbox_globals:
             self._install_chart_hooks(sandbox_globals, chart_capture)
 
-        # Capture stdout/stderr
         stdout_capture = io.StringIO()
         stderr_capture = io.StringIO()
 
@@ -1122,7 +1039,6 @@ class SandboxExecutor:
             except Exception:
                 pass
 
-        # Execute
         start_time = time.time()
 
         try:
@@ -1143,13 +1059,10 @@ class SandboxExecutor:
                     original_cwd = os.getcwd()
                     try:
                         os.chdir(session_dir)
-                        logger.debug(f"Changed CWD to {session_dir}")
-
                         compiled = compile(processed_code, '<sandbox>', 'exec')
                         exec(compiled, sandbox_globals)
                     finally:
                         os.chdir(original_cwd)
-                        logger.debug(f"Restored CWD to {original_cwd}")
 
             await asyncio.wait_for(
                 loop.run_in_executor(None, _execute),
@@ -1159,10 +1072,7 @@ class SandboxExecutor:
             result.success = True
             logger.info("Code execution succeeded")
 
-            # =====================================================================
-            # POST-EXECUTION: Auto-capture any unclosed matplotlib figures
-            # This is the safety net - catches charts even if plt.show() wasn't called
-            # =====================================================================
+            # POST-EXECUTION: Auto-capture unclosed figures
             if 'plt' in sandbox_globals:
                 try:
                     plt = sandbox_globals['plt']
@@ -1170,11 +1080,9 @@ class SandboxExecutor:
                 except Exception as e:
                     logger.debug(f"Post-execution figure capture failed: {e}")
 
-            # Extract RESULT variable if set
             if 'RESULT' in sandbox_globals and sandbox_globals['RESULT'] is not None:
                 result.result = sandbox_globals['RESULT']
 
-            # Get variables from kernel session
             session_info = kernel_manager.get_session_info(session_id)
             if session_info:
                 result.variables = session_info['variables']
@@ -1219,7 +1127,6 @@ class SandboxExecutor:
             if result.error_message:
                 logger.error(f"error: {result.error_message}")
 
-            # Track memory usage
             if HAS_RESOURCE:
                 try:
                     usage = resource_module.getrusage(resource_module.RUSAGE_SELF)
@@ -1227,7 +1134,6 @@ class SandboxExecutor:
                 except Exception:
                     result.memory_used_mb = 0.0
 
-            # Track new files created (includes chart PNGs from auto-capture)
             if session_dir.exists():
                 try:
                     files_after = set(str(p) for p in session_dir.rglob('*') if p.is_file())
@@ -1240,12 +1146,7 @@ class SandboxExecutor:
                 except Exception:
                     pass
 
-        # =================================================================
         # AUTO FILE STORAGE + INLINE IMAGE DETECTION
-        #
-        # Store all new files in Postgres. For images (especially charts),
-        # also populate inline_images for rendering in chat.
-        # =================================================================
         if result.files_created:
             try:
                 download_info = await self._store_files_in_postgres(
@@ -1255,7 +1156,6 @@ class SandboxExecutor:
                 )
                 result.download_urls = download_info
 
-                # Separate images for inline rendering
                 for info in download_info:
                     if info.get('is_image', False):
                         result.inline_images.append({
@@ -1264,14 +1164,12 @@ class SandboxExecutor:
                             'alt_text': info['filename'].replace('_', ' ').replace('.png', ''),
                         })
 
-                # Log chart capture results
                 if chart_capture.captured_charts:
                     logger.info(
                         f"Charts auto-captured: {chart_capture.captured_charts} "
                         f"-> {len(result.inline_images)} inline images"
                     )
 
-                # Append download URLs to stdout for non-image files
                 non_image_downloads = [d for d in download_info if not d.get('is_image', False)]
                 if non_image_downloads:
                     url_lines = ["\n\nGenerated files ready for download:"]
@@ -1280,12 +1178,9 @@ class SandboxExecutor:
                             f"\n[{info['filename']} ({info['size']}) - Click to Download]({info['url']})"
                         )
                         url_lines.append(f"Direct link: {info['url']}")
-                    url_summary = '\n'.join(url_lines)
-                    result.stdout = result.stdout + url_summary
+                    result.stdout = result.stdout + '\n'.join(url_lines)
                     logger.info(f"Appended {len(non_image_downloads)} download URLs to stdout")
 
-                # For images, append markdown image syntax to stdout
-                # This gives the AI agent the URLs to render inline
                 if result.inline_images:
                     img_lines = ["\n\nGenerated charts:"]
                     for img in result.inline_images:

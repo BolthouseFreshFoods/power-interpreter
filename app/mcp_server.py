@@ -16,13 +16,15 @@ MCP Tools (12):
 - list_datasets: List loaded datasets
 - create_session: Create workspace session
 
-Version: 1.1.1 - Improved tool descriptions for SimTheory file handling
+Version: 1.2.0 - Fix: Strip download_urls from JSON to prevent SimTheory
+                 broken widget; present URLs as plain text for AI agent
 """
 
 from mcp.server.fastmcp import FastMCP
 from typing import Optional, Dict
 import httpx
 import os
+import json
 import logging
 
 logger = logging.getLogger(__name__)
@@ -44,6 +46,72 @@ logger.info(f"MCP Server: API_KEY={'***configured***' if API_KEY else 'NOT SET'}
 
 def _headers():
     return {"X-API-Key": API_KEY, "Content-Type": "application/json"}
+
+
+def _reformat_execution_response(resp_text: str) -> str:
+    """Reformat execute_code response for SimTheory consumption.
+    
+    SimTheory's frontend intercepts 'download_urls' in structured JSON
+    and renders a broken download widget. To work around this:
+    
+    1. Parse the JSON response
+    2. Extract download_urls info
+    3. Remove download_urls from the structured response
+    4. Append download info as plain text to stdout
+       so the AI agent can present links naturally in chat
+    
+    This ensures download links appear as regular clickable text
+    rather than SimTheory's broken embedded widget.
+    """
+    try:
+        data = json.loads(resp_text)
+    except (json.JSONDecodeError, TypeError):
+        # Not JSON, return as-is
+        return resp_text
+    
+    # Check if there are download_urls to reformat
+    download_urls = data.get('download_urls', [])
+    if not download_urls:
+        return resp_text
+    
+    # Build plain-text download section
+    # The AI agent will see this in stdout and present it to the user
+    download_text = "\n\n" + "=" * 50 + "\n"
+    download_text += "DOWNLOAD LINKS (copy URL or click):\n"
+    download_text += "=" * 50 + "\n"
+    for info in download_urls:
+        filename = info.get('filename', 'file')
+        url = info.get('url', '')
+        size = info.get('size', '')
+        download_text += f"\n  {filename} ({size})\n"
+        download_text += f"  {url}\n"
+    download_text += "\n" + "=" * 50
+    
+    # Append to stdout (the AI agent reads this)
+    current_stdout = data.get('stdout', '')
+    # Remove any previously appended download sections from executor
+    # (in case executor also appended them)
+    if 'Generated files ready for download:' in current_stdout:
+        # Strip the executor's markdown-formatted section
+        idx = current_stdout.find('\n\nGenerated files ready for download:')
+        if idx >= 0:
+            current_stdout = current_stdout[:idx]
+    
+    data['stdout'] = current_stdout + download_text
+    
+    # Remove download_urls from structured data
+    # This prevents SimTheory from triggering its broken download widget
+    data['download_urls'] = []
+    
+    # Also add a hint for the AI agent
+    if not data.get('result'):
+        data['result'] = (
+            f"Files generated successfully. "
+            f"Download links are in the stdout output above. "
+            f"Present the URLs to the user as clickable links."
+        )
+    
+    return json.dumps(data)
 
 
 # ============================================================
@@ -78,6 +146,10 @@ async def execute_code(
     Pre-installed libraries: pandas, numpy, matplotlib, plotly, seaborn,
     scipy, scikit-learn, statsmodels, openpyxl, pdfplumber.
     
+    GENERATED FILES: When code creates files (xlsx, csv, png, etc.), download
+    URLs will appear in the stdout output. Present these URLs to the user
+    as clickable links so they can download the files.
+    
     Use for quick operations (<60s). For longer tasks, use submit_job.
     
     Args:
@@ -86,7 +158,8 @@ async def execute_code(
         timeout: Max seconds (max 60 for sync)
     
     Returns:
-        Execution result with stdout, result, errors, files created
+        Execution result with stdout, result, errors, files created.
+        If files were generated, download URLs appear in stdout.
     """
     url = f"{API_BASE}/api/execute"
     logger.info(f"execute_code: POST {url}")
@@ -98,7 +171,9 @@ async def execute_code(
                 json={"code": code, "session_id": session_id, "timeout": timeout}
             )
             logger.info(f"execute_code: response status={resp.status_code}")
-            return resp.text
+            
+            # Reformat response to prevent SimTheory's broken download widget
+            return _reformat_execution_response(resp.text)
     except Exception as e:
         logger.error(f"execute_code: error: {e}", exc_info=True)
         return f"Error calling execute API: {e}"
@@ -186,7 +261,8 @@ async def get_job_result(job_id: str) -> str:
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.get(url, headers=_headers())
-            return resp.text
+            # Also reformat job results in case they contain download URLs
+            return _reformat_execution_response(resp.text)
     except Exception as e:
         logger.error(f"get_job_result: error: {e}", exc_info=True)
         return f"Error calling get_job_result API: {e}"

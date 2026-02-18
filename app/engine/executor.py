@@ -9,6 +9,7 @@ Executes Python code in a controlled environment with:
 - PERSISTENT SESSION STATE (v2.0) - variables survive across calls
 - AUTO FILE STORAGE (v2.1) - generated files stored in Postgres with download URLs
 - INLINE CHART RENDERING (v2.6) - matplotlib/plotly charts auto-captured
+- DEFENSIVE PATH NORMALIZATION (v2.8) - strips doubled session_id prefixes
 
 CRITICAL BUG FIX (v2.6):
   'import matplotlib.pyplot as plt' was broken because:
@@ -26,7 +27,17 @@ v2.7.0 - Add reportlab + matplotlib PDF backend to sandbox allowlist
   2. matplotlib.backends.backend_pdf was not imported (only backend_agg)
   Both paths now work.
 
-Version: 2.7.0
+v2.8.0 - Defensive path normalization
+  AI sometimes generates paths like 'default/filename.xlsx' when the
+  executor's cwd is already /sandbox/sessions/default/. This causes
+  [Errno 2] because it resolves to default/default/filename.xlsx.
+  
+  Fix: Two-layer defense:
+  1. _make_safe_open() strips session_id/ prefix from relative paths
+  2. _normalize_path() helper injected into sandbox globals
+  Both silently fix the path and log a warning.
+
+Version: 2.8.0
 """
 
 import asyncio
@@ -446,10 +457,41 @@ class SandboxExecutor:
         return sandbox_globals
 
     def _make_safe_open(self, session_dir: Path):
-        """Create a safe open() that only allows access within session directory"""
+        """Create a safe open() that only allows access within session directory.
+        
+        v2.8.0: Also normalizes paths to strip doubled session_id prefixes.
+        If AI generates 'default/file.xlsx' and cwd is already the default
+        session dir, we strip the prefix and use just 'file.xlsx'.
+        """
+        # Pre-compute the session_id from the directory name for prefix stripping
+        _session_name = session_dir.name  # e.g., 'default'
+        
         def safe_open(filepath, mode='r', *args, **kwargs):
             path = Path(filepath)
+            
+            # ============================================================
+            # v2.8.0: PATH NORMALIZATION
+            # Strip session_id prefix from relative paths.
+            # AI sometimes generates 'default/file.xlsx' when cwd is already
+            # /sandbox/sessions/default/, causing double-prefix.
+            # ============================================================
             if not path.is_absolute():
+                path_str = str(path)
+                prefix_slash = f"{_session_name}/"
+                prefix_backslash = f"{_session_name}\\"
+                
+                if path_str.startswith(prefix_slash) or path_str.startswith(prefix_backslash):
+                    stripped = path_str[len(prefix_slash):]
+                    # Only strip if the stripped version exists OR the original doesn't
+                    stripped_path = session_dir / stripped
+                    original_path = session_dir / path_str
+                    if stripped_path.exists() or not original_path.exists():
+                        logger.warning(
+                            f"Path normalization: '{path_str}' -> '{stripped}' "
+                            f"(stripped session prefix '{_session_name}/')"
+                        )
+                        path = Path(stripped)
+                
                 path = session_dir / path
 
             try:
@@ -471,6 +513,40 @@ class SandboxExecutor:
             return open(resolved, mode, *args, **kwargs)
 
         return safe_open
+
+    def _make_normalize_path(self, session_dir: Path):
+        """Create a path normalization helper to inject into sandbox globals.
+        
+        v2.8.0: This function is available in user code as _normalize_path().
+        It strips session_id prefixes and resolves paths relative to the
+        session directory. Useful as a safety net for pandas, openpyxl, etc.
+        that don't go through our safe_open().
+        """
+        _session_name = session_dir.name
+        
+        def _normalize_path(filepath):
+            """Normalize a file path for sandbox use.
+            
+            Strips doubled session prefixes (e.g., 'default/file.csv' -> 'file.csv')
+            when the current working directory is already the session directory.
+            """
+            path_str = str(filepath)
+            
+            # Don't touch absolute paths
+            if os.path.isabs(path_str):
+                return path_str
+            
+            # Strip session_id prefix if present
+            prefix = f"{_session_name}/"
+            if path_str.startswith(prefix):
+                stripped = path_str[len(prefix):]
+                # Prefer stripped if it exists, or if original doesn't exist
+                if os.path.exists(stripped) or not os.path.exists(path_str):
+                    return stripped
+            
+            return path_str
+        
+        return _normalize_path
 
     def _install_chart_hooks(self, sandbox_globals: Dict, chart_capture: ChartCapture):
         """Install matplotlib hooks for auto-capturing charts."""
@@ -715,8 +791,8 @@ class SandboxExecutor:
             return False
         return False
 
-    def _preprocess_code(self, code: str, sandbox_globals: Dict) -> str:
-        """Preprocess code to handle imports and add safety wrappers.
+    def _preprocess_code(self, code: str, sandbox_globals: Dict, session_id: str = "default") -> str:
+        """Preprocess code to handle imports, add safety wrappers, and normalize paths.
 
         CRITICAL FIX (v2.6): For 'import X.Y as Z', do NOT override Z
         if _lazy_import already set it correctly. Previously:
@@ -726,9 +802,31 @@ class SandboxExecutor:
         
         Now: if the alias already exists in sandbox_globals after
         _lazy_import, we skip the alias override.
+        
+        v2.8.0: Also normalizes file path strings that contain the
+        session_id as a prefix (e.g., 'default/file.csv' -> 'file.csv').
         """
         # First: strip matplotlib.use() calls
         code = self._strip_matplotlib_use(code)
+        
+        # v2.8.0: Strip session_id prefix from path-like strings in code
+        # Matches patterns like: 'default/filename.ext' or "default/filename.ext"
+        # Only strips when it looks like a file path (has an extension)
+        session_prefix_pattern = re_module.compile(
+            r"""(['"])""" + re_module.escape(session_id) + r"""/([^'"]+\.[a-zA-Z0-9]+)(['"])"""
+        )
+        
+        def _strip_session_prefix(match):
+            open_quote = match.group(1)
+            filename = match.group(2)
+            close_quote = match.group(3)
+            logger.warning(
+                f"Code path normalization: '{session_id}/{filename}' -> '{filename}' "
+                f"(stripped session prefix from code)"
+            )
+            return f"{open_quote}{filename}{close_quote}"
+        
+        code = session_prefix_pattern.sub(_strip_session_prefix, code)
         
         lines = code.split('\n')
         processed_lines = []
@@ -1051,12 +1149,15 @@ class SandboxExecutor:
 
         sandbox_globals['RESULT'] = None
 
+        # v2.8.0: Inject path normalization helper into sandbox
+        sandbox_globals['_normalize_path'] = self._make_normalize_path(session_dir)
+
         if context:
             sandbox_globals.update(context)
 
-        # Preprocess code
+        # Preprocess code (now includes path normalization)
         try:
-            processed_code = self._preprocess_code(code, sandbox_globals)
+            processed_code = self._preprocess_code(code, sandbox_globals, session_id=session_id)
         except Exception as e:
             logger.error(f"Failed to preprocess code: {e}", exc_info=True)
             result.success = False

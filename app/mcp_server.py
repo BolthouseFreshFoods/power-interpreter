@@ -3,7 +3,7 @@
 Defines the MCP tools that SimTheory.ai can call.
 This maps MCP tool calls to the FastAPI endpoints.
 
-MCP Tools (12):
+MCP Tools (11):
 - execute_code: Run Python code (sync, <60s)
 - submit_job: Submit long-running job (async)
 - get_job_status: Check job progress
@@ -16,9 +16,11 @@ MCP Tools (12):
 - list_datasets: List loaded datasets
 - create_session: Create workspace session
 
-Version: 1.5.2 - Fix: stop stripping URLs from stdout
+Version: 1.6.0 - Auto File Handling: improved tool descriptions for
+                 reliable multi-step chaining. AI now knows the correct
+                 sequence for file → analysis workflows.
 
-HISTORY OF THE BUG:
+HISTORY:
   v1.2.0: Response was a JSON blob. URLs lived in stdout. AI parsed them. WORKED.
   v1.5.0: Introduced content blocks. Stripped URLs from stdout, tried to rebuild
            from inline_images[]/download_urls[] arrays. Those arrays were empty
@@ -26,6 +28,9 @@ HISTORY OF THE BUG:
   v1.5.1: Switched from markdown to plain text URLs. Still stripped stdout. Still broken.
   v1.5.2: Stop stripping stdout. Pass URLs through as-is. Belt-and-suspenders:
            also create extra blocks from JSON arrays if populated.
+  v1.6.0: Auto File Handling. Rewrote tool descriptions so the AI reliably
+           chains fetch_file → execute_code, upload_file → execute_code,
+           and fetch_file → load_dataset → query_dataset. No logic changes.
 """
 
 from mcp.server.fastmcp import FastMCP
@@ -199,49 +204,53 @@ async def execute_code(
     session_id: str = "default",
     timeout: int = 30
 ) -> list:
-    """Execute Python code in a persistent sandboxed environment on Railway.
+    """Execute Python code in a persistent sandboxed environment.
     
-    SESSION PERSISTENCE - IMPORTANT:
-    This environment works like a Jupyter notebook. Variables, DataFrames,
-    imports, and objects persist across calls WITHIN THE SAME session_id.
+    IMPORTANT — READ BEFORE CALLING:
     
-    ALWAYS use session_id="default" unless you have a specific reason to
-    isolate work (e.g., separate projects). DO NOT create new session IDs
-    for each call — that defeats persistence and forces a fresh environment.
+    1. REMOTE EXECUTION: Code runs on a REMOTE server, NOT locally.
+       You CANNOT use local file paths like /home/ubuntu/... or /tmp/uploads/...
     
-    Example of persistence:
-      Call 1: execute_code("import pandas as pd; df = pd.read_csv('data.csv')", session_id="default")
-      Call 2: execute_code("print(df.shape)", session_id="default")  # df still exists!
-      Call 3: execute_code("summary = df.describe(); print(summary)", session_id="default")  # works!
+    2. FILE ACCESS: To work with files, you MUST get them into the sandbox first:
+       - User provided a URL? → Call fetch_file FIRST, then execute_code.
+       - User attached/uploaded a file? → Call upload_file FIRST, then execute_code.
+       - File already in sandbox? → Just reference it by filename: 'data.csv'
+       Do NOT use pd.read_csv('https://...') — outbound HTTP from code is blocked.
     
-    CHARTS AND VISUALIZATIONS:
-    When code calls plt.show() or creates matplotlib figures, charts are
-    automatically captured as PNG images. Download URLs for the chart images
-    will appear in the stdout output. Present these URLs to the user.
+    3. SESSION PERSISTENCE: This works like a Jupyter notebook. Variables, imports,
+       and DataFrames persist across calls WITHIN the same session_id.
+       ALWAYS use session_id="default" unless isolating separate projects.
+       Do NOT create new session IDs per call — that destroys persistence.
+       
+       Example:
+         Call 1: execute_code("import pandas as pd; df = pd.read_csv('data.csv')")
+         Call 2: execute_code("print(df.shape)")  # df still exists!
+         Call 3: execute_code("summary = df.describe()")  # builds on previous work
     
-    GENERATED FILES:
-    When code creates files (xlsx, csv, pdf), download URLs are included
-    in the stdout output. Present these URLs to the user as clickable links.
+    4. CHARTS: matplotlib/plotly figures are auto-captured as PNG images.
+       Download URLs appear in stdout. Present these to the user.
     
-    REMOTE EXECUTION:
-    This runs on a REMOTE server, NOT locally. You CANNOT reference
-    local file paths like /home/ubuntu/... or /tmp/uploads/...
+    5. GENERATED FILES: When code creates files (xlsx, csv, pdf), download
+       URLs are appended to stdout. Present these as clickable links.
     
-    To work with files:
-    1. First use upload_file (for small files <10MB, base64 encoded)
-    2. Or use fetch_file (for files available at a URL)
-    3. Then reference files by their sandbox path: just the filename like 'data.csv'
+    STANDARD WORKFLOW:
+      Step 1: Get file into sandbox (fetch_file or upload_file)
+      Step 2: execute_code to load and analyze (pd.read_csv('filename.csv'))
+      Step 3: execute_code for follow-up analysis (variables persist!)
     
-    Pre-installed libraries: pandas, numpy, matplotlib, plotly, seaborn,
-    scipy, scikit-learn, statsmodels, openpyxl, pdfplumber, requests, urllib.
+    For large datasets (1M+ rows), consider:
+      Step 1: fetch_file or upload_file
+      Step 2: load_dataset (loads CSV into PostgreSQL)
+      Step 3: query_dataset (fast SQL queries)
+    
+    Pre-installed: pandas, numpy, matplotlib, plotly, seaborn, scipy,
+    scikit-learn, statsmodels, openpyxl, pdfplumber, reportlab, requests.
     
     Use for quick operations (<60s). For longer tasks, use submit_job.
     
     Args:
-        code: Python code to execute. Do NOT use absolute file paths.
-        session_id: Session ID for state persistence. Use "default" to maintain
-                    variables across calls. Only change this if you need isolated
-                    workspaces for separate projects.
+        code: Python code to execute. Use relative filenames only (e.g., 'data.csv').
+        session_id: Session for state persistence. Use "default" for continuity.
         timeout: Max seconds (max 60 for sync)
     
     Returns:
@@ -272,26 +281,26 @@ async def submit_job(
     session_id: str = "default",
     timeout: int = 600
 ) -> str:
-    """Submit a long-running job for async execution on the remote server.
+    """Submit a long-running job for async execution.
     
-    IMPORTANT: This runs on a REMOTE server. You CANNOT reference local file paths.
-    Files must be uploaded first using upload_file or fetch_file.
+    IMPORTANT: Same file rules as execute_code — files must be in the
+    sandbox first. Use fetch_file or upload_file before submitting.
     
-    SESSION PERSISTENCE: Use session_id="default" to share state with
-    execute_code calls. Variables created in execute_code will be available
+    SESSION PERSISTENCE: Uses the same kernel as execute_code when
+    session_id matches. Variables created in execute_code are available
     in the job, and vice versa.
     
-    Returns immediately with a job_id. Use get_job_status to check progress.
-    Use get_job_result to get output when complete.
+    Returns immediately with a job_id. Poll with get_job_status,
+    then retrieve output with get_job_result.
     
     Use for:
-    - Large data processing (1.5M+ rows)
+    - Large data processing (1M+ rows)
     - Complex analysis (>60 seconds)
     - Report generation
     
     Args:
-        code: Python code to execute. Use relative paths for sandbox files.
-        session_id: Session ID for state persistence. Use "default" to share
+        code: Python code to execute. Use relative filenames only.
+        session_id: Session for state persistence. Use "default" to share
                     state with execute_code calls.
         timeout: Max seconds (default 600 = 10 min)
     
@@ -371,24 +380,28 @@ async def upload_file(
     content_base64: str,
     session_id: str = "default"
 ) -> str:
-    """Upload a file to the remote sandbox using base64-encoded content.
+    """Upload a file to the sandbox using base64-encoded content.
     
-    USE THIS when the user provides or attaches a file in the conversation.
-    This is the PRIMARY way to get files into the sandbox for analysis.
+    WHEN TO USE THIS:
+    - User ATTACHED or PASTED a file in the conversation (you have the content)
+    - Small files under 10MB
     
-    Best for files under 10MB. For larger files, the user should host
-    the file at a URL and use fetch_file instead.
+    WHEN TO USE fetch_file INSTEAD:
+    - User provided a URL (you do NOT have the file content, only a link)
+    - Large files over 10MB
     
-    After uploading, the file is available in the sandbox by its filename.
+    AFTER UPLOADING — your next step depends on the goal:
     
-    Complete workflow example:
-    1. upload_file("invoices.csv", "<base64 content>", session_id="default")
-    2. execute_code("import pandas as pd; df = pd.read_csv('invoices.csv'); print(df.head())", session_id="default")
+    For Python analysis (pandas, charts, etc.):
+      1. upload_file("data.csv", "<base64>", session_id="default")
+      2. execute_code("import pandas as pd; df = pd.read_csv('data.csv'); print(df.head())", session_id="default")
     
-    Or load into PostgreSQL for SQL queries:
-    1. upload_file("data.csv", "<base64 content>", session_id="default")
-    2. load_dataset("data.csv", "my_dataset", session_id="default")
-    3. query_dataset("SELECT * FROM my_dataset LIMIT 10")
+    For SQL analysis (large datasets, complex queries):
+      1. upload_file("data.csv", "<base64>", session_id="default")
+      2. load_dataset("data.csv", "my_data", session_id="default")
+      3. query_dataset("SELECT * FROM my_data LIMIT 10")
+    
+    CRITICAL: Use the SAME session_id across all calls so files are accessible.
     
     Args:
         filename: Name for the file (e.g., 'invoices.csv', 'report.xlsx')
@@ -424,26 +437,38 @@ async def fetch_file(
     filename: str,
     session_id: str = "default"
 ) -> str:
-    """Download a file from a URL into the remote sandbox.
+    """Download a file from a URL into the sandbox. Supports up to 500MB.
     
-    USE THIS for large files or files hosted online. Supports up to 500MB.
+    WHEN TO USE THIS:
+    - User provided a URL to a file (CSV, Excel, PDF, etc.)
+    - User shared a Google Drive, Dropbox, or S3 link
+    - Any file available at a public URL
     
-    Supports any publicly accessible URL:
+    WHEN TO USE upload_file INSTEAD:
+    - User attached a file directly in the conversation (you have the content)
+    
+    SUPPORTED URL FORMATS:
+    - Direct links: https://example.com/data.csv
     - Google Drive: https://drive.google.com/uc?export=download&id=FILE_ID
     - Dropbox: Change dl=0 to dl=1 in the sharing URL
     - S3 pre-signed URLs
-    - Any direct download link
     
-    After fetching, the file is available in the sandbox by its filename.
-    Use session_id="default" to keep files accessible to execute_code calls.
+    AFTER FETCHING — your next step depends on the goal:
     
-    Example workflow:
-    1. fetch_file(url="https://example.com/big_data.csv", filename="data.csv", session_id="default")
-    2. execute_code("import pandas as pd; df = pd.read_csv('data.csv'); print(df.shape)", session_id="default")
+    For Python analysis (pandas, charts, etc.):
+      1. fetch_file(url="https://...", filename="data.csv", session_id="default")
+      2. execute_code("import pandas as pd; df = pd.read_csv('data.csv'); print(df.head())", session_id="default")
+    
+    For SQL analysis (large datasets, 100K+ rows):
+      1. fetch_file(url="https://...", filename="data.csv", session_id="default")
+      2. load_dataset("data.csv", "my_data", session_id="default")
+      3. query_dataset("SELECT * FROM my_data LIMIT 10")
+    
+    CRITICAL: Use session_id="default" so the file is accessible to execute_code.
     
     Args:
         url: Public URL to download from
-        filename: What to name the file in the sandbox (e.g., 'invoices.csv')
+        filename: What to name the file in the sandbox (e.g., 'sales.csv')
         session_id: Session for file isolation (default: 'default')
     
     Returns:
@@ -471,12 +496,13 @@ async def fetch_file(
 
 @mcp.tool()
 async def list_files(session_id: str = None) -> str:
-    """List files in the remote sandbox.
+    """List files in the sandbox.
     
-    Use this to see what files are available before running code.
+    Use this to check what files are available before running code.
+    Helpful when you're unsure if a file was already uploaded or fetched.
     
     Args:
-        session_id: Optional session filter (use "default" to see main workspace files)
+        session_id: Optional session filter (use "default" to see main workspace)
     
     Returns:
         List of files with metadata
@@ -509,20 +535,28 @@ async def load_dataset(
 ) -> str:
     """Load a CSV file from the sandbox into PostgreSQL for fast SQL querying.
     
-    IMPORTANT: The file must already be in the sandbox. Use upload_file or
-    fetch_file first to get the file into the sandbox.
+    PREREQUISITE: The file MUST already be in the sandbox. Get it there first:
+      - From a URL: fetch_file(url="...", filename="data.csv")
+      - From user upload: upload_file("data.csv", "<base64>")
     
-    Handles 1.5M+ rows by loading in chunks.
-    After loading, use query_dataset with SQL to analyze.
+    WHEN TO USE THIS vs. just execute_code with pandas:
+    - Dataset has 100K+ rows → use load_dataset + query_dataset (faster)
+    - You need complex SQL joins, GROUP BY, window functions → load_dataset
+    - Quick look at a small file → just use execute_code with pandas
+    
+    COMPLETE WORKFLOW:
+      1. fetch_file(url="https://...", filename="big_data.csv", session_id="default")
+      2. load_dataset("big_data.csv", "sales", session_id="default")
+      3. query_dataset("SELECT region, SUM(revenue) FROM sales GROUP BY region")
     
     Args:
-        file_path: Filename in sandbox (e.g., 'invoices.csv' - NOT a local path)
-        dataset_name: Logical name for SQL queries (e.g., 'vestis_invoices')
+        file_path: Filename in sandbox (e.g., 'data.csv' — NOT a URL or local path)
+        dataset_name: Table name for SQL queries (e.g., 'sales', 'invoices')
         session_id: Session for file isolation (default: 'default')
         delimiter: CSV delimiter (default comma)
     
     Returns:
-        Dataset info with row count, columns, preview
+        Dataset info with row count, columns, and preview
     """
     url = f"{API_BASE}/api/data/load-csv"
     logger.info(f"load_dataset: POST {url}")
@@ -550,15 +584,16 @@ async def query_dataset(
     limit: int = 1000,
     offset: int = 0
 ) -> str:
-    """Execute a SQL query against loaded datasets in PostgreSQL.
+    """Execute a SQL query against datasets loaded into PostgreSQL.
     
-    Only SELECT queries allowed. Results paginated.
+    PREREQUISITE: Dataset must be loaded first with load_dataset.
+    Use list_datasets to see available table names.
     
-    Use list_datasets first to find table names.
+    Only SELECT queries allowed. Results are paginated.
     
     Args:
-        sql: SQL SELECT query
-        limit: Max rows (default 1000)
+        sql: SQL SELECT query (e.g., "SELECT * FROM sales WHERE revenue > 1000")
+        limit: Max rows returned (default 1000)
         offset: Row offset for pagination
     
     Returns:
@@ -590,7 +625,7 @@ async def list_datasets(session_id: str = None) -> str:
         session_id: Optional session filter
     
     Returns:
-        List of datasets
+        List of datasets with metadata
     """
     params = {}
     if session_id:
@@ -618,12 +653,11 @@ async def create_session(
 ) -> str:
     """Create a new workspace session for file/data isolation.
     
-    Most of the time you should use session_id="default" which is
-    automatically available. Only create new sessions when you need
-    to isolate work between separate projects.
+    You almost NEVER need this. The "default" session is automatically
+    available and should be used for all normal work.
     
-    Use session_id in other tools to scope operations.
-    Each session has its own sandbox directory and file space.
+    Only create a new session when you need to completely isolate
+    files and data between unrelated projects running simultaneously.
     
     Args:
         name: Session name (e.g., 'vestis-audit', 'financial-model')

@@ -11,6 +11,7 @@ Executes Python code in a controlled environment with:
 - INLINE CHART RENDERING (v2.6) - matplotlib/plotly charts auto-captured
 - DEFENSIVE PATH NORMALIZATION (v2.8) - strip doubled session_id prefix
 - /tmp/ PATH INTERCEPTION (v2.8.1) - redirect /tmp/ paths to sandbox
+- READ-ONLY UPLOAD ACCESS (v2.8.2) - sandbox can read uploaded files
 
 CRITICAL BUG FIX (v2.6):
   'import matplotlib.pyplot as plt' was broken because:
@@ -52,7 +53,19 @@ v2.8.1 - /tmp/ path interception
   Also intercept other common AI-generated absolute paths:
     /home/*, /var/*, /Users/*, C:\\*
 
-Version: 2.8.1
+v2.8.2 - Read-only upload access
+  SimTheory uploads files to /home/ubuntu/uploads/tmp/permanent_files/
+  but the sandbox blocked ALL access outside session_dir. The AI found
+  the file path but got PermissionError trying to open it.
+  
+  Fix: 
+  1. ALLOWED_READ_PATHS list of directories the sandbox can READ from
+  2. safe_open() permits read-only access to these paths
+  3. Write operations still restricted to session_dir only
+  4. _normalize_path_for_sandbox() no longer strips upload paths
+  5. Pandas read hooks pass through upload paths unchanged
+
+Version: 2.8.2
 """
 
 import asyncio
@@ -113,9 +126,26 @@ REDIRECT_PATH_PREFIXES = (
     '/tmp/',
     '/temp/',
     '/var/tmp/',
-    '/home/',
-    '/Users/',
-    '/root/',
+)
+
+# ============================================================
+# v2.8.2: Directories the sandbox can READ from (but not write to)
+# These are paths where uploaded files land outside the sandbox.
+# ============================================================
+ALLOWED_READ_PATHS = [
+    '/home/ubuntu/uploads',
+    '/home/ubuntu/uploads/tmp',
+    '/home/ubuntu/uploads/tmp/permanent_files',
+    '/app/uploads',
+    '/uploads',
+]
+
+# v2.8.2: Absolute path prefixes that are LEGITIMATE read-only sources
+# These should NOT be redirected to sandbox by _normalize_path_for_sandbox
+LEGITIMATE_READ_PREFIXES = (
+    '/home/ubuntu/uploads/',
+    '/app/uploads/',
+    '/uploads/',
 )
 
 
@@ -283,6 +313,42 @@ class ChartCapture:
         return _tracking_savefig
 
 
+def _is_allowed_read_path(filepath: str) -> bool:
+    """Check if a filepath is within an allowed read-only directory.
+    
+    v2.8.2: Uploaded files land in directories outside the sandbox.
+    This function checks if the path is in one of those directories
+    so safe_open() can permit read-only access.
+    """
+    try:
+        resolved = str(Path(filepath).resolve())
+        for allowed_dir in ALLOWED_READ_PATHS:
+            try:
+                allowed_resolved = str(Path(allowed_dir).resolve())
+                if resolved.startswith(allowed_resolved + '/') or resolved == allowed_resolved:
+                    return True
+            except Exception:
+                # If the allowed dir doesn't exist, try string match
+                if resolved.startswith(allowed_dir + '/') or resolved.startswith(allowed_dir):
+                    return True
+        return False
+    except Exception:
+        return False
+
+
+def _is_legitimate_read_path(filepath: str) -> bool:
+    """Check if a filepath is a legitimate read-only source path.
+    
+    v2.8.2: These paths should NOT be redirected to sandbox by
+    _normalize_path_for_sandbox(). They are real paths where
+    uploaded files exist.
+    """
+    for prefix in LEGITIMATE_READ_PREFIXES:
+        if filepath.startswith(prefix):
+            return True
+    return False
+
+
 class SandboxExecutor:
     """Executes Python code in a sandboxed environment with persistent state"""
 
@@ -290,6 +356,7 @@ class SandboxExecutor:
         self.sandbox_dir = sandbox_dir or settings.SANDBOX_DIR
         self.sandbox_dir.mkdir(parents=True, exist_ok=True)
         logger.info(f"SandboxExecutor initialized: sandbox_dir={self.sandbox_dir}")
+        logger.info(f"Allowed read paths: {ALLOWED_READ_PATHS}")
 
     def _get_safe_builtins(self) -> Dict:
         """Build a safe builtins dict, handling both dict and module forms."""
@@ -489,17 +556,20 @@ class SandboxExecutor:
         
         Handles TWO classes of bad paths:
         
-        1. ABSOLUTE PATHS (v2.8.1): AI generates /tmp/file.csv, /home/user/file.csv, etc.
+        1. ABSOLUTE PATHS (v2.8.1): AI generates /tmp/file.csv, etc.
            These are redirected to just the basename in the sandbox cwd.
            /tmp/intercompany_filtered_accounts_v2.csv -> intercompany_filtered_accounts_v2.csv
-           /home/ubuntu/data.csv -> data.csv
-           /Users/timothy/Downloads/report.xlsx -> report.xlsx
         
         2. SESSION PREFIX DOUBLING (v2.8.0): AI generates 'default/file.csv' when
            cwd is already /sandbox/sessions/default/.
            default/data.csv -> data.csv
         
-        Returns the normalized path string (always relative).
+        v2.8.2: DOES NOT redirect paths in ALLOWED_READ_PATHS.
+        Upload paths like /home/ubuntu/uploads/tmp/permanent_files/file.xlsx
+        are legitimate and should be passed through unchanged.
+        
+        Returns the normalized path string (always relative, unless it's
+        a legitimate read-only path).
         """
         if not filepath:
             return filepath
@@ -507,8 +577,17 @@ class SandboxExecutor:
         path_str = str(filepath)
         
         # ============================================================
+        # v2.8.2: PASS THROUGH legitimate read-only paths
+        # Upload directories are real paths, not AI hallucinations
+        # ============================================================
+        if _is_legitimate_read_path(path_str):
+            logger.debug(f"Path is legitimate read-only source, passing through: {path_str}")
+            return path_str
+        
+        # ============================================================
         # v2.8.1: ABSOLUTE PATH INTERCEPTION
-        # Redirect /tmp/, /home/, /Users/, /var/tmp/, /root/ to sandbox
+        # Redirect /tmp/, /var/tmp/, /temp/ to sandbox
+        # (but NOT /home/ubuntu/uploads/ — handled above)
         # ============================================================
         if os.path.isabs(path_str):
             for prefix in REDIRECT_PATH_PREFIXES:
@@ -557,11 +636,13 @@ class SandboxExecutor:
         return path_str
 
     def _make_safe_open(self, session_dir: Path):
-        """Create a safe open() that only allows access within session directory.
+        """Create a safe open() that controls file access.
         
         v2.8.0: Auto-normalizes paths to strip doubled session_id prefix.
         v2.8.1: Also intercepts /tmp/ and other absolute paths, redirecting
                 to the sandbox directory.
+        v2.8.2: Allows READ-ONLY access to ALLOWED_READ_PATHS (upload dirs).
+                Write operations still restricted to session_dir only.
         """
         normalize = self._normalize_path_for_sandbox
         _session_dir = session_dir
@@ -571,6 +652,7 @@ class SandboxExecutor:
             
             # ============================================================
             # v2.8.1: NORMALIZE PATH (handles /tmp/, session prefix, etc.)
+            # v2.8.2: Passes through legitimate upload paths unchanged
             # ============================================================
             normalized = normalize(path_str, _session_dir)
             if normalized != path_str:
@@ -585,17 +667,42 @@ class SandboxExecutor:
             try:
                 resolved = path.resolve()
                 session_resolved = _session_dir.resolve()
-                if not str(resolved).startswith(str(session_resolved)):
-                    raise PermissionError(
-                        f"Access denied: Cannot access files outside sandbox. "
-                        f"Use relative paths or SANDBOX_DIR."
+                
+                # ============================================================
+                # v2.8.2: CHECK ALLOWED READ PATHS
+                # If the path is in an allowed read directory AND mode is
+                # read-only, permit access. Write operations are ALWAYS
+                # restricted to session_dir.
+                # ============================================================
+                is_in_session = str(resolved).startswith(str(session_resolved))
+                is_read_only = not any(c in mode for c in ('w', 'a', 'x', '+'))
+                is_allowed_read = is_read_only and _is_allowed_read_path(str(resolved))
+                
+                if not is_in_session and not is_allowed_read:
+                    if not is_read_only:
+                        raise PermissionError(
+                            f"Access denied: Cannot WRITE to files outside sandbox. "
+                            f"Path: {path_str} -> Use relative paths for output files."
+                        )
+                    else:
+                        raise PermissionError(
+                            f"Access denied: Cannot access files outside sandbox. "
+                            f"Path: {path_str} -> Use upload_file or fetch_file to "
+                            f"get files into the sandbox first."
+                        )
+                
+                if is_allowed_read and not is_in_session:
+                    logger.info(
+                        f"safe_open: READ-ONLY access granted to upload path: {resolved}"
                     )
+                    
             except PermissionError:
                 raise
             except Exception as e:
                 raise PermissionError(f"Invalid file path: {e}")
 
-            if 'w' in mode or 'a' in mode:
+            # Only create parent dirs for write operations within session
+            if any(c in mode for c in ('w', 'a', 'x', '+')):
                 resolved.parent.mkdir(parents=True, exist_ok=True)
 
             return open(resolved, mode, *args, **kwargs)
@@ -612,7 +719,8 @@ class SandboxExecutor:
         _session_dir = session_dir
         
         def _normalize_path(filepath):
-            """Normalize file path - strips /tmp/ prefix, doubled session prefix, etc."""
+            """Normalize file path - strips /tmp/ prefix, doubled session prefix, etc.
+            Passes through legitimate upload paths unchanged."""
             return executor_self._normalize_path_for_sandbox(str(filepath), _session_dir)
         
         return _normalize_path
@@ -622,6 +730,7 @@ class SandboxExecutor:
         
         v2.8.0: Catches 'default/file.csv' session prefix doubling.
         v2.8.1: Also catches /tmp/file.csv, /home/user/file.csv, etc.
+        v2.8.2: Passes through legitimate upload paths unchanged.
         
         Wraps: read_csv, read_excel, ExcelFile, read_json, read_parquet,
                DataFrame.to_csv, DataFrame.to_excel, DataFrame.to_json,
@@ -982,6 +1091,17 @@ class SandboxExecutor:
                 except ImportError:
                     logger.warning("requests not installed")
                     return False
+            # ============================================================
+            # v2.8.2: shutil — needed for copying files from upload paths
+            # ============================================================
+            elif name == 'shutil':
+                import shutil
+                sandbox_globals['shutil'] = shutil
+                return True
+            elif name == 'glob':
+                import glob
+                sandbox_globals['glob'] = glob
+                return True
         except ImportError as e:
             logger.warning(f"Failed to import {name}: {e}")
             return False
@@ -1293,6 +1413,7 @@ class SandboxExecutor:
         
         v2.8.0: Path normalization hooks installed on every execution.
         v2.8.1: /tmp/ and other absolute paths redirected to sandbox.
+        v2.8.2: Upload paths permitted for read-only access.
         """
         result = ExecutionResult()
         timeout = timeout or settings.MAX_EXECUTION_TIME
@@ -1330,7 +1451,7 @@ class SandboxExecutor:
             sandbox_globals.update(context)
 
         # ============================================================
-        # v2.8.0 + v2.8.1: Install path normalization hooks
+        # v2.8.0 + v2.8.1 + v2.8.2: Install path normalization hooks
         # These must be installed on EVERY execution (not just first)
         # because they need the current session_dir context.
         # ============================================================

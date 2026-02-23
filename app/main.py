@@ -13,7 +13,17 @@ Features:
 - Auto file storage in Postgres with public download URLs
 
 Author: Kaffer AI for Timothy Escamilla
-Version: 1.7.2
+Version: 1.8.1
+
+HISTORY:
+  v1.7.2: fetch_from_url route fix, stable release
+  v1.8.0: base64 ImageContent blocks in mcp_server.py (enrichment worked
+           but SimTheory doesn't render MCP image blocks)
+  v1.8.1: Added /charts/{session_id}/{filename} route. SimTheory constructs
+           image URLs at this path pattern. Previously 404'd because route
+           didn't exist. Now serves chart PNG bytes from Postgres with
+           correct Content-Type. Public endpoint, no auth (same as /dl/).
+           Evidence: "GET /charts/chart-test-v181/chart_001.png 404"
 """
 
 import logging
@@ -46,7 +56,7 @@ async def lifespan(app: FastAPI):
     """Application lifecycle management"""
     # --- STARTUP ---
     logger.info("="*60)
-    logger.info("Power Interpreter MCP v1.7.2 starting...")
+    logger.info("Power Interpreter MCP v1.8.1 starting...")
     logger.info("="*60)
 
     # Ensure directories exist
@@ -80,6 +90,7 @@ async def lifespan(app: FastAPI):
     logger.info(f"  Sandbox dir: {settings.SANDBOX_DIR}")
     logger.info(f"  Public URL: {public_url or '(auto-detect from RAILWAY_PUBLIC_DOMAIN)'}")
     logger.info(f"  Download endpoint: /dl/{{file_id}} (public, no auth)")
+    logger.info(f"  Chart endpoint: /charts/{{session_id}}/{{filename}} (public, no auth)")
     logger.info(f"  Sandbox file max: {settings.SANDBOX_FILE_MAX_MB} MB")
     logger.info(f"  Sandbox file TTL: {settings.SANDBOX_FILE_TTL_HOURS} hours")
     logger.info(f"  Max execution time: {settings.MAX_EXECUTION_TIME}s")
@@ -158,9 +169,10 @@ app = FastAPI(
         "General-purpose sandboxed Python execution engine. "
         "Execute code, manage files, query large datasets, "
         "and run long-running analysis jobs without timeouts. "
-        "Generated files get persistent download URLs via /dl/{file_id}."
+        "Generated files get persistent download URLs via /dl/{file_id}. "
+        "Charts served at /charts/{session_id}/{filename}."
     ),
-    version="1.7.2",
+    version="1.8.1",
     lifespan=lifespan,
     docs_url="/docs",
     redoc_url="/redoc",
@@ -174,6 +186,125 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# =============================================================================
+# CHART SERVING ROUTE (v1.8.1)
+# =============================================================================
+# SimTheory constructs image URLs at:
+#   /charts/{session_id}/{filename}
+#
+# Evidence from logs:
+#   GET /charts/chart-test-v180/chart_001.png -> 404
+#   GET /charts/chart-test-v181/chart_001.png -> 404
+#
+# This route queries Postgres by session_id + filename and serves the
+# image bytes with correct Content-Type. Public, no auth (like /dl/).
+#
+# MUST be defined before /mcp mount to ensure FastAPI matches it.
+# =============================================================================
+
+
+@app.get("/charts/{session_id}/{filename}")
+async def serve_chart(session_id: str, filename: str):
+    """Serve chart images by session_id and filename.
+
+    SimTheory auto-constructs these URLs from MCP tool responses.
+    Looks up the most recent matching file in Postgres and serves it.
+
+    Public endpoint — no authentication required (same as /dl/).
+    """
+    logger.info(f"Chart request: session={session_id} filename={filename}")
+
+    try:
+        from app.database import get_session_factory
+        from app.models import SandboxFile
+        from sqlalchemy import select
+
+        factory = get_session_factory()
+        async with factory() as db_session:
+            # Find the most recent file matching session_id + filename
+            result = await db_session.execute(
+                select(SandboxFile)
+                .where(SandboxFile.session_id == session_id)
+                .where(SandboxFile.filename == filename)
+                .order_by(SandboxFile.created_at.desc())
+                .limit(1)
+            )
+            file_record = result.scalar_one_or_none()
+
+            if not file_record:
+                logger.warning(
+                    f"Chart not found: session={session_id} filename={filename}"
+                )
+                return JSONResponse(
+                    status_code=404,
+                    content={
+                        "error": f"Chart not found: {session_id}/{filename}",
+                        "hint": "The chart may have expired or the session_id may be wrong.",
+                    }
+                )
+
+            # Determine Content-Type from filename or stored value
+            content_type = getattr(file_record, 'content_type', None) or 'application/octet-stream'
+            fname_lower = filename.lower()
+            if fname_lower.endswith('.png'):
+                content_type = 'image/png'
+            elif fname_lower.endswith('.jpg') or fname_lower.endswith('.jpeg'):
+                content_type = 'image/jpeg'
+            elif fname_lower.endswith('.svg'):
+                content_type = 'image/svg+xml'
+            elif fname_lower.endswith('.gif'):
+                content_type = 'image/gif'
+            elif fname_lower.endswith('.pdf'):
+                content_type = 'application/pdf'
+
+            # Get the binary data
+            file_data = getattr(file_record, 'file_data', None)
+            if file_data is None:
+                # Try alternate column name
+                file_data = getattr(file_record, 'data', None)
+            if file_data is None:
+                file_data = getattr(file_record, 'content', None)
+
+            if file_data is None:
+                logger.error(
+                    f"Chart found but no binary data: session={session_id} "
+                    f"filename={filename} record_id={getattr(file_record, 'id', '?')}"
+                )
+                return JSONResponse(
+                    status_code=500,
+                    content={"error": "File record found but binary data is missing"}
+                )
+
+            file_size = len(file_data)
+            logger.info(
+                f"Chart served: session={session_id} filename={filename} "
+                f"size={file_size} bytes content_type={content_type}"
+            )
+
+            return Response(
+                content=file_data,
+                media_type=content_type,
+                headers={
+                    "Content-Disposition": f'inline; filename="{filename}"',
+                    "Cache-Control": "public, max-age=3600",
+                    "X-Power-Interpreter": "chart-serve-v1.8.1",
+                }
+            )
+
+    except ImportError as e:
+        logger.error(f"Chart serve import error: {e}")
+        return JSONResponse(
+            status_code=503,
+            content={"error": "Database not available"}
+        )
+    except Exception as e:
+        logger.error(f"Chart serve error: session={session_id} filename={filename}: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Internal error serving chart: {e}"}
+        )
 
 
 # =============================================================================
@@ -365,7 +496,7 @@ async def _handle_single_jsonrpc(data: dict):
                 },
                 "serverInfo": {
                     "name": "Power Interpreter",
-                    "version": "1.7.2",
+                    "version": "1.8.1",
                 },
             },
         }

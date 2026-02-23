@@ -10,14 +10,16 @@ MCP Tools (12):
 - get_job_result: Get completed job output
 - upload_file: Upload a file (base64) to sandbox
 - fetch_file: Download a file from URL to sandbox
-- fetch_from_url: ★ NEW — load file from CDN/URL directly into sandbox
+- fetch_from_url: ★ Load file from CDN/URL directly into sandbox
 - list_files: List sandbox files
 - load_dataset: Load CSV into PostgreSQL
 - query_dataset: SQL query against datasets
 - list_datasets: List loaded datasets
 - create_session: Create workspace session
 
-Version: 1.7.1 - fix: remove unsupported 'description' kwarg from FastMCP()
+Version: 1.7.2 - fix: fetch_from_url was calling /api/files/fetch-from-url (404).
+                       Corrected to /api/files/fetch which is the actual registered
+                       FastAPI route in files.py. One word difference, total blocker.
 
 HISTORY:
   v1.2.0: Response was a JSON blob. URLs lived in stdout. AI parsed them. WORKED.
@@ -28,13 +30,15 @@ HISTORY:
   v1.5.2: Stop stripping stdout. Pass URLs through as-is. Belt-and-suspenders:
            also create extra blocks from JSON arrays if populated.
   v1.6.0: Auto File Handling. Rewrote tool descriptions so the AI reliably
-           chains fetch_file → execute_code, upload_file → execute_code,
-           and fetch_file → load_dataset → query_dataset. No logic changes.
+           chains fetch_file -> execute_code, upload_file -> execute_code,
+           and fetch_file -> load_dataset -> query_dataset. No logic changes.
   v1.7.0: fetch_from_url tool added. Streams files directly from any HTTPS URL
            (Cloudinary CDN, S3, public URLs) into sandbox. Fixes Priority 1
            file upload blocker — no base64 overhead, no SimTheory encoding bug.
   v1.7.1: Fix TypeError — FastMCP() does not accept 'description' kwarg in the
            installed version. Removed it. App now starts cleanly.
+  v1.7.2: Fix 404 — fetch_from_url was POSTing to /api/files/fetch-from-url
+           which does not exist. Correct route is /api/files/fetch. Fixed.
 """
 
 from mcp.server.fastmcp import FastMCP
@@ -153,60 +157,44 @@ def _build_content_blocks(resp_text: str) -> list:
 async def execute_code(
     code: str,
     session_id: str = "default",
-    timeout: int = 30
+    timeout: int = 55
 ) -> list:
-    """Execute Python code in a persistent sandboxed environment.
+    """Execute Python code in a persistent sandbox kernel.
 
-    IMPORTANT — READ BEFORE CALLING:
+    The kernel persists between calls — variables, imports, and loaded
+    files are all available in subsequent execute_code calls.
 
-    1. REMOTE EXECUTION: Code runs on a REMOTE server, NOT locally.
-       You CANNOT use local file paths like /home/ubuntu/... or /tmp/uploads/...
+    WORKFLOW — always follow this pattern:
+      1. fetch_from_url(url, filename) — load a file from URL into sandbox
+      2. execute_code("import pandas as pd; df = pd.read_excel('filename.xlsx')")
+      3. execute_code("print(df.head())")  — variables persist!
 
-    2. FILE ACCESS: To work with files, you MUST get them into the sandbox first:
-       - User provided a URL? → Call fetch_from_url FIRST, then execute_code.
-       - User attached/uploaded a file? → Call upload_file FIRST, then execute_code.
-       - File already in sandbox? → Just reference it by filename: 'data.csv'
-       Do NOT use pd.read_csv('https://...') — outbound HTTP from code is blocked.
-
-    3. SESSION PERSISTENCE: Variables, imports, and DataFrames persist across
-       calls WITHIN the same session_id. ALWAYS use session_id="default" unless
-       isolating separate projects.
-
-    4. CHARTS: matplotlib/plotly figures are auto-captured as PNG images.
-       Download URLs appear in stdout. Present these to the user.
-
-    5. GENERATED FILES: When code creates files (xlsx, csv, pdf), download
-       URLs are appended to stdout. Present these as clickable links.
-
-    Pre-installed: pandas, numpy, matplotlib, plotly, seaborn, scipy,
-    scikit-learn, statsmodels, openpyxl, pdfplumber, reportlab, requests,
-    xgboost, lightgbm, sympy, duckdb, pyarrow, Pillow, beautifulsoup4.
+    OUTPUT — stdout is returned as-is. Any URLs printed to stdout
+    (chart URLs, download URLs) will be visible in the response.
 
     Args:
-        code: Python code to execute. Use relative filenames only (e.g., 'data.csv').
-        session_id: Session for state persistence. Use "default" for continuity.
-        timeout: Max seconds (max 60 for sync)
+        code: Python code to execute. Multi-line strings work fine.
+        session_id: Session for state persistence (default: 'default').
+                    Use the same session_id across calls to share state.
+        timeout: Max seconds before timeout (default 55, max 59).
     """
     url = f"{API_BASE}/api/execute"
-    logger.info(f"execute_code: POST {url}")
+    logger.info(f"execute_code: POST {url} session={session_id}")
     try:
-        async with httpx.AsyncClient(timeout=70) as client:
+        async with httpx.AsyncClient(timeout=timeout + 5) as client:
             resp = await client.post(
                 url,
                 headers=_headers(),
                 json={"code": code, "session_id": session_id, "timeout": timeout}
             )
-            logger.info(f"execute_code: response status={resp.status_code}")
-            blocks = _build_content_blocks(resp.text)
-            logger.info(f"execute_code: returning {len(blocks)} content blocks")
-            return blocks
+            return _build_content_blocks(resp.text)
     except Exception as e:
         logger.error(f"execute_code: error: {e}", exc_info=True)
-        return [{"type": "text", "text": f"Error calling execute API: {e}"}]
+        return [{"type": "text", "text": f"Error calling execute_code API: {e}"}]
 
 
 # ============================================================
-# FILE MANAGEMENT TOOLS
+# FILE TOOLS
 # ============================================================
 
 @mcp.tool()
@@ -215,61 +203,65 @@ async def fetch_from_url(
     filename: Optional[str] = None,
     session_id: str = "default",
 ) -> list:
-    """Fetch a file from any accessible URL and save it directly into the sandbox.
+    """Fetch a file from any HTTPS URL directly into the sandbox.
 
-    ★ THIS IS THE PRIMARY WAY TO LOAD FILES INTO POWER INTERPRETER ★
+    USE THIS to load files before running execute_code on them.
 
-    SimTheory uploads files to Cloudinary CDN. Pass that CDN URL here and
-    the file will be streamed directly into the sandbox — no base64 encoding,
-    no size limits from encoding overhead.
+    Supports:
+    - Cloudinary CDN URLs (SimTheory file attachments)
+    - Google Sheets export URLs (?format=xlsx or ?format=csv)
+    - S3 pre-signed URLs
+    - Any public HTTPS download link
 
-    AFTER FETCHING — standard workflow:
-      1. fetch_from_url(url="https://cdn.simtheory.ai/.../data.xlsx", session_id="default")
-      2. execute_code("import pandas as pd; df = pd.read_excel('data.xlsx'); print(df.head())", session_id="default")
-
-    Supported file types: xlsx, xls, csv, tsv, json, jsonl, parquet,
-                          pdf, txt, png, jpg, zip, db, sqlite
+    WORKFLOW:
+      1. fetch_from_url(url="https://...", filename="data.xlsx")
+      2. execute_code("import pandas as pd; df = pd.read_excel('data.xlsx')")
+      3. execute_code("print(df.describe())")
 
     Args:
-        url:        Full HTTPS URL to the file
-        filename:   Filename to save as in sandbox. Inferred from URL if omitted.
-        session_id: Sandbox session. Use "default" to share with execute_code.
+        url: HTTPS URL to download from.
+        filename: Name to save as in sandbox (e.g. 'invoices.xlsx').
+                  If omitted, derived from the URL.
+        session_id: Session for file isolation (default: 'default').
     """
-    api_url = f"{API_BASE}/api/files/fetch-from-url"
+    # Derive filename from URL if not provided
+    if not filename:
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        filename = parsed.path.split('/')[-1].split('?')[0] or 'downloaded_file'
+
+    # FIXED v1.7.2: Call /api/files/fetch (correct route in files.py)
+    # Previously called /api/files/fetch-from-url which returned 404.
+    api_url = f"{API_BASE}/api/files/fetch"
     logger.info(f"fetch_from_url: POST {api_url} url={url[:80]} filename={filename}")
+
     try:
-        async with httpx.AsyncClient(timeout=300) as client:
+        async with httpx.AsyncClient(timeout=120) as client:
             resp = await client.post(
                 api_url,
                 headers=_headers(),
                 json={"url": url, "filename": filename, "session_id": session_id}
             )
             logger.info(f"fetch_from_url: response status={resp.status_code}")
-            try:
+            if resp.status_code == 200:
                 data = resp.json()
-                if data.get("success") or resp.status_code == 200:
-                    saved_name = data.get("filename", filename or "file")
-                    size_bytes = data.get("size_bytes", 0)
-                    size_kb = size_bytes / 1024 if size_bytes else 0
-                    text = (
-                        f"✅ File downloaded successfully!\n\n"
-                        f"  Filename : {saved_name}\n"
-                        f"  Size     : {size_bytes:,} bytes ({size_kb:.1f} KB)\n"
-                        f"  Session  : {session_id}\n\n"
-                        f"Ready to use in execute_code:\n"
-                        f"  import pandas as pd\n"
-                        f"  df = pd.read_excel('{saved_name}')  # or read_csv, read_json, etc.\n"
-                        f"  print(df.shape, df.columns.tolist())"
+                return [{
+                    "type": "text",
+                    "text": (
+                        f"✅ File fetched successfully!\n"
+                        f"  Filename : {data.get('filename')}\n"
+                        f"  Size     : {data.get('size_human')}\n"
+                        f"  Path     : {data.get('path')}\n"
+                        f"  Session  : {data.get('session_id')}\n"
+                        f"  Preview  : {data.get('preview', 'N/A')}\n\n"
+                        f"Now call execute_code to work with this file."
                     )
-                else:
-                    error = data.get("error", data.get("detail", resp.text))
-                    text = f"❌ fetch_from_url failed (HTTP {resp.status_code}):\n  {error}"
-            except Exception:
-                text = resp.text
-            return [{"type": "text", "text": text}]
+                }]
+            else:
+                return [{"type": "text", "text": f"❌ fetch_from_url failed (HTTP {resp.status_code}):\n  {resp.text[:300]}"}]
     except Exception as e:
         logger.error(f"fetch_from_url: error: {e}", exc_info=True)
-        return [{"type": "text", "text": f"Error calling fetch_from_url: {e}"}]
+        return [{"type": "text", "text": f"❌ fetch_from_url error: {e}"}]
 
 
 @mcp.tool()
@@ -278,25 +270,29 @@ async def upload_file(
     content_base64: str,
     session_id: str = "default"
 ) -> str:
-    """Upload a file to the sandbox using base64-encoded content.
+    """Upload a file to the sandbox via base64 encoding.
 
-    For large files or CDN URLs, prefer fetch_from_url instead.
+    Use for files under 10MB. For larger files or URL-accessible files,
+    use fetch_from_url instead (no base64 overhead).
+
+    After uploading, use execute_code to process the file:
+      execute_code("import pandas as pd; df = pd.read_csv('filename.csv')")
 
     Args:
-        filename: Name for the file (e.g., 'invoices.csv', 'report.xlsx')
+        filename: Name to save as (e.g., 'data.csv')
         content_base64: Base64-encoded file content
-        session_id: Session for file isolation (default: 'default')
+        session_id: Session for isolation (default: 'default')
     """
     url = f"{API_BASE}/api/files/upload"
     logger.info(f"upload_file: POST {url} filename={filename}")
     try:
-        async with httpx.AsyncClient(timeout=120) as client:
+        async with httpx.AsyncClient(timeout=60) as client:
             resp = await client.post(
                 url,
                 headers=_headers(),
-                json={"filename": filename, "content_base64": content_base64, "session_id": session_id}
+                json={"filename": filename, "content_base64": content_base64,
+                      "session_id": session_id}
             )
-            logger.info(f"upload_file: response status={resp.status_code}")
             return resp.text
     except Exception as e:
         logger.error(f"upload_file: error: {e}", exc_info=True)
@@ -309,23 +305,25 @@ async def fetch_file(
     filename: str,
     session_id: str = "default"
 ) -> str:
-    """Download a file from a URL into the sandbox. Supports up to 500MB.
+    """Download a file from a URL into the sandbox.
+
+    Alternative to fetch_from_url. Both call the same backend route.
+    Use fetch_from_url for new code (better response formatting).
 
     Args:
-        url: Public URL to download from
-        filename: What to name the file in the sandbox (e.g., 'sales.csv')
-        session_id: Session for file isolation (default: 'default')
+        url: URL to download from
+        filename: Name to save as in sandbox
+        session_id: Session for isolation (default: 'default')
     """
     api_url = f"{API_BASE}/api/files/fetch"
-    logger.info(f"fetch_file: POST {api_url} url={url[:80]}... filename={filename}")
+    logger.info(f"fetch_file: POST {api_url}")
     try:
-        async with httpx.AsyncClient(timeout=300) as client:
+        async with httpx.AsyncClient(timeout=120) as client:
             resp = await client.post(
                 api_url,
                 headers=_headers(),
                 json={"url": url, "filename": filename, "session_id": session_id}
             )
-            logger.info(f"fetch_file: response status={resp.status_code}")
             return resp.text
     except Exception as e:
         logger.error(f"fetch_file: error: {e}", exc_info=True)
@@ -333,20 +331,25 @@ async def fetch_file(
 
 
 @mcp.tool()
-async def list_files(session_id: str = None) -> str:
-    """List files in the sandbox.
+async def list_files(session_id: Optional[str] = "default") -> str:
+    """List files currently in the sandbox.
+
+    Shows filename, size, type, and a text preview for each file.
+    Use this to confirm a file was successfully uploaded or fetched
+    before trying to process it with execute_code.
 
     Args:
-        session_id: Optional session filter (use "default" to see main workspace)
+        session_id: Session to list files for (default: 'default')
     """
-    params = {}
-    if session_id:
-        params["session_id"] = session_id
     url = f"{API_BASE}/api/files"
     logger.info(f"list_files: GET {url}")
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(url, headers=_headers(), params=params)
+            resp = await client.get(
+                url,
+                headers=_headers(),
+                params={"session_id": session_id}
+            )
             return resp.text
     except Exception as e:
         logger.error(f"list_files: error: {e}", exc_info=True)

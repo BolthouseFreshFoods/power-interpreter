@@ -2,6 +2,8 @@
 
 All settings loaded from environment variables with sensible defaults.
 Railway automatically provides DATABASE_URL when PostgreSQL is attached.
+
+Version: 1.7.3
 """
 
 import os
@@ -91,10 +93,13 @@ class Settings:
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
     
     # --- Pre-approved Libraries for Sandbox ---
+    # INFORMATIONAL REFERENCE: The authoritative allowlist lives in
+    # executor.py _lazy_import(). This set is kept in sync for
+    # documentation and potential future use by other modules.
     ALLOWED_IMPORTS: set = {
-        # Data
+        # Data I/O
         'pandas', 'numpy', 'csv', 'json', 'openpyxl', 'xlsxwriter',
-        'pdfplumber', 'tabulate',
+        'pdfplumber', 'tabulate', 'reportlab',
         # Visualization
         'matplotlib', 'matplotlib.pyplot', 'plotly', 'plotly.express',
         'plotly.graph_objects', 'seaborn',
@@ -104,16 +109,22 @@ class Settings:
         'math', 'statistics', 'datetime', 'collections', 'itertools',
         'functools', 'operator', 're', 'string', 'textwrap',
         'decimal', 'fractions', 'random', 'hashlib', 'base64',
-        'io', 'os.path', 'pathlib', 'glob', 'copy', 'typing',
-        'dataclasses', 'enum', 'abc',
+        'io', 'os', 'pathlib', 'glob', 'copy', 'typing',
+        'dataclasses', 'enum', 'abc', 'struct', 'pprint',
+        'time', 'calendar', 'shutil', 'urllib', 'requests',
     }
     
-    # --- Blocked Operations ---
+    # --- Blocked Builtins ---
+    # These are TRULY blocked — executor.py does NOT re-add them.
+    # Note: getattr, setattr, vars, dir are intentionally ALLOWED
+    # (executor explicitly provides them in safe builtins).
+    # open is replaced with safe_open (sandboxed file access).
     BLOCKED_BUILTINS: set = {
         'exec', 'eval', 'compile', '__import__',
-        'globals', 'locals', 'vars', 'dir',
-        'getattr', 'setattr', 'delattr',
-        'open',  # We provide our own safe file I/O
+        'globals', 'locals',
+        'delattr',
+        'exit', 'quit', 'breakpoint', 'input',
+        'open',  # Replaced by safe_open in executor.py
     }
     
     def ensure_directories(self):

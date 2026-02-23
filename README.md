@@ -224,6 +224,6 @@ power-interpreter/
 
 ## Author
 
-Built by **Kaffer AI** for **Timothy Escamilla**, CEO at New Carrot Farms LLC.
+Built by **AI**, at New Carrot Farms LLC.
 
 Part of the AI infrastructure stack for business analytics, M&A due diligence, and operational intelligence.

@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements first (Docker cache layer)
+# Cache bust: 2026-02-23 v2.0 — force full pip reinstall
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 

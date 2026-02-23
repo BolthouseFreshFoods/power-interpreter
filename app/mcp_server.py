@@ -17,8 +17,7 @@ MCP Tools (12):
 - list_datasets: List loaded datasets
 - create_session: Create workspace session
 
-Version: 1.7.0 - fetch_from_url: Priority 1 fix — stream files from CDN URL
-                 directly into sandbox, bypassing broken base64 upload path.
+Version: 1.7.1 - fix: remove unsupported 'description' kwarg from FastMCP()
 
 HISTORY:
   v1.2.0: Response was a JSON blob. URLs lived in stdout. AI parsed them. WORKED.
@@ -34,6 +33,8 @@ HISTORY:
   v1.7.0: fetch_from_url tool added. Streams files directly from any HTTPS URL
            (Cloudinary CDN, S3, public URLs) into sandbox. Fixes Priority 1
            file upload blocker — no base64 overhead, no SimTheory encoding bug.
+  v1.7.1: Fix TypeError — FastMCP() does not accept 'description' kwarg in the
+           installed version. Removed it. App now starts cleanly.
 """
 
 from mcp.server.fastmcp import FastMCP
@@ -45,11 +46,8 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# MCP Server
-mcp = FastMCP(
-    "Power Interpreter",
-    description="General-purpose sandboxed Python execution engine with large dataset support"
-)
+# MCP Server — name only, no description kwarg (not supported in installed fastmcp version)
+mcp = FastMCP("Power Interpreter")
 
 # Internal API base URL
 _default_base = "http://127.0.0.1:8080"
@@ -79,13 +77,6 @@ def _build_content_blocks(resp_text: str) -> list:
     If the JSON response also has populated inline_images[] or
     download_urls[] arrays, we create ADDITIONAL blocks for those
     (belt and suspenders). But we never remove URLs from stdout.
-
-    Content blocks:
-    1. Text block with stdout (UNMODIFIED - includes any URLs the executor appended)
-    2. Error block (if execution failed)
-    3. Additional image blocks (if inline_images[] is populated in JSON)
-    4. Additional download blocks (if download_urls[] is populated in JSON)
-    5. Metadata block (execution time, variables)
     """
     try:
         data = json.loads(resp_text)
@@ -94,20 +85,12 @@ def _build_content_blocks(resp_text: str) -> list:
 
     blocks = []
 
-    # ================================================================
-    # Block 1: Main output (stdout) — PASSED THROUGH UNMODIFIED
-    #
-    # The executor appends download URLs and chart URLs to stdout.
-    # This is the RELIABLE delivery path. Do NOT strip or modify.
-    # ================================================================
+    # Block 1: stdout — PASSED THROUGH UNMODIFIED
     stdout = data.get('stdout', '').strip()
-
     if stdout:
         blocks.append({"type": "text", "text": stdout})
 
-    # ================================================================
-    # Block 2: Error information (if execution failed)
-    # ================================================================
+    # Block 2: Error information
     if not data.get('success', False):
         error_msg = data.get('error_message', 'Unknown error')
         error_tb = data.get('error_traceback', '')
@@ -118,80 +101,45 @@ def _build_content_blocks(resp_text: str) -> list:
             error_text += f"\n\nTraceback:\n{error_tb}"
         blocks.append({"type": "text", "text": error_text})
 
-    # ================================================================
     # Block 3: Additional image blocks (belt-and-suspenders)
-    #
-    # If inline_images[] is populated in the JSON response, create
-    # extra blocks. These may duplicate what's in stdout — that's OK.
-    # Better to show the URL twice than zero times.
-    # ================================================================
     inline_images = data.get('inline_images', [])
-
     for img in inline_images:
         alt = img.get('alt_text', 'Generated chart')
         url = img.get('url', '')
         if url:
-            blocks.append({
-                "type": "text",
-                "text": f"Chart: {alt}\nImage URL: {url}"
-            })
-            logger.info(f"Content block (extra): chart '{alt}' -> {url}")
+            blocks.append({"type": "text", "text": f"Chart: {alt}\nImage URL: {url}"})
 
-    # ================================================================
     # Block 4: Additional download blocks (belt-and-suspenders)
-    #
-    # If download_urls[] is populated, create extra blocks.
-    # Skip images that were already handled above.
-    # ================================================================
     download_urls = data.get('download_urls', [])
     image_filenames = {img.get('filename', '') for img in inline_images}
-
     non_image_downloads = [
         d for d in download_urls
         if d.get('filename', '') not in image_filenames
         and not d.get('is_image', False)
     ]
-
     for info in non_image_downloads:
         filename = info.get('filename', 'file')
         url = info.get('url', '')
         size = info.get('size', '')
         if url:
-            blocks.append({
-                "type": "text",
-                "text": f"File: {filename} ({size})\nDownload URL: {url}"
-            })
-            logger.info(f"Content block (extra): download '{filename}' -> {url}")
+            blocks.append({"type": "text", "text": f"File: {filename} ({size})\nDownload URL: {url}"})
 
-    # ================================================================
-    # Block 5: Metadata (execution info, variables)
-    # ================================================================
+    # Block 5: Metadata
     meta_parts = []
-
     exec_time = data.get('execution_time_ms', 0)
     if exec_time:
         meta_parts.append(f"Execution: {exec_time}ms")
-
     kernel_info = data.get('kernel_info', {})
     if kernel_info.get('session_persisted'):
         var_count = kernel_info.get('variable_count', 0)
         exec_count = kernel_info.get('execution_count', 0)
         meta_parts.append(f"Session: {var_count} variables persisted (call #{exec_count})")
-
     if meta_parts:
-        blocks.append({
-            "type": "text",
-            "text": " | ".join(meta_parts)
-        })
+        blocks.append({"type": "text", "text": " | ".join(meta_parts)})
 
-    # ================================================================
-    # Safety: ensure we always return at least one block
-    # ================================================================
+    # Safety: always return at least one block
     if not blocks:
-        blocks.append({
-            "type": "text",
-            "text": "Code executed successfully (no output)."
-        })
+        blocks.append({"type": "text", "text": "Code executed successfully (no output)."})
 
     logger.info(f"Built {len(blocks)} content blocks for MCP response")
     return blocks
@@ -220,15 +168,9 @@ async def execute_code(
        - File already in sandbox? → Just reference it by filename: 'data.csv'
        Do NOT use pd.read_csv('https://...') — outbound HTTP from code is blocked.
 
-    3. SESSION PERSISTENCE: This works like a Jupyter notebook. Variables, imports,
-       and DataFrames persist across calls WITHIN the same session_id.
-       ALWAYS use session_id="default" unless isolating separate projects.
-       Do NOT create new session IDs per call — that destroys persistence.
-
-       Example:
-         Call 1: execute_code("import pandas as pd; df = pd.read_csv('data.csv')")
-         Call 2: execute_code("print(df.shape)")  # df still exists!
-         Call 3: execute_code("summary = df.describe()")  # builds on previous work
+    3. SESSION PERSISTENCE: Variables, imports, and DataFrames persist across
+       calls WITHIN the same session_id. ALWAYS use session_id="default" unless
+       isolating separate projects.
 
     4. CHARTS: matplotlib/plotly figures are auto-captured as PNG images.
        Download URLs appear in stdout. Present these to the user.
@@ -236,29 +178,14 @@ async def execute_code(
     5. GENERATED FILES: When code creates files (xlsx, csv, pdf), download
        URLs are appended to stdout. Present these as clickable links.
 
-    STANDARD WORKFLOW:
-      Step 1: Get file into sandbox (fetch_from_url or upload_file)
-      Step 2: execute_code to load and analyze (pd.read_csv('filename.csv'))
-      Step 3: execute_code for follow-up analysis (variables persist!)
-
-    For large datasets (1M+ rows), consider:
-      Step 1: fetch_from_url or upload_file
-      Step 2: load_dataset (loads CSV into PostgreSQL)
-      Step 3: query_dataset (fast SQL queries)
-
     Pre-installed: pandas, numpy, matplotlib, plotly, seaborn, scipy,
     scikit-learn, statsmodels, openpyxl, pdfplumber, reportlab, requests,
     xgboost, lightgbm, sympy, duckdb, pyarrow, Pillow, beautifulsoup4.
-
-    Use for quick operations (<60s). For longer tasks, use submit_job.
 
     Args:
         code: Python code to execute. Use relative filenames only (e.g., 'data.csv').
         session_id: Session for state persistence. Use "default" for continuity.
         timeout: Max seconds (max 60 for sync)
-
-    Returns:
-        List of content blocks: stdout text (with URLs), and execution metadata.
     """
     url = f"{API_BASE}/api/execute"
     logger.info(f"execute_code: POST {url}")
@@ -270,7 +197,6 @@ async def execute_code(
                 json={"code": code, "session_id": session_id, "timeout": timeout}
             )
             logger.info(f"execute_code: response status={resp.status_code}")
-
             blocks = _build_content_blocks(resp.text)
             logger.info(f"execute_code: returning {len(blocks)} content blocks")
             return blocks
@@ -297,25 +223,9 @@ async def fetch_from_url(
     the file will be streamed directly into the sandbox — no base64 encoding,
     no size limits from encoding overhead.
 
-    WHEN TO USE THIS (vs upload_file):
-    - User shared a file that is now on Cloudinary CDN (SimTheory uploads)
-    - User provided any public HTTPS URL to a file
-    - File is larger than a few MB (streaming is far more efficient)
-
-    SUPPORTED URL FORMATS:
-    - Cloudinary: https://cdn.simtheory.ai/raw/upload/v.../filename.xlsx
-    - Direct links: https://example.com/data.csv
-    - S3 pre-signed URLs
-    - Any public HTTPS file URL
-
     AFTER FETCHING — standard workflow:
       1. fetch_from_url(url="https://cdn.simtheory.ai/.../data.xlsx", session_id="default")
       2. execute_code("import pandas as pd; df = pd.read_excel('data.xlsx'); print(df.head())", session_id="default")
-
-    For large datasets (100K+ rows), use SQL workflow:
-      1. fetch_from_url(url="...", filename="data.csv", session_id="default")
-      2. load_dataset("data.csv", "my_table", session_id="default")
-      3. query_dataset("SELECT * FROM my_table LIMIT 10")
 
     Supported file types: xlsx, xls, csv, tsv, json, jsonl, parquet,
                           pdf, txt, png, jpg, zip, db, sqlite
@@ -324,9 +234,6 @@ async def fetch_from_url(
         url:        Full HTTPS URL to the file
         filename:   Filename to save as in sandbox. Inferred from URL if omitted.
         session_id: Sandbox session. Use "default" to share with execute_code.
-
-    Returns:
-        Success message with exact sandbox path and ready-to-use code snippet.
     """
     api_url = f"{API_BASE}/api/files/fetch-from-url"
     logger.info(f"fetch_from_url: POST {api_url} url={url[:80]} filename={filename}")
@@ -335,19 +242,12 @@ async def fetch_from_url(
             resp = await client.post(
                 api_url,
                 headers=_headers(),
-                json={
-                    "url": url,
-                    "filename": filename,
-                    "session_id": session_id,
-                }
+                json={"url": url, "filename": filename, "session_id": session_id}
             )
             logger.info(f"fetch_from_url: response status={resp.status_code}")
-
-            # Parse response and build helpful content block
             try:
                 data = resp.json()
                 if data.get("success") or resp.status_code == 200:
-                    saved_path = data.get("path", data.get("filename", filename or "file"))
                     saved_name = data.get("filename", filename or "file")
                     size_bytes = data.get("size_bytes", 0)
                     size_kb = size_bytes / 1024 if size_bytes else 0
@@ -355,7 +255,6 @@ async def fetch_from_url(
                         f"✅ File downloaded successfully!\n\n"
                         f"  Filename : {saved_name}\n"
                         f"  Size     : {size_bytes:,} bytes ({size_kb:.1f} KB)\n"
-                        f"  Path     : {saved_path}\n"
                         f"  Session  : {session_id}\n\n"
                         f"Ready to use in execute_code:\n"
                         f"  import pandas as pd\n"
@@ -367,7 +266,6 @@ async def fetch_from_url(
                     text = f"❌ fetch_from_url failed (HTTP {resp.status_code}):\n  {error}"
             except Exception:
                 text = resp.text
-
             return [{"type": "text", "text": text}]
     except Exception as e:
         logger.error(f"fetch_from_url: error: {e}", exc_info=True)
@@ -382,35 +280,12 @@ async def upload_file(
 ) -> str:
     """Upload a file to the sandbox using base64-encoded content.
 
-    WHEN TO USE THIS:
-    - User ATTACHED or PASTED a file in the conversation (you have the content)
-    - Small files under 10MB
-
-    WHEN TO USE fetch_from_url INSTEAD:
-    - User provided a URL (you do NOT have the file content, only a link)
-    - Large files over 10MB
-    - SimTheory uploaded the file to Cloudinary CDN (use the CDN URL)
-
-    AFTER UPLOADING — your next step depends on the goal:
-
-    For Python analysis (pandas, charts, etc.):
-      1. upload_file("data.csv", "<base64>", session_id="default")
-      2. execute_code("import pandas as pd; df = pd.read_csv('data.csv'); print(df.head())", session_id="default")
-
-    For SQL analysis (large datasets, complex queries):
-      1. upload_file("data.csv", "<base64>", session_id="default")
-      2. load_dataset("data.csv", "my_data", session_id="default")
-      3. query_dataset("SELECT * FROM my_data LIMIT 10")
-
-    CRITICAL: Use the SAME session_id across all calls so files are accessible.
+    For large files or CDN URLs, prefer fetch_from_url instead.
 
     Args:
         filename: Name for the file (e.g., 'invoices.csv', 'report.xlsx')
         content_base64: Base64-encoded file content
         session_id: Session for file isolation (default: 'default')
-
-    Returns:
-        Confirmation with file path, size, and preview info
     """
     url = f"{API_BASE}/api/files/upload"
     logger.info(f"upload_file: POST {url} filename={filename}")
@@ -419,11 +294,7 @@ async def upload_file(
             resp = await client.post(
                 url,
                 headers=_headers(),
-                json={
-                    "filename": filename,
-                    "content_base64": content_base64,
-                    "session_id": session_id
-                }
+                json={"filename": filename, "content_base64": content_base64, "session_id": session_id}
             )
             logger.info(f"upload_file: response status={resp.status_code}")
             return resp.text
@@ -440,41 +311,10 @@ async def fetch_file(
 ) -> str:
     """Download a file from a URL into the sandbox. Supports up to 500MB.
 
-    WHEN TO USE THIS:
-    - User provided a URL to a file (CSV, Excel, PDF, etc.)
-    - User shared a Google Drive, Dropbox, or S3 link
-    - Any file available at a public URL
-
-    WHEN TO USE fetch_from_url INSTEAD:
-    - SimTheory uploaded the file to Cloudinary CDN — use fetch_from_url
-      which has better error handling and response formatting for CDN files
-
-    SUPPORTED URL FORMATS:
-    - Direct links: https://example.com/data.csv
-    - Google Drive: https://drive.google.com/uc?export=download&id=FILE_ID
-    - Dropbox: Change dl=0 to dl=1 in the sharing URL
-    - S3 pre-signed URLs
-
-    AFTER FETCHING — your next step depends on the goal:
-
-    For Python analysis (pandas, charts, etc.):
-      1. fetch_file(url="https://...", filename="data.csv", session_id="default")
-      2. execute_code("import pandas as pd; df = pd.read_csv('data.csv'); print(df.head())", session_id="default")
-
-    For SQL analysis (large datasets, 100K+ rows):
-      1. fetch_file(url="https://...", filename="data.csv", session_id="default")
-      2. load_dataset("data.csv", "my_data", session_id="default")
-      3. query_dataset("SELECT * FROM my_data LIMIT 10")
-
-    CRITICAL: Use session_id="default" so the file is accessible to execute_code.
-
     Args:
         url: Public URL to download from
         filename: What to name the file in the sandbox (e.g., 'sales.csv')
         session_id: Session for file isolation (default: 'default')
-
-    Returns:
-        Confirmation with file path, size, type detection, and preview
     """
     api_url = f"{API_BASE}/api/files/fetch"
     logger.info(f"fetch_file: POST {api_url} url={url[:80]}... filename={filename}")
@@ -483,11 +323,7 @@ async def fetch_file(
             resp = await client.post(
                 api_url,
                 headers=_headers(),
-                json={
-                    "url": url,
-                    "filename": filename,
-                    "session_id": session_id
-                }
+                json={"url": url, "filename": filename, "session_id": session_id}
             )
             logger.info(f"fetch_file: response status={resp.status_code}")
             return resp.text
@@ -500,19 +336,12 @@ async def fetch_file(
 async def list_files(session_id: str = None) -> str:
     """List files in the sandbox.
 
-    Use this to check what files are available before running code.
-    Helpful when you're unsure if a file was already uploaded or fetched.
-
     Args:
         session_id: Optional session filter (use "default" to see main workspace)
-
-    Returns:
-        List of files with metadata
     """
     params = {}
     if session_id:
         params["session_id"] = session_id
-
     url = f"{API_BASE}/api/files"
     logger.info(f"list_files: GET {url}")
     try:
@@ -534,31 +363,15 @@ async def submit_job(
     session_id: str = "default",
     timeout: int = 600
 ) -> str:
-    """Submit a long-running job for async execution.
+    """Submit a long-running job for async execution. Returns a job_id immediately.
 
-    IMPORTANT: Same file rules as execute_code — files must be in the
-    sandbox first. Use fetch_from_url or upload_file before submitting.
-
-    SESSION PERSISTENCE: Uses the same kernel as execute_code when
-    session_id matches. Variables created in execute_code are available
-    in the job, and vice versa.
-
-    Returns immediately with a job_id. Poll with get_job_status,
+    Use for jobs that exceed 60 seconds. Poll with get_job_status,
     then retrieve output with get_job_result.
 
-    Use for:
-    - Large data processing (1M+ rows)
-    - Complex analysis (>60 seconds)
-    - Report generation
-
     Args:
-        code: Python code to execute. Use relative filenames only.
-        session_id: Session for state persistence. Use "default" to share
-                    state with execute_code calls.
+        code: Python code to execute.
+        session_id: Session for state persistence.
         timeout: Max seconds (default 600 = 10 min)
-
-    Returns:
-        Job ID and status
     """
     url = f"{API_BASE}/api/jobs/submit"
     logger.info(f"submit_job: POST {url}")
@@ -583,9 +396,6 @@ async def get_job_status(job_id: str) -> str:
 
     Args:
         job_id: The job ID from submit_job
-
-    Returns:
-        Job status with timing info
     """
     url = f"{API_BASE}/api/jobs/{job_id}/status"
     logger.info(f"get_job_status: GET {url}")
@@ -599,25 +409,18 @@ async def get_job_status(job_id: str) -> str:
 
 
 @mcp.tool()
-async def get_job_result(job_id: str) -> str:
+async def get_job_result(job_id: str) -> list:
     """Get the full result of a completed job.
-
-    Includes stdout, stderr, result data, files created, execution time.
-    If the job generated charts, image URLs will be in the output.
 
     Args:
         job_id: The job ID from submit_job
-
-    Returns:
-        Full job result with image URLs and download links
     """
     url = f"{API_BASE}/api/jobs/{job_id}/result"
     logger.info(f"get_job_result: GET {url}")
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.get(url, headers=_headers())
-            blocks = _build_content_blocks(resp.text)
-            return blocks
+            return _build_content_blocks(resp.text)
     except Exception as e:
         logger.error(f"get_job_result: error: {e}", exc_info=True)
         return f"Error calling get_job_result API: {e}"
@@ -636,28 +439,11 @@ async def load_dataset(
 ) -> str:
     """Load a CSV file from the sandbox into PostgreSQL for fast SQL querying.
 
-    PREREQUISITE: The file MUST already be in the sandbox. Get it there first:
-      - From a URL: fetch_from_url(url="...", filename="data.csv")
-      - From user upload: upload_file("data.csv", "<base64>")
-
-    WHEN TO USE THIS vs. just execute_code with pandas:
-    - Dataset has 100K+ rows → use load_dataset + query_dataset (faster)
-    - You need complex SQL joins, GROUP BY, window functions → load_dataset
-    - Quick look at a small file → just use execute_code with pandas
-
-    COMPLETE WORKFLOW:
-      1. fetch_from_url(url="https://...", filename="big_data.csv", session_id="default")
-      2. load_dataset("big_data.csv", "sales", session_id="default")
-      3. query_dataset("SELECT region, SUM(revenue) FROM sales GROUP BY region")
-
     Args:
         file_path: Filename in sandbox (e.g., 'data.csv' — NOT a URL or local path)
         dataset_name: Table name for SQL queries (e.g., 'sales', 'invoices')
         session_id: Session for file isolation (default: 'default')
         delimiter: CSV delimiter (default comma)
-
-    Returns:
-        Dataset info with row count, columns, and preview
     """
     url = f"{API_BASE}/api/data/load-csv"
     logger.info(f"load_dataset: POST {url}")
@@ -666,12 +452,8 @@ async def load_dataset(
             resp = await client.post(
                 url,
                 headers=_headers(),
-                json={
-                    "file_path": file_path,
-                    "dataset_name": dataset_name,
-                    "session_id": session_id,
-                    "delimiter": delimiter
-                }
+                json={"file_path": file_path, "dataset_name": dataset_name,
+                      "session_id": session_id, "delimiter": delimiter}
             )
             return resp.text
     except Exception as e:
@@ -687,18 +469,10 @@ async def query_dataset(
 ) -> str:
     """Execute a SQL query against datasets loaded into PostgreSQL.
 
-    PREREQUISITE: Dataset must be loaded first with load_dataset.
-    Use list_datasets to see available table names.
-
-    Only SELECT queries allowed. Results are paginated.
-
     Args:
         sql: SQL SELECT query (e.g., "SELECT * FROM sales WHERE revenue > 1000")
         limit: Max rows returned (default 1000)
         offset: Row offset for pagination
-
-    Returns:
-        Query results with columns and data
     """
     url = f"{API_BASE}/api/data/query"
     logger.info(f"query_dataset: POST {url}")
@@ -719,19 +493,12 @@ async def query_dataset(
 async def list_datasets(session_id: str = None) -> str:
     """List all datasets loaded into PostgreSQL.
 
-    Shows dataset names, table names, row counts, and sizes.
-    Use the table_name in SQL queries with query_dataset.
-
     Args:
         session_id: Optional session filter
-
-    Returns:
-        List of datasets with metadata
     """
     params = {}
     if session_id:
         params["session_id"] = session_id
-
     url = f"{API_BASE}/api/data/datasets"
     logger.info(f"list_datasets: GET {url}")
     try:
@@ -754,18 +521,12 @@ async def create_session(
 ) -> str:
     """Create a new workspace session for file/data isolation.
 
-    You almost NEVER need this. The "default" session is automatically
-    available and should be used for all normal work.
-
-    Only create a new session when you need to completely isolate
-    files and data between unrelated projects running simultaneously.
+    The "default" session is automatically available for all normal work.
+    Only create a new session to isolate unrelated projects.
 
     Args:
         name: Session name (e.g., 'vestis-audit', 'financial-model')
         description: Optional description
-
-    Returns:
-        Session ID and details
     """
     url = f"{API_BASE}/api/sessions"
     logger.info(f"create_session: POST {url}")

@@ -17,9 +17,7 @@ MCP Tools (12):
 - list_datasets: List loaded datasets
 - create_session: Create workspace session
 
-Version: 1.7.2 - fix: fetch_from_url was calling /api/files/fetch-from-url (404).
-                       Corrected to /api/files/fetch which is the actual registered
-                       FastAPI route in files.py. One word difference, total blocker.
+Version: 1.8.0 - feat: inline base64 image rendering for charts
 
 HISTORY:
   v1.2.0: Response was a JSON blob. URLs lived in stdout. AI parsed them. WORKED.
@@ -39,6 +37,13 @@ HISTORY:
            installed version. Removed it. App now starts cleanly.
   v1.7.2: Fix 404 — fetch_from_url was POSTing to /api/files/fetch-from-url
            which does not exist. Correct route is /api/files/fetch. Fixed.
+  v1.8.0: Charts now render inline. Previously, chart URLs were returned as text
+           strings which SimTheory couldn't render. Now we:
+           1. Detect inline_images in the execute_code response
+           2. Fetch the PNG bytes from internal /dl/{file_id} route
+           3. Base64 encode them
+           4. Return MCP ImageContent blocks: {"type":"image","data":"...","mimeType":"image/png"}
+           SimTheory renders ImageContent blocks natively. Charts now display.
 """
 
 from mcp.server.fastmcp import FastMCP
@@ -47,6 +52,7 @@ import httpx
 import os
 import json
 import logging
+import base64
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +64,9 @@ _default_base = "http://127.0.0.1:8080"
 API_BASE = os.getenv("API_BASE_URL", _default_base)
 API_KEY = os.getenv("API_KEY", "")
 
+# Max image size to base64 encode (5MB). Larger images get text URL fallback.
+MAX_IMAGE_BASE64_BYTES = 5 * 1024 * 1024
+
 logger.info(f"MCP Server: API_BASE={API_BASE}")
 logger.info(f"MCP Server: API_KEY={'***configured***' if API_KEY else 'NOT SET'}")
 
@@ -65,6 +74,146 @@ logger.info(f"MCP Server: API_KEY={'***configured***' if API_KEY else 'NOT SET'}
 def _headers():
     return {"X-API-Key": API_KEY, "Content-Type": "application/json"}
 
+
+# ============================================================
+# IMAGE HELPERS (v1.8.0)
+# ============================================================
+
+async def _fetch_image_base64(file_id: str, filename: str) -> Optional[Dict]:
+    """Fetch image bytes from internal /dl/ route, return MCP ImageContent block.
+    
+    Uses the internal API_BASE (127.0.0.1:8080) to avoid going through
+    the public Railway domain. The /dl/ route is unauthenticated.
+    
+    Returns:
+        {"type": "image", "data": "<base64>", "mimeType": "image/png"}
+        or None if fetch fails.
+    """
+    from urllib.parse import quote
+    encoded_filename = quote(filename)
+    internal_url = f"{API_BASE}/dl/{file_id}/{encoded_filename}"
+    
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(internal_url)
+            
+            if resp.status_code != 200:
+                logger.warning(
+                    f"Image fetch failed: {internal_url} -> HTTP {resp.status_code}"
+                )
+                return None
+            
+            # Check size before encoding
+            if len(resp.content) > MAX_IMAGE_BASE64_BYTES:
+                logger.warning(
+                    f"Image too large for base64: {filename} "
+                    f"({len(resp.content)} bytes > {MAX_IMAGE_BASE64_BYTES})"
+                )
+                return None
+            
+            # Determine MIME type from response or filename
+            content_type = resp.headers.get('content-type', '')
+            if 'png' in content_type or filename.lower().endswith('.png'):
+                mime = 'image/png'
+            elif 'jpeg' in content_type or 'jpg' in content_type:
+                mime = 'image/jpeg'
+            elif 'svg' in content_type:
+                mime = 'image/svg+xml'
+            else:
+                mime = content_type.split(';')[0].strip() or 'image/png'
+            
+            b64 = base64.b64encode(resp.content).decode('utf-8')
+            
+            logger.info(
+                f"Image base64 encoded: {filename} "
+                f"({len(resp.content)} bytes -> {len(b64)} chars base64, {mime})"
+            )
+            
+            return {
+                "type": "image",
+                "data": b64,
+                "mimeType": mime,
+            }
+            
+    except Exception as e:
+        logger.warning(f"Image base64 fetch failed for {filename}: {e}")
+        return None
+
+
+async def _enrich_blocks_with_images(blocks: list, resp_text: str) -> list:
+    """Replace text-based image URLs with native MCP ImageContent blocks.
+    
+    v1.8.0: For each inline image in the execute_code response:
+    1. Fetch the PNG bytes from internal /dl/{file_id}/{filename} route
+    2. Base64 encode the bytes
+    3. Insert as MCP ImageContent block (SimTheory renders these natively)
+    4. Fall back to text URL if fetch fails
+    
+    This is called AFTER _build_content_blocks() to enrich the response.
+    """
+    try:
+        data = json.loads(resp_text)
+    except (json.JSONDecodeError, TypeError):
+        return blocks
+    
+    inline_images = data.get('inline_images', [])
+    download_urls = data.get('download_urls', [])
+    
+    if not inline_images:
+        return blocks
+    
+    # Build file_id lookup from download_urls (which has the UUID)
+    file_id_map = {}
+    for dl in download_urls:
+        if dl.get('is_image'):
+            file_id_map[dl.get('filename', '')] = {
+                'file_id': dl.get('file_id', ''),
+                'url': dl.get('url', ''),
+            }
+    
+    # Fetch each image and build MCP ImageContent blocks
+    image_blocks = []
+    fallback_blocks = []
+    
+    for img in inline_images:
+        filename = img.get('filename', '')
+        alt_text = img.get('alt_text', 'Generated chart')
+        dl_info = file_id_map.get(filename, {})
+        file_id = dl_info.get('file_id', '')
+        public_url = dl_info.get('url', '') or img.get('url', '')
+        
+        if file_id:
+            block = await _fetch_image_base64(file_id, filename)
+            if block:
+                image_blocks.append(block)
+                logger.info(f"Image block created for: {filename}")
+                continue
+        
+        # Fallback: text URL (image fetch failed or no file_id)
+        if public_url:
+            fallback_blocks.append({
+                "type": "text",
+                "text": f"Chart: {alt_text}\nImage URL: {public_url}"
+            })
+            logger.warning(f"Falling back to text URL for: {filename}")
+    
+    # Insert image blocks after the first text block (stdout)
+    if image_blocks or fallback_blocks:
+        insert_pos = min(1, len(blocks))
+        for i, block in enumerate(image_blocks + fallback_blocks):
+            blocks.insert(insert_pos + i, block)
+        
+        logger.info(
+            f"Enriched response with {len(image_blocks)} image blocks "
+            f"and {len(fallback_blocks)} fallback text blocks"
+        )
+    
+    return blocks
+
+
+# ============================================================
+# CONTENT BLOCK BUILDER
+# ============================================================
 
 def _build_content_blocks(resp_text: str) -> list:
     """Build MCP content blocks from execute_code API response.
@@ -78,9 +227,10 @@ def _build_content_blocks(resp_text: str) -> list:
     and chart URLs to stdout, and that's the RELIABLE path. We pass
     stdout through as-is.
 
-    If the JSON response also has populated inline_images[] or
-    download_urls[] arrays, we create ADDITIONAL blocks for those
-    (belt and suspenders). But we never remove URLs from stdout.
+    v1.8.0 CHANGE: Block 3 (inline_images text blocks) is REMOVED.
+    Images are now handled by _enrich_blocks_with_images() which
+    fetches actual bytes and returns MCP ImageContent blocks.
+    Fallback text URLs are also handled there if fetch fails.
     """
     try:
         data = json.loads(resp_text)
@@ -105,21 +255,17 @@ def _build_content_blocks(resp_text: str) -> list:
             error_text += f"\n\nTraceback:\n{error_tb}"
         blocks.append({"type": "text", "text": error_text})
 
-    # Block 3: Additional image blocks (belt-and-suspenders)
-    inline_images = data.get('inline_images', [])
-    for img in inline_images:
-        alt = img.get('alt_text', 'Generated chart')
-        url = img.get('url', '')
-        if url:
-            blocks.append({"type": "text", "text": f"Chart: {alt}\nImage URL: {url}"})
+    # Block 3: REMOVED (v1.8.0)
+    # Previously created text blocks with image URLs.
+    # Now handled by _enrich_blocks_with_images() which returns
+    # native MCP ImageContent blocks with base64 data.
+    # The image URLs are still in stdout (Block 1) as fallback text.
 
-    # Block 4: Additional download blocks (belt-and-suspenders)
+    # Block 4: Additional download blocks (non-image files only)
     download_urls = data.get('download_urls', [])
-    image_filenames = {img.get('filename', '') for img in inline_images}
     non_image_downloads = [
         d for d in download_urls
-        if d.get('filename', '') not in image_filenames
-        and not d.get('is_image', False)
+        if not d.get('is_image', False)
     ]
     for info in non_image_downloads:
         filename = info.get('filename', 'file')
@@ -169,8 +315,8 @@ async def execute_code(
       2. execute_code("import pandas as pd; df = pd.read_excel('filename.xlsx')")
       3. execute_code("print(df.head())")  — variables persist!
 
-    OUTPUT — stdout is returned as-is. Any URLs printed to stdout
-    (chart URLs, download URLs) will be visible in the response.
+    OUTPUT — stdout is returned as-is. Charts (matplotlib/seaborn/plotly)
+    are auto-captured and returned as inline images.
 
     Args:
         code: Python code to execute. Multi-line strings work fine.
@@ -187,7 +333,15 @@ async def execute_code(
                 headers=_headers(),
                 json={"code": code, "session_id": session_id, "timeout": timeout}
             )
-            return _build_content_blocks(resp.text)
+            
+            # Build text content blocks
+            blocks = _build_content_blocks(resp.text)
+            
+            # v1.8.0: Enrich with native image blocks (base64)
+            blocks = await _enrich_blocks_with_images(blocks, resp.text)
+            
+            return blocks
+            
     except Exception as e:
         logger.error(f"execute_code: error: {e}", exc_info=True)
         return [{"type": "text", "text": f"Error calling execute_code API: {e}"}]
@@ -231,7 +385,6 @@ async def fetch_from_url(
         filename = parsed.path.split('/')[-1].split('?')[0] or 'downloaded_file'
 
     # FIXED v1.7.2: Call /api/files/fetch (correct route in files.py)
-    # Previously called /api/files/fetch-from-url which returned 404.
     api_url = f"{API_BASE}/api/files/fetch"
     logger.info(f"fetch_from_url: POST {api_url} url={url[:80]} filename={filename}")
 
@@ -423,7 +576,15 @@ async def get_job_result(job_id: str) -> list:
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.get(url, headers=_headers())
-            return _build_content_blocks(resp.text)
+            
+            # Build text blocks
+            blocks = _build_content_blocks(resp.text)
+            
+            # v1.8.0: Enrich with native image blocks (base64)
+            blocks = await _enrich_blocks_with_images(blocks, resp.text)
+            
+            return blocks
+            
     except Exception as e:
         logger.error(f"get_job_result: error: {e}", exc_info=True)
         return f"Error calling get_job_result API: {e}"

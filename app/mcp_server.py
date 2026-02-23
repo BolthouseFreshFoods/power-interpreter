@@ -17,7 +17,7 @@ MCP Tools (12):
 - list_datasets: List loaded datasets
 - create_session: Create workspace session
 
-Version: 1.8.0 - feat: inline base64 image rendering for charts
+Version: 1.8.1 - fix: base64 image enrichment now works via stdout regex fallback
 
 HISTORY:
   v1.2.0: Response was a JSON blob. URLs lived in stdout. AI parsed them. WORKED.
@@ -37,22 +37,29 @@ HISTORY:
            installed version. Removed it. App now starts cleanly.
   v1.7.2: Fix 404 — fetch_from_url was POSTing to /api/files/fetch-from-url
            which does not exist. Correct route is /api/files/fetch. Fixed.
-  v1.8.0: Charts now render inline. Previously, chart URLs were returned as text
-           strings which SimTheory couldn't render. Now we:
-           1. Detect inline_images in the execute_code response
-           2. Fetch the PNG bytes from internal /dl/{file_id} route
-           3. Base64 encode them
-           4. Return MCP ImageContent blocks: {"type":"image","data":"...","mimeType":"image/png"}
-           SimTheory renders ImageContent blocks natively. Charts now display.
+  v1.8.0: Charts now render inline via base64 ImageContent blocks. BUT: relied
+           on inline_images[] JSON array which is empty due to executor race
+           condition (documented since v1.5.0). Enrichment never fired.
+  v1.8.1: Fix the v1.8.0 miss. Two changes:
+           1. When inline_images[] is empty (the common case), scan stdout for
+              /dl/{uuid}/{filename} URLs via regex. Extract file_id + filename,
+              fetch bytes from internal /dl/ route, base64 encode, return as
+              MCP ImageContent block. This is the RELIABLE path.
+           2. Strip markdown image syntax from stdout text block so SimTheory
+              doesn't also try to render it (it rewrites URLs wrong -> 404).
+           Evidence from v1.8.0 smoke test logs:
+             - "Built 2 content blocks" = only text, no images (inline_images was empty)
+             - "GET /charts/chart-test-v180/chart_001.png 404" = SimTheory rewrote URL
 """
 
 from mcp.server.fastmcp import FastMCP
-from typing import Optional, Dict
+from typing import Optional, Dict, List, Tuple
 import httpx
 import os
 import json
 import logging
 import base64
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +74,25 @@ API_KEY = os.getenv("API_KEY", "")
 # Max image size to base64 encode (5MB). Larger images get text URL fallback.
 MAX_IMAGE_BASE64_BYTES = 5 * 1024 * 1024
 
+# Regex to find our /dl/{uuid}/{filename} image URLs in stdout
+# Matches: https://power-interpreter-production.up.railway.app/dl/f675f421-4c1c-4418-9c81-0c916c2afff7/chart_001.png
+# Also matches: http://127.0.0.1:8080/dl/... (internal)
+_DL_IMAGE_URL_RE = re.compile(
+    r'(https?://[^\s\)]+/dl/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/([^\s\)\]]+\.(?:png|jpg|jpeg|svg|gif)))',
+    re.IGNORECASE
+)
+
+# Regex to strip markdown image syntax from stdout
+# Matches: ![anything](url)  and also plain "Generated charts:\n\n" prefix
+_MARKDOWN_IMAGE_RE = re.compile(
+    r'!\[[^\]]*\]\([^\)]*\.(?:png|jpg|jpeg|svg|gif)\)',
+    re.IGNORECASE
+)
+_GENERATED_CHARTS_RE = re.compile(
+    r'Generated charts?:\s*\n*',
+    re.IGNORECASE
+)
+
 logger.info(f"MCP Server: API_BASE={API_BASE}")
 logger.info(f"MCP Server: API_KEY={'***configured***' if API_KEY else 'NOT SET'}")
 
@@ -76,15 +102,15 @@ def _headers():
 
 
 # ============================================================
-# IMAGE HELPERS (v1.8.0)
+# IMAGE HELPERS (v1.8.0 + v1.8.1 fixes)
 # ============================================================
 
 async def _fetch_image_base64(file_id: str, filename: str) -> Optional[Dict]:
     """Fetch image bytes from internal /dl/ route, return MCP ImageContent block.
-    
+
     Uses the internal API_BASE (127.0.0.1:8080) to avoid going through
     the public Railway domain. The /dl/ route is unauthenticated.
-    
+
     Returns:
         {"type": "image", "data": "<base64>", "mimeType": "image/png"}
         or None if fetch fails.
@@ -92,17 +118,17 @@ async def _fetch_image_base64(file_id: str, filename: str) -> Optional[Dict]:
     from urllib.parse import quote
     encoded_filename = quote(filename)
     internal_url = f"{API_BASE}/dl/{file_id}/{encoded_filename}"
-    
+
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.get(internal_url)
-            
+
             if resp.status_code != 200:
                 logger.warning(
                     f"Image fetch failed: {internal_url} -> HTTP {resp.status_code}"
                 )
                 return None
-            
+
             # Check size before encoding
             if len(resp.content) > MAX_IMAGE_BASE64_BYTES:
                 logger.warning(
@@ -110,7 +136,7 @@ async def _fetch_image_base64(file_id: str, filename: str) -> Optional[Dict]:
                     f"({len(resp.content)} bytes > {MAX_IMAGE_BASE64_BYTES})"
                 )
                 return None
-            
+
             # Determine MIME type from response or filename
             content_type = resp.headers.get('content-type', '')
             if 'png' in content_type or filename.lower().endswith('.png'):
@@ -121,93 +147,183 @@ async def _fetch_image_base64(file_id: str, filename: str) -> Optional[Dict]:
                 mime = 'image/svg+xml'
             else:
                 mime = content_type.split(';')[0].strip() or 'image/png'
-            
+
             b64 = base64.b64encode(resp.content).decode('utf-8')
-            
+
             logger.info(
                 f"Image base64 encoded: {filename} "
                 f"({len(resp.content)} bytes -> {len(b64)} chars base64, {mime})"
             )
-            
+
             return {
                 "type": "image",
                 "data": b64,
                 "mimeType": mime,
             }
-            
+
     except Exception as e:
         logger.warning(f"Image base64 fetch failed for {filename}: {e}")
         return None
 
 
+def _extract_image_urls_from_stdout(stdout: str) -> List[Tuple[str, str, str]]:
+    """Extract /dl/{uuid}/{filename} image URLs from stdout text.
+
+    v1.8.1: This is the RELIABLE path. The executor appends chart URLs
+    to stdout as markdown: ![chart_001](https://.../dl/{uuid}/chart_001.png)
+    The inline_images[] JSON array is often empty due to a race condition.
+
+    Returns list of (full_url, file_id, filename) tuples.
+    """
+    matches = _DL_IMAGE_URL_RE.findall(stdout)
+    if matches:
+        logger.info(f"Found {len(matches)} image URL(s) in stdout via regex")
+        for full_url, file_id, filename in matches:
+            logger.info(f"  -> file_id={file_id}, filename={filename}")
+    return matches
+
+
+def _strip_image_markdown_from_text(text: str) -> str:
+    """Remove markdown image syntax and 'Generated charts:' prefix from text.
+
+    v1.8.1: We strip these because:
+    1. We're returning proper MCP ImageContent blocks (base64) instead
+    2. If we leave the markdown, SimTheory rewrites the URL wrong -> 404
+       Evidence: GET /charts/chart-test-v180/chart_001.png -> 404
+    """
+    cleaned = _MARKDOWN_IMAGE_RE.sub('', text)
+    cleaned = _GENERATED_CHARTS_RE.sub('', cleaned)
+    # Clean up any leftover blank lines
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned).strip()
+    return cleaned
+
+
 async def _enrich_blocks_with_images(blocks: list, resp_text: str) -> list:
     """Replace text-based image URLs with native MCP ImageContent blocks.
-    
-    v1.8.0: For each inline image in the execute_code response:
-    1. Fetch the PNG bytes from internal /dl/{file_id}/{filename} route
-    2. Base64 encode the bytes
-    3. Insert as MCP ImageContent block (SimTheory renders these natively)
-    4. Fall back to text URL if fetch fails
-    
-    This is called AFTER _build_content_blocks() to enrich the response.
+
+    v1.8.1 FIX: Two-path approach:
+      Path A: Use inline_images[] + download_urls[] from JSON (if populated)
+      Path B: Scan stdout for /dl/{uuid}/{filename} URLs via regex (RELIABLE)
+
+    After fetching images as base64, strip the markdown syntax from the
+    stdout text block so SimTheory doesn't also try to render it wrong.
     """
     try:
         data = json.loads(resp_text)
     except (json.JSONDecodeError, TypeError):
         return blocks
-    
+
     inline_images = data.get('inline_images', [])
     download_urls = data.get('download_urls', [])
-    
-    if not inline_images:
-        return blocks
-    
-    # Build file_id lookup from download_urls (which has the UUID)
-    file_id_map = {}
-    for dl in download_urls:
-        if dl.get('is_image'):
-            file_id_map[dl.get('filename', '')] = {
-                'file_id': dl.get('file_id', ''),
-                'url': dl.get('url', ''),
-            }
-    
-    # Fetch each image and build MCP ImageContent blocks
+    stdout = data.get('stdout', '')
+
     image_blocks = []
     fallback_blocks = []
-    
-    for img in inline_images:
-        filename = img.get('filename', '')
-        alt_text = img.get('alt_text', 'Generated chart')
-        dl_info = file_id_map.get(filename, {})
-        file_id = dl_info.get('file_id', '')
-        public_url = dl_info.get('url', '') or img.get('url', '')
-        
-        if file_id:
-            block = await _fetch_image_base64(file_id, filename)
-            if block:
-                image_blocks.append(block)
-                logger.info(f"Image block created for: {filename}")
-                continue
-        
-        # Fallback: text URL (image fetch failed or no file_id)
-        if public_url:
-            fallback_blocks.append({
-                "type": "text",
-                "text": f"Chart: {alt_text}\nImage URL: {public_url}"
-            })
-            logger.warning(f"Falling back to text URL for: {filename}")
-    
-    # Insert image blocks after the first text block (stdout)
+    images_found = False
+
+    # ------------------------------------------------------------------
+    # PATH A: Use inline_images[] + download_urls[] (v1.8.0 approach)
+    # ------------------------------------------------------------------
+    if inline_images:
+        logger.info(f"Path A: {len(inline_images)} inline_images in JSON")
+        images_found = True
+
+        # Build file_id lookup from download_urls
+        file_id_map = {}
+        for dl in download_urls:
+            if dl.get('is_image'):
+                file_id_map[dl.get('filename', '')] = {
+                    'file_id': dl.get('file_id', ''),
+                    'url': dl.get('url', ''),
+                }
+
+        for img in inline_images:
+            filename = img.get('filename', '')
+            alt_text = img.get('alt_text', 'Generated chart')
+            dl_info = file_id_map.get(filename, {})
+            file_id = dl_info.get('file_id', '')
+            public_url = dl_info.get('url', '') or img.get('url', '')
+
+            if file_id:
+                block = await _fetch_image_base64(file_id, filename)
+                if block:
+                    image_blocks.append(block)
+                    logger.info(f"Path A: image block created for {filename}")
+                    continue
+
+            # Fallback: text URL
+            if public_url:
+                fallback_blocks.append({
+                    "type": "text",
+                    "text": f"Chart: {alt_text}\nImage URL: {public_url}"
+                })
+                logger.warning(f"Path A: falling back to text URL for {filename}")
+
+    # ------------------------------------------------------------------
+    # PATH B: Scan stdout for /dl/ URLs (v1.8.1 — the RELIABLE path)
+    # ------------------------------------------------------------------
+    if not images_found and stdout:
+        url_matches = _extract_image_urls_from_stdout(stdout)
+
+        if url_matches:
+            images_found = True
+            logger.info(f"Path B: found {len(url_matches)} image URL(s) in stdout")
+
+            for full_url, file_id, filename in url_matches:
+                block = await _fetch_image_base64(file_id, filename)
+                if block:
+                    image_blocks.append(block)
+                    logger.info(f"Path B: image block created for {filename}")
+                else:
+                    # Fallback: keep the public URL as text
+                    fallback_blocks.append({
+                        "type": "text",
+                        "text": f"Chart: {filename}\nImage URL: {full_url}"
+                    })
+                    logger.warning(f"Path B: base64 fetch failed, text fallback for {filename}")
+
+    # ------------------------------------------------------------------
+    # STRIP markdown image syntax from stdout text block
+    # ------------------------------------------------------------------
+    if image_blocks and blocks:
+        # Find the stdout text block (always the first one) and clean it
+        for i, block in enumerate(blocks):
+            if block.get('type') == 'text':
+                original_text = block['text']
+                cleaned_text = _strip_image_markdown_from_text(original_text)
+                if cleaned_text != original_text:
+                    if cleaned_text:
+                        blocks[i] = {"type": "text", "text": cleaned_text}
+                        logger.info(f"Stripped image markdown from text block {i}")
+                    else:
+                        # If stripping left nothing, remove the block entirely
+                        blocks[i] = None
+                        logger.info(f"Removed empty text block {i} after stripping")
+                # Only clean the first text block (stdout)
+                break
+
+        # Remove any None blocks
+        blocks = [b for b in blocks if b is not None]
+
+    # ------------------------------------------------------------------
+    # INSERT image blocks into response
+    # ------------------------------------------------------------------
     if image_blocks or fallback_blocks:
-        insert_pos = min(1, len(blocks))
-        for i, block in enumerate(image_blocks + fallback_blocks):
-            blocks.insert(insert_pos + i, block)
-        
+        # Insert after first remaining text block (or at start if none)
+        insert_pos = 0
+        for i, block in enumerate(blocks):
+            if block.get('type') == 'text':
+                insert_pos = i + 1
+                break
+
+        for j, block in enumerate(image_blocks + fallback_blocks):
+            blocks.insert(insert_pos + j, block)
+
         logger.info(
-            f"Enriched response with {len(image_blocks)} image blocks "
-            f"and {len(fallback_blocks)} fallback text blocks"
+            f"Enriched response: {len(image_blocks)} image blocks, "
+            f"{len(fallback_blocks)} fallback blocks"
         )
-    
+
     return blocks
 
 
@@ -223,14 +339,12 @@ def _build_content_blocks(resp_text: str) -> list:
       isinstance(result, list) -> content = result
 
     CRITICAL DESIGN DECISION (v1.5.2):
-    We do NOT strip URLs from stdout. The executor appends download URLs
-    and chart URLs to stdout, and that's the RELIABLE path. We pass
-    stdout through as-is.
+    We do NOT strip URLs from stdout HERE. Stdout is passed through as-is.
+    Image markdown stripping happens later in _enrich_blocks_with_images()
+    ONLY if we successfully create base64 ImageContent blocks to replace them.
 
-    v1.8.0 CHANGE: Block 3 (inline_images text blocks) is REMOVED.
-    Images are now handled by _enrich_blocks_with_images() which
-    fetches actual bytes and returns MCP ImageContent blocks.
-    Fallback text URLs are also handled there if fetch fails.
+    v1.8.0: Removed Block 3 (inline_images text blocks).
+    v1.8.1: Images handled entirely by _enrich_blocks_with_images().
     """
     try:
         data = json.loads(resp_text)
@@ -240,6 +354,8 @@ def _build_content_blocks(resp_text: str) -> list:
     blocks = []
 
     # Block 1: stdout — PASSED THROUGH UNMODIFIED
+    # (image markdown will be stripped later by _enrich_blocks_with_images
+    #  ONLY if base64 blocks are successfully created)
     stdout = data.get('stdout', '').strip()
     if stdout:
         blocks.append({"type": "text", "text": stdout})
@@ -256,10 +372,7 @@ def _build_content_blocks(resp_text: str) -> list:
         blocks.append({"type": "text", "text": error_text})
 
     # Block 3: REMOVED (v1.8.0)
-    # Previously created text blocks with image URLs.
-    # Now handled by _enrich_blocks_with_images() which returns
-    # native MCP ImageContent blocks with base64 data.
-    # The image URLs are still in stdout (Block 1) as fallback text.
+    # Images handled by _enrich_blocks_with_images()
 
     # Block 4: Additional download blocks (non-image files only)
     download_urls = data.get('download_urls', [])
@@ -333,15 +446,16 @@ async def execute_code(
                 headers=_headers(),
                 json={"code": code, "session_id": session_id, "timeout": timeout}
             )
-            
+
             # Build text content blocks
             blocks = _build_content_blocks(resp.text)
-            
-            # v1.8.0: Enrich with native image blocks (base64)
+
+            # v1.8.1: Enrich with native image blocks (base64)
+            # Uses Path A (JSON arrays) or Path B (stdout regex) 
             blocks = await _enrich_blocks_with_images(blocks, resp.text)
-            
+
             return blocks
-            
+
     except Exception as e:
         logger.error(f"execute_code: error: {e}", exc_info=True)
         return [{"type": "text", "text": f"Error calling execute_code API: {e}"}]
@@ -401,7 +515,7 @@ async def fetch_from_url(
                 return [{
                     "type": "text",
                     "text": (
-                        f"✅ File fetched successfully!\n"
+                        f"File fetched successfully!\n"
                         f"  Filename : {data.get('filename')}\n"
                         f"  Size     : {data.get('size_human')}\n"
                         f"  Path     : {data.get('path')}\n"
@@ -411,10 +525,10 @@ async def fetch_from_url(
                     )
                 }]
             else:
-                return [{"type": "text", "text": f"❌ fetch_from_url failed (HTTP {resp.status_code}):\n  {resp.text[:300]}"}]
+                return [{"type": "text", "text": f"fetch_from_url failed (HTTP {resp.status_code}):\n  {resp.text[:300]}"}]
     except Exception as e:
         logger.error(f"fetch_from_url: error: {e}", exc_info=True)
-        return [{"type": "text", "text": f"❌ fetch_from_url error: {e}"}]
+        return [{"type": "text", "text": f"fetch_from_url error: {e}"}]
 
 
 @mcp.tool()
@@ -576,15 +690,15 @@ async def get_job_result(job_id: str) -> list:
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.get(url, headers=_headers())
-            
+
             # Build text blocks
             blocks = _build_content_blocks(resp.text)
-            
-            # v1.8.0: Enrich with native image blocks (base64)
+
+            # v1.8.1: Enrich with native image blocks (base64)
             blocks = await _enrich_blocks_with_images(blocks, resp.text)
-            
+
             return blocks
-            
+
     except Exception as e:
         logger.error(f"get_job_result: error: {e}", exc_info=True)
         return f"Error calling get_job_result API: {e}"

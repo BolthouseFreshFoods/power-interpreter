@@ -1,6 +1,6 @@
 """Power Interpreter - Data Management Routes
 
-Load large datasets into PostgreSQL and query them.
+Load datasets (CSV, Excel, PDF, JSON, Parquet) into PostgreSQL and query them.
 Handles 1.5M+ rows efficiently via chunked loading and SQL queries.
 """
 
@@ -13,8 +13,20 @@ from app.engine.data_manager import data_manager
 router = APIRouter()
 
 
+class LoadDataRequest(BaseModel):
+    """Request to load a data file into PostgreSQL"""
+    file_path: str = Field(..., description="Path to data file in sandbox")
+    dataset_name: str = Field(..., description="Logical name for the dataset")
+    session_id: Optional[str] = Field(default=None, description="Session ID")
+    delimiter: str = Field(default=",", description="CSV delimiter (CSV only)")
+    encoding: str = Field(default="utf-8", description="File encoding (CSV only)")
+    sheet_name: Optional[str] = Field(default=None, description="Excel sheet name (Excel only, defaults to first sheet)")
+    pdf_pages: Optional[str] = Field(default=None, description="PDF pages to extract, e.g. '1,3,5' or 'all' (PDF only)")
+
+
+# Keep old endpoint for backwards compatibility
 class LoadCSVRequest(BaseModel):
-    """Request to load a CSV into PostgreSQL"""
+    """Legacy request - use LoadDataRequest instead"""
     file_path: str = Field(..., description="Path to CSV file in sandbox")
     dataset_name: str = Field(..., description="Logical name for the dataset")
     session_id: Optional[str] = Field(default=None, description="Session ID")
@@ -30,9 +42,16 @@ class QueryRequest(BaseModel):
     offset: int = Field(default=0, description="Row offset for pagination")
 
 
-@router.post("/data/load-csv")
-async def load_csv(request: LoadCSVRequest):
-    """Load a CSV file into PostgreSQL for fast querying
+@router.post("/data/load")
+async def load_data(request: LoadDataRequest):
+    """Load any supported data file into PostgreSQL for fast querying.
+    
+    Supported formats:
+      - CSV / TSV (.csv, .tsv, .txt)
+      - Excel (.xlsx, .xls, .xlsm, .xlsb)
+      - PDF with tables (.pdf) -- extracts tabular data via pdfplumber
+      - JSON (.json) -- expects array of objects or records format
+      - Parquet (.parquet, .pq)
     
     Handles files with 1.5M+ rows by loading in 50K-row chunks.
     Creates indexes automatically on date and ID columns.
@@ -40,22 +59,51 @@ async def load_csv(request: LoadCSVRequest):
     After loading, query with POST /api/data/query using SQL.
     
     Example:
-        Load: {"file_path": "invoices.csv", "dataset_name": "vestis_invoices"}
+        Load: {"file_path": "invoices.xlsx", "dataset_name": "vestis_invoices"}
         Query: {"sql": "SELECT * FROM data_xxx WHERE amount > 100 LIMIT 10"}
     """
     try:
-        result = await data_manager.load_csv(
+        result = await data_manager.load_data(
             file_path=request.file_path,
             dataset_name=request.dataset_name,
             session_id=request.session_id,
             delimiter=request.delimiter,
-            encoding=request.encoding
+            encoding=request.encoding,
+            sheet_name=request.sheet_name,
+            pdf_pages=request.pdf_pages,
         )
         return result
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"File not found: {request.file_path}")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to load CSV: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to load data: {str(e)}")
+
+
+@router.post("/data/load-csv")
+async def load_csv(request: LoadCSVRequest):
+    """Legacy endpoint -- redirects to load_data with format auto-detection.
+    
+    Use /data/load instead for new integrations.
+    This endpoint is kept for backwards compatibility and now supports
+    all file formats (CSV, Excel, PDF, JSON, Parquet) via auto-detection.
+    """
+    try:
+        result = await data_manager.load_data(
+            file_path=request.file_path,
+            dataset_name=request.dataset_name,
+            session_id=request.session_id,
+            delimiter=request.delimiter,
+            encoding=request.encoding,
+        )
+        return result
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"File not found: {request.file_path}")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to load data: {str(e)}")
 
 
 @router.post("/data/query")

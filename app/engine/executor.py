@@ -12,6 +12,7 @@ Executes Python code in a controlled environment with:
 - DEFENSIVE PATH NORMALIZATION (v2.8) - strip doubled session_id prefix
 - /tmp/ PATH INTERCEPTION (v2.8.1) - redirect /tmp/ paths to sandbox
 - READ-ONLY UPLOAD ACCESS (v2.8.2) - sandbox can read uploaded files
+- SANDBOX PATH RECOGNITION (v2.8.3) - /app/sandbox_data in allowed paths
 
 CRITICAL BUG FIX (v2.6):
   'import matplotlib.pyplot as plt' was broken because:
@@ -65,7 +66,13 @@ v2.8.2 - Read-only upload access
   4. _normalize_path_for_sandbox() no longer strips upload paths
   5. Pandas read hooks pass through upload paths unchanged
 
-Version: 2.8.2
+v2.8.3 - Sandbox path recognition
+  Added /app/sandbox_data to ALLOWED_READ_PATHS and LEGITIMATE_READ_PREFIXES.
+  If AI generates an absolute path like /app/sandbox_data/default/file.xlsx,
+  the normalizer and safe_open now explicitly recognize it as legitimate
+  rather than relying on fall-through behavior. Defensive improvement.
+
+Version: 2.8.3
 """
 
 import asyncio
@@ -129,8 +136,9 @@ REDIRECT_PATH_PREFIXES = (
 )
 
 # ============================================================
-# v2.8.2: Directories the sandbox can READ from (but not write to)
-# These are paths where uploaded files land outside the sandbox.
+# v2.8.2 + v2.8.3: Directories the sandbox can READ from (but not write to)
+# These are paths where uploaded files land outside the sandbox,
+# plus the sandbox root itself for absolute path resolution.
 # ============================================================
 ALLOWED_READ_PATHS = [
     '/home/ubuntu/uploads',
@@ -138,14 +146,16 @@ ALLOWED_READ_PATHS = [
     '/home/ubuntu/uploads/tmp/permanent_files',
     '/app/uploads',
     '/uploads',
+    '/app/sandbox_data',
 ]
 
-# v2.8.2: Absolute path prefixes that are LEGITIMATE read-only sources
+# v2.8.2 + v2.8.3: Absolute path prefixes that are LEGITIMATE read-only sources
 # These should NOT be redirected to sandbox by _normalize_path_for_sandbox
 LEGITIMATE_READ_PREFIXES = (
     '/home/ubuntu/uploads/',
     '/app/uploads/',
     '/uploads/',
+    '/app/sandbox_data/',
 )
 
 
@@ -317,6 +327,7 @@ def _is_allowed_read_path(filepath: str) -> bool:
     """Check if a filepath is within an allowed read-only directory.
     
     v2.8.2: Uploaded files land in directories outside the sandbox.
+    v2.8.3: Also recognizes /app/sandbox_data for absolute path access.
     This function checks if the path is in one of those directories
     so safe_open() can permit read-only access.
     """
@@ -342,6 +353,8 @@ def _is_legitimate_read_path(filepath: str) -> bool:
     v2.8.2: These paths should NOT be redirected to sandbox by
     _normalize_path_for_sandbox(). They are real paths where
     uploaded files exist.
+    v2.8.3: Also includes /app/sandbox_data/ so absolute sandbox
+    paths are passed through unchanged.
     """
     for prefix in LEGITIMATE_READ_PREFIXES:
         if filepath.startswith(prefix):
@@ -568,6 +581,8 @@ class SandboxExecutor:
         Upload paths like /home/ubuntu/uploads/tmp/permanent_files/file.xlsx
         are legitimate and should be passed through unchanged.
         
+        v2.8.3: Also passes through /app/sandbox_data/ paths unchanged.
+        
         Returns the normalized path string (always relative, unless it's
         a legitimate read-only path).
         """
@@ -577,8 +592,9 @@ class SandboxExecutor:
         path_str = str(filepath)
         
         # ============================================================
-        # v2.8.2: PASS THROUGH legitimate read-only paths
-        # Upload directories are real paths, not AI hallucinations
+        # v2.8.2 + v2.8.3: PASS THROUGH legitimate read-only paths
+        # Upload directories and sandbox absolute paths are real paths,
+        # not AI hallucinations
         # ============================================================
         if _is_legitimate_read_path(path_str):
             logger.debug(f"Path is legitimate read-only source, passing through: {path_str}")
@@ -587,7 +603,7 @@ class SandboxExecutor:
         # ============================================================
         # v2.8.1: ABSOLUTE PATH INTERCEPTION
         # Redirect /tmp/, /var/tmp/, /temp/ to sandbox
-        # (but NOT /home/ubuntu/uploads/ — handled above)
+        # (but NOT /home/ubuntu/uploads/ or /app/sandbox_data/ — handled above)
         # ============================================================
         if os.path.isabs(path_str):
             for prefix in REDIRECT_PATH_PREFIXES:
@@ -643,6 +659,7 @@ class SandboxExecutor:
                 to the sandbox directory.
         v2.8.2: Allows READ-ONLY access to ALLOWED_READ_PATHS (upload dirs).
                 Write operations still restricted to session_dir only.
+        v2.8.3: /app/sandbox_data now in allowed paths for absolute resolution.
         """
         normalize = self._normalize_path_for_sandbox
         _session_dir = session_dir
@@ -653,6 +670,7 @@ class SandboxExecutor:
             # ============================================================
             # v2.8.1: NORMALIZE PATH (handles /tmp/, session prefix, etc.)
             # v2.8.2: Passes through legitimate upload paths unchanged
+            # v2.8.3: Passes through /app/sandbox_data/ paths unchanged
             # ============================================================
             normalized = normalize(path_str, _session_dir)
             if normalized != path_str:
@@ -669,7 +687,7 @@ class SandboxExecutor:
                 session_resolved = _session_dir.resolve()
                 
                 # ============================================================
-                # v2.8.2: CHECK ALLOWED READ PATHS
+                # v2.8.2 + v2.8.3: CHECK ALLOWED READ PATHS
                 # If the path is in an allowed read directory AND mode is
                 # read-only, permit access. Write operations are ALWAYS
                 # restricted to session_dir.
@@ -720,7 +738,7 @@ class SandboxExecutor:
         
         def _normalize_path(filepath):
             """Normalize file path - strips /tmp/ prefix, doubled session prefix, etc.
-            Passes through legitimate upload paths unchanged."""
+            Passes through legitimate upload paths and sandbox paths unchanged."""
             return executor_self._normalize_path_for_sandbox(str(filepath), _session_dir)
         
         return _normalize_path
@@ -731,6 +749,7 @@ class SandboxExecutor:
         v2.8.0: Catches 'default/file.csv' session prefix doubling.
         v2.8.1: Also catches /tmp/file.csv, /home/user/file.csv, etc.
         v2.8.2: Passes through legitimate upload paths unchanged.
+        v2.8.3: Passes through /app/sandbox_data/ paths unchanged.
         
         Wraps: read_csv, read_excel, ExcelFile, read_json, read_parquet,
                DataFrame.to_csv, DataFrame.to_excel, DataFrame.to_json,
@@ -1414,6 +1433,7 @@ class SandboxExecutor:
         v2.8.0: Path normalization hooks installed on every execution.
         v2.8.1: /tmp/ and other absolute paths redirected to sandbox.
         v2.8.2: Upload paths permitted for read-only access.
+        v2.8.3: /app/sandbox_data recognized as legitimate path.
         """
         result = ExecutionResult()
         timeout = timeout or settings.MAX_EXECUTION_TIME
@@ -1451,14 +1471,14 @@ class SandboxExecutor:
             sandbox_globals.update(context)
 
         # ============================================================
-        # v2.8.0 + v2.8.1 + v2.8.2: Install path normalization hooks
+        # v2.8.0 + v2.8.1 + v2.8.2 + v2.8.3: Install path normalization hooks
         # These must be installed on EVERY execution (not just first)
         # because they need the current session_dir context.
         # ============================================================
         sandbox_globals['_normalize_path'] = self._make_path_normalizer(session_dir)
         self._install_pandas_path_hooks(sandbox_globals, session_dir)
 
-        # Preprocess code
+        # Preprocess code (handles imports via _lazy_import allowlist)
         try:
             processed_code = self._preprocess_code(code, sandbox_globals)
         except Exception as e:
@@ -1471,6 +1491,9 @@ class SandboxExecutor:
         logger.info(f"Processed code preview: {processed_code[:300]}")
 
         # CHART CAPTURE setup
+        # NOTE: This is intentionally AFTER _preprocess_code because preprocessing
+        # may lazy-load matplotlib into sandbox_globals. The check below will
+        # correctly detect plt/matplotlib that was just loaded by preprocessing.
         chart_capture = ChartCapture(session_dir)
         if 'plt' in sandbox_globals or 'matplotlib' in sandbox_globals:
             self._install_chart_hooks(sandbox_globals, chart_capture)

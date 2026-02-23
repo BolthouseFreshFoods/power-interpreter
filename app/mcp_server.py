@@ -12,12 +12,12 @@ MCP Tools (12):
 - fetch_file: Download a file from URL to sandbox
 - fetch_from_url: ★ Load file from CDN/URL directly into sandbox
 - list_files: List sandbox files
-- load_dataset: Load CSV into PostgreSQL
+- load_dataset: Load data file into PostgreSQL (CSV, Excel, PDF, JSON, Parquet)
 - query_dataset: SQL query against datasets
 - list_datasets: List loaded datasets
 - create_session: Create workspace session
 
-Version: 1.8.1 - fix: base64 image enrichment now works via stdout regex fallback
+Version: 1.8.2 - fix: load_dataset now documents universal format support
 
 HISTORY:
   v1.2.0: Response was a JSON blob. URLs lived in stdout. AI parsed them. WORKED.
@@ -50,6 +50,12 @@ HISTORY:
            Evidence from v1.8.0 smoke test logs:
              - "Built 2 content blocks" = only text, no images (inline_images was empty)
              - "GET /charts/chart-test-v180/chart_001.png 404" = SimTheory rewrote URL
+  v1.8.2: Universal data loading. load_dataset tool description updated to
+           reflect that the backend now auto-detects file format from extension:
+           CSV, Excel (.xlsx/.xls), PDF (table extraction), JSON, Parquet.
+           No more "Load a CSV file" — it loads ANY supported format.
+           Backend: data_manager.py uses detect_format() + format-specific readers.
+           The /api/data/load-csv endpoint is preserved as backwards-compatible alias.
 """
 
 from mcp.server.fastmcp import FastMCP
@@ -451,7 +457,7 @@ async def execute_code(
             blocks = _build_content_blocks(resp.text)
 
             # v1.8.1: Enrich with native image blocks (base64)
-            # Uses Path A (JSON arrays) or Path B (stdout regex) 
+            # Uses Path A (JSON arrays) or Path B (stdout regex)
             blocks = await _enrich_blocks_with_images(blocks, resp.text)
 
             return blocks
@@ -715,13 +721,29 @@ async def load_dataset(
     session_id: str = "default",
     delimiter: str = ","
 ) -> str:
-    """Load a CSV file from the sandbox into PostgreSQL for fast SQL querying.
+    """Load a data file from the sandbox into PostgreSQL for fast SQL querying.
+
+    Supports multiple file formats — auto-detected from file extension:
+      - CSV / TSV (.csv, .tsv, .txt)
+      - Excel (.xlsx, .xls, .xlsm, .xlsb)
+      - PDF with tables (.pdf) — extracts tabular data automatically
+      - JSON (.json) — array of objects or records format
+      - Parquet (.parquet, .pq)
+
+    Handles large files (1.5M+ rows) via chunked loading into PostgreSQL.
+    Creates indexes automatically on date and ID columns.
+
+    WORKFLOW:
+      1. fetch_from_url(url, filename="invoices.xlsx")
+      2. load_dataset(file_path="invoices.xlsx", dataset_name="invoices")
+      3. query_dataset(sql="SELECT * FROM data_xxx WHERE amount > 1000")
 
     Args:
-        file_path: Filename in sandbox (e.g., 'data.csv' — NOT a URL or local path)
-        dataset_name: Table name for SQL queries (e.g., 'sales', 'invoices')
+        file_path: Filename in sandbox (e.g., 'data.xlsx' — NOT a URL or local path).
+                   Format is auto-detected from the file extension.
+        dataset_name: Logical name for SQL queries (e.g., 'sales', 'invoices')
         session_id: Session for file isolation (default: 'default')
-        delimiter: CSV delimiter (default comma)
+        delimiter: CSV delimiter (default comma, only used for CSV files)
     """
     url = f"{API_BASE}/api/data/load-csv"
     logger.info(f"load_dataset: POST {url}")

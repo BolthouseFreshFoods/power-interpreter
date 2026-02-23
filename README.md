@@ -1,320 +1,175 @@
-# Power Interpreter
+# Power Interpreter MCP
 
-A production-grade Python execution sandbox exposed as an MCP (Model Context Protocol) server. Designed to exceed the capabilities of standard Code Interpreter environments — with multi-session support, direct CDN file loading, async job execution, SQL querying, and a full enterprise analytics library stack.
+**General-purpose sandboxed Python execution engine with MCP integration.**
 
-Deployed on [Railway](https://railway.app) and integrated with SimTheory AI agents via MCP/SSE.
+Built for [SimTheory.ai](https://simtheory.ai) — execute Python code, load datasets, generate charts, and run long-running analysis jobs, all through the Model Context Protocol (MCP).
 
 ---
 
-## What Makes This Different from Code Interpreter
+## Version
 
-| Capability | Code Interpreter | Power Interpreter |
-|---|---|---|
-| pandas / numpy / matplotlib | ✅ | ✅ |
-| scikit-learn / xgboost / lightgbm | ✅ | ✅ |
-| statsmodels / pingouin | ✅ | ✅ |
-| plotly / seaborn / kaleido | ✅ | ✅ |
-| sympy (symbolic math) | ✅ | ✅ |
-| DuckDB (in-process SQL) | ❌ | ✅ |
-| Parquet / Arrow columnar data | ❌ | ✅ |
-| PDF reading (pdfplumber) | ❌ | ✅ |
-| Multi-session (concurrent) | ❌ One per conversation | ✅ Up to 6 named sessions |
-| Execution timeout | ~120s | 120s default, up to 300s |
-| File upload via CDN URL | ❌ | ✅ `fetch_from_url` |
-| Async long-running jobs | ❌ | ✅ `submit_job` / `get_job_result` |
-| Cross-session file isolation | ❌ | ✅ Per `session_id` sandbox |
-| Internet access | ✅ | ❌ Sandboxed (by design) |
+**v1.8.2** — Universal data loading + updated MCP tool descriptions
 
 ---
 
 ## Architecture
 
 ```
-SimTheory Agent
-      │
-      │  MCP/SSE (HTTPS)
-      ▼
-┌─────────────────────────────────┐
-│         main.py (FastAPI)       │
-│   /mcp/sse  ←── MCP endpoint   │
-│   /health   ←── Railway probe  │
-└────────────┬────────────────────┘
-             │
-             ▼
-┌─────────────────────────────────┐
-│       mcp_server.py (FastMCP)   │
-│  12 registered MCP tools        │
-│  fetch_from_url ← NEW           │
-│  execute_code                   │
-│  submit_job / get_job_result    │
-│  load_dataset / query_dataset   │
-│  upload_file / fetch_file       │
-│  list_files / list_datasets     │
-│  create_session                 │
-└────────────┬────────────────────┘
-             │
-             ▼
-┌─────────────────────────────────┐
-│     executor.py (Kernel Mgr)    │
-│  Up to 6 concurrent kernels     │
-│  Session persistence            │
-│  Chart capture (PNG)            │
-│  120s timeout (300s max)        │
-└────────────┬────────────────────┘
-             │
-             ▼
-┌─────────────────────────────────┐
-│   /app/sandbox_data/{session}/  │
-│   Isolated per session_id       │
-│   Files persist within session  │
-└─────────────────────────────────┘
+SimTheory.ai (MCP Client)
+    │
+    ▼  JSON-RPC over HTTP POST
+┌─────────────────────────────────────────┐
+│  Power Interpreter (Railway)            │
+│                                         │
+│  ┌─────────────┐  ┌──────────────────┐  │
+│  │ MCP Server  │  │ FastAPI Routes   │  │
+│  │ (12 tools)  │──│ /api/execute     │  │
+│  │             │  │ /api/data/load   │  │
+│  │             │  │ /api/files/*     │  │
+│  │             │  │ /api/jobs/*      │  │
+│  └─────────────┘  └──────────────────┘  │
+│         │                  │            │
+│         ▼                  ▼            │
+│  ┌─────────────┐  ┌──────────────────┐  │
+│  │ Python      │  │ PostgreSQL       │  │
+│  │ Kernel      │  │ (datasets,       │  │
+│  │ (persistent │  │  files, jobs,    │  │
+│  │  sessions)  │  │  metadata)       │  │
+│  └─────────────┘  └──────────────────┘  │
+└─────────────────────────────────────────┘
 ```
 
 ---
 
-## MCP Tools Reference (12 Tools)
+## MCP Tools (12)
 
-### 🔴 Priority Tools — Start Here
+### Code Execution
+| Tool | Description |
+|------|-------------|
+| `execute_code` | Run Python code in a persistent sandbox kernel (sync, <60s) |
+| `submit_job` | Submit long-running code for async execution (up to 30 min) |
+| `get_job_status` | Check async job progress |
+| `get_job_result` | Retrieve completed job output |
 
-#### `fetch_from_url` ⭐ NEW
-Load any file directly from a CDN URL (Cloudinary, S3, HTTPS) into the sandbox. This is the **primary way to load files** — no base64 encoding required.
+### File Management
+| Tool | Description |
+|------|-------------|
+| `fetch_from_url` | ★ Download file from any HTTPS URL into sandbox (CDN, S3, etc.) |
+| `upload_file` | Upload a file via base64 encoding (<10MB) |
+| `fetch_file` | Download file from URL (legacy, use `fetch_from_url`) |
+| `list_files` | List files in the sandbox |
 
-```json
-{
-  "tool": "fetch_from_url",
-  "args": {
-    "url": "https://cdn.simtheory.ai/raw/upload/v.../myfile.xlsx",
-    "filename": "myfile.xlsx",
-    "session_id": "default"
-  }
-}
-```
+### Data & Datasets
+| Tool | Description |
+|------|-------------|
+| `load_dataset` | Load data file into PostgreSQL — **auto-detects format** (see below) |
+| `query_dataset` | Execute SQL SELECT queries against loaded datasets |
+| `list_datasets` | List all datasets in PostgreSQL |
 
-Returns the exact sandbox path to use in `execute_code`. Supports: `xlsx, xls, csv, tsv, json, jsonl, parquet, pdf, txt, png, jpg, zip, db, sqlite`. Max file size: 500MB.
-
----
-
-#### `execute_code`
-Run Python in a sandboxed, persistent kernel session.
-
-```json
-{
-  "tool": "execute_code",
-  "args": {
-    "code": "import pandas as pd\ndf = pd.read_excel('/app/sandbox_data/default/myfile.xlsx')\nprint(df.describe())",
-    "session_id": "default",
-    "timeout": 120
-  }
-}
-```
-
-- Variables persist across calls within the same `session_id`
-- Charts (matplotlib, seaborn, plotly) are captured and returned as PNG image blocks
-- Files written to `/app/sandbox_data/{session_id}/` are accessible to other tools
-- Default timeout: 120s. Maximum: 300s.
+### Sessions
+| Tool | Description |
+|------|-------------|
+| `create_session` | Create isolated workspace session |
 
 ---
 
-#### `submit_job` + `get_job_status` + `get_job_result`
-For long-running tasks (large dataset processing, ML training, complex cross-references). Submit asynchronously and poll for results.
+## Supported Data Formats
 
-```json
-// Submit
-{ "tool": "submit_job", "args": { "code": "...", "session_id": "analysis", "timeout": 240 } }
-// → Returns: { "job_id": "a3f9c1b2" }
+The `load_dataset` tool (and the `/api/data/load` endpoint) **auto-detects file format** from the file extension:
 
-// Poll
-{ "tool": "get_job_status", "args": { "job_id": "a3f9c1b2" } }
-// → Returns: { "status": "running", "elapsed": "14.2s" }
+| Format | Extensions | Reader | Notes |
+|--------|-----------|--------|-------|
+| **CSV** | `.csv`, `.tsv`, `.txt` | `pd.read_csv()` | Chunked loading for large files |
+| **Excel** | `.xlsx`, `.xls`, `.xlsm`, `.xlsb` | `pd.read_excel()` | Full read, then chunked insert |
+| **PDF** | `.pdf` | `pdfplumber` | Extracts tabular data from PDF pages |
+| **JSON** | `.json` | `pd.read_json()` + `json_normalize` | Array of objects or nested JSON |
+| **Parquet** | `.parquet`, `.pq` | `pd.read_parquet()` | Columnar format, very fast |
 
-// Retrieve
-{ "tool": "get_job_result", "args": { "job_id": "a3f9c1b2" } }
-// → Returns: full output + charts
+All formats are loaded into PostgreSQL in 50K-row chunks with automatic indexing on date and ID columns. Handles **1.5M+ rows** efficiently.
+
+### Typical Workflow
+
+```
+1. fetch_from_url(url="https://cdn.example.com/invoices.xlsx", filename="invoices.xlsx")
+2. load_dataset(file_path="invoices.xlsx", dataset_name="invoices")
+3. query_dataset(sql="SELECT vendor, SUM(amount) FROM data_xxx GROUP BY vendor")
 ```
 
 ---
 
-### 📁 File Management
+## API Endpoints
 
-#### `upload_file`
-Upload a file via base64-encoded content. For large files, prefer `fetch_from_url`.
+### Public (no auth)
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/health` | Health check |
+| `GET` | `/dl/{file_id}/{filename}` | Download generated files |
+| `GET` | `/charts/{session_id}/{filename}` | Serve chart images |
 
-```json
-{
-  "tool": "upload_file",
-  "args": {
-    "filename": "data.csv",
-    "content_base64": "<base64 string>",
-    "session_id": "default"
-  }
-}
-```
+### Protected (API key required)
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/api/execute` | Execute Python code |
+| `POST` | `/api/data/load` | Load data file (universal format) |
+| `POST` | `/api/data/load-csv` | Legacy alias (now auto-detects all formats) |
+| `POST` | `/api/data/query` | SQL query against datasets |
+| `GET` | `/api/data/datasets` | List datasets |
+| `GET` | `/api/data/datasets/{name}` | Dataset info |
+| `DELETE` | `/api/data/datasets/{name}` | Drop dataset |
+| `POST` | `/api/files/upload` | Upload file (base64) |
+| `POST` | `/api/files/fetch` | Fetch file from URL |
+| `GET` | `/api/files` | List sandbox files |
+| `POST` | `/api/jobs/submit` | Submit async job |
+| `GET` | `/api/jobs/{id}/status` | Job status |
+| `GET` | `/api/jobs/{id}/result` | Job result |
+| `POST` | `/api/sessions` | Create session |
 
-#### `fetch_file`
-Retrieve a file generated by `execute_code` from the sandbox (returned as base64).
-
-```json
-{ "tool": "fetch_file", "args": { "filename": "results.xlsx", "session_id": "default" } }
-```
-
-#### `list_files`
-List all files in a sandbox session.
-
-```json
-{ "tool": "list_files", "args": { "session_id": "default" } }
-```
-
----
-
-### 📊 Dataset Tools
-
-#### `load_dataset`
-Load a sandbox file into a named pandas DataFrame. Supports xlsx, csv, parquet, json.
-
-```json
-{
-  "tool": "load_dataset",
-  "args": {
-    "filename": "invoices.xlsx",
-    "dataset_name": "invoices",
-    "session_id": "default",
-    "sheet_name": "Sheet1"
-  }
-}
-```
-
-#### `query_dataset`
-Run SQL against any loaded DataFrame using DuckDB — no database setup required.
-
-```json
-{
-  "tool": "query_dataset",
-  "args": {
-    "query": "SELECT vendor, SUM(amount) as total FROM invoices GROUP BY vendor ORDER BY total DESC",
-    "session_id": "default"
-  }
-}
-```
-
-#### `list_datasets`
-List all DataFrames currently loaded in a session (name, shape, columns).
-
----
-
-### ⚙️ Session Management
-
-#### `create_session`
-Create a named session with its own isolated sandbox directory and kernel.
-
-```json
-{ "tool": "create_session", "args": { "session_id": "vestis_analysis" } }
-```
-
-Up to 6 concurrent sessions supported. Each session has:
-- Its own kernel with persistent variable state
-- Its own `/app/sandbox_data/{session_id}/` file directory
-- Independent execution context
-
----
-
-## Recommended Workflow
-
-### Loading and Analyzing a File from CDN
-
-```
-1. fetch_from_url(url="https://cdn.simtheory.ai/.../data.xlsx", session_id="analysis")
-   → ✅ File saved to /app/sandbox_data/analysis/data.xlsx (212,789 bytes)
-
-2. execute_code(code="""
-   import pandas as pd
-   df = pd.read_excel('/app/sandbox_data/analysis/data.xlsx')
-   print(df.shape)
-   print(df.dtypes)
-   print(df.describe())
-   """, session_id="analysis")
-
-3. query_dataset(query="SELECT vendor, COUNT(*) as n, SUM(amount) as total FROM df GROUP BY vendor", session_id="analysis")
-
-4. execute_code(code="""
-   import matplotlib.pyplot as plt
-   df.groupby('vendor')['amount'].sum().plot(kind='bar')
-   plt.title('Revenue by Vendor')
-   plt.tight_layout()
-   plt.savefig('/app/sandbox_data/analysis/chart.png')
-   """, session_id="analysis")
-
-5. fetch_file(filename="chart.png", session_id="analysis")
-```
-
----
-
-## Analytics Library Stack
-
-### Core Data Science
-- `pandas` — DataFrames, time series, data wrangling
-- `numpy` — Numerical computing
-- `scipy` — Scientific computing, statistical tests
-
-### Machine Learning
-- `scikit-learn` — Classification, regression, clustering, preprocessing
-- `xgboost` — Gradient boosting
-- `lightgbm` — Fast gradient boosting for large datasets
-
-### Visualization
-- `matplotlib` — Publication-quality charts
-- `seaborn` — Statistical visualization
-- `plotly` + `kaleido` — Interactive charts, static export
-
-### Statistics & Econometrics
-- `statsmodels` — OLS, time series (ARIMA), hypothesis testing
-- `pingouin` — Statistical tests (t-test, ANOVA, correlation)
-
-### Symbolic Math
-- `sympy` — Symbolic algebra, calculus, equation solving
-
-### Data Formats
-- `openpyxl` / `xlsxwriter` / `xlrd` — Excel read/write
-- `pyarrow` / `fastparquet` — Parquet / columnar data
-- `duckdb` — In-process SQL on DataFrames
-- `pdfplumber` / `PyPDF2` — PDF text extraction
-- `python-docx` — Word document generation
-- `beautifulsoup4` / `lxml` — HTML/XML parsing
-
-### Image Processing
-- `Pillow` — Image manipulation, format conversion
-
-### Utilities
-- `rich` — Beautiful terminal output
-- `tabulate` — Table formatting
-- `tqdm` — Progress bars
-- `tenacity` — Retry logic
+### MCP Transport
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/mcp/sse` | Direct JSON-RPC handler (SimTheory) |
+| `GET` | `/mcp/sse` | SSE transport (standard MCP clients) |
 
 ---
 
 ## Deployment
 
+Deployed on **Railway** with:
+- Python 3.11+
+- PostgreSQL (datasets, files, jobs, metadata)
+- Uvicorn ASGI server on port 8080
+
 ### Environment Variables
+| Variable | Description |
+|----------|-------------|
+| `DATABASE_URL` | PostgreSQL connection string |
+| `API_KEY` | API key for protected endpoints |
+| `RAILWAY_PUBLIC_DOMAIN` | Auto-set by Railway for public URLs |
 
-| Variable | Default | Description |
-|---|---|---|
-| `PORT` | `8000` | HTTP port (set by Railway) |
-| `EXECUTOR_URL` | `http://127.0.0.1:8080` | Internal executor endpoint |
-| `SANDBOX_DATA_DIR` | `/app/sandbox_data` | Root sandbox directory |
-| `MAX_UPLOAD_MB` | `500` | Max file upload size |
-| `MAX_FETCH_SIZE_MB` | `500` | Max fetch_from_url file size |
-| `LOG_LEVEL` | `INFO` | Logging verbosity |
+### Configuration
+| Setting | Default |
+|---------|---------|
+| Max execution time | 300s |
+| Max memory | 4096 MB |
+| Max concurrent jobs | 4 |
+| Job timeout | 1800s (30 min) |
+| Sandbox file max size | 50 MB |
+| Sandbox file TTL | 72 hours |
+| Dataset chunk size | 50,000 rows |
 
-### Railway Deployment
+---
 
-Pushes to `main` trigger automatic Railway deployments. Health check is configured in `railway.toml` at `/health`.
+## Pre-installed Libraries
 
-```toml
-# railway.toml
-[deploy]
-healthcheckPath = "/health"
-healthcheckTimeout = 30
-restartPolicyType = "on_failure"
-```
+The sandbox kernel includes:
+- **Data**: pandas, numpy, openpyxl, xlsxwriter
+- **Visualization**: matplotlib, seaborn, plotly
+- **Statistics**: scipy, statsmodels, scikit-learn
+- **Math**: sympy
+- **PDF**: pdfplumber
+- **Web**: requests, beautifulsoup4, httpx
+- **Images**: Pillow (PIL)
+- **Standard**: json, csv, re, datetime, collections, math, statistics
 
 ---
 
@@ -323,52 +178,52 @@ restartPolicyType = "on_failure"
 ```
 power-interpreter/
 ├── app/
-│   ├── __init__.py
-│   ├── main.py              # FastAPI app, /mcp/sse endpoint, /health
-│   ├── mcp_server.py        # FastMCP — all 12 MCP tools registered here
-│   ├── fetch_from_url.py    # ★ NEW — CDN/URL file fetcher
-│   ├── models.py            # Pydantic request/response models
-│   ├── storage.py           # Sandbox file management
-│   └── engine/
-│       ├── executor.py      # Python kernel execution, chart capture
-│       └── kernel_manager.py # Session lifecycle, up to 6 kernels
+│   ├── main.py              # FastAPI app, lifespan, MCP JSON-RPC handler
+│   ├── mcp_server.py         # MCP tool definitions (12 tools)
+│   ├── config.py              # Settings and environment config
+│   ├── auth.py                # API key authentication
+│   ├── database.py            # PostgreSQL connection management
+│   ├── models.py              # SQLAlchemy models (Dataset, SandboxFile, etc.)
+│   ├── engine/
+│   │   ├── data_manager.py    # ★ Universal data loading (CSV/Excel/PDF/JSON/Parquet)
+│   │   ├── executor.py        # Python code execution engine
+│   │   ├── file_manager.py    # Sandbox file management
+│   │   ├── job_manager.py     # Async job queue
+│   │   └── kernel_manager.py  # Persistent Python kernel sessions
+│   └── routes/
+│       ├── data.py            # /api/data/* endpoints
+│       ├── execute.py         # /api/execute endpoint
+│       ├── files.py           # /api/files/* + /dl/* endpoints
+│       ├── health.py          # /health endpoint
+│       ├── jobs.py            # /api/jobs/* endpoints
+│       └── sessions.py        # /api/sessions endpoint
 ├── Dockerfile
-├── railway.toml
-├── requirements.txt         # Full analytics library suite
-├── start.py                 # Startup script (reads PORT env var)
+├── requirements.txt
 └── README.md
 ```
 
 ---
 
-## Recent Changes
+## Version History
 
-### v2.0 — Priority 1 & 2 (Feb 2026)
-
-**Priority 1 — Full Analytics Library Suite**
-- Added `scikit-learn`, `xgboost`, `lightgbm` for ML
-- Added `plotly` + `kaleido` for interactive/static charts
-- Added `statsmodels`, `pingouin` for advanced statistics
-- Added `sympy` for symbolic math
-- Added `Pillow` for image processing
-- Added `pdfplumber`, `PyPDF2`, `python-docx` for document handling
-- Added `duckdb`, `sqlalchemy` for in-process SQL
-- Added `pyarrow`, `fastparquet` for columnar data formats
-- Added `beautifulsoup4`, `lxml` for HTML/XML parsing
-- Added `rich`, `tabulate`, `tqdm`, `tenacity` for utilities
-
-**Priority 2 — File Loading via CDN URL**
-- Added `fetch_from_url` tool — streams files directly from any HTTPS URL into sandbox
-- Eliminates base64 upload bottleneck for large files
-- Supports 500MB max file size with 64KB streaming chunks
-- Sanitizes filenames, validates extensions, guards against path traversal
-- Execution timeout increased from 30s → 120s default (300s max)
-- `mcp_server.py` fully rewritten with clean tool registration and docstrings
-- `load_dataset` now supports xlsx, csv, parquet, json natively
-- `query_dataset` uses DuckDB for SQL on any loaded DataFrame
+| Version | Date | Changes |
+|---------|------|---------|
+| **v1.8.2** | 2026-02-23 | `load_dataset` tool description updated for universal format support |
+| **v1.8.1** | 2026-02-23 | Chart base64 enrichment fix (stdout regex fallback) |
+| **v1.8.0** | 2026-02-22 | Base64 ImageContent blocks for charts |
+| **v1.7.2** | 2026-02-22 | `fetch_from_url` route fix (404 → correct path) |
+| **v1.7.1** | 2026-02-22 | FastMCP constructor fix (removed unsupported kwarg) |
+| **v1.7.0** | 2026-02-21 | `fetch_from_url` tool added (CDN/S3/URL direct download) |
+| **v1.6.0** | 2026-02-20 | Auto file handling — tool descriptions rewritten for reliable chaining |
+| **v1.5.2** | 2026-02-19 | Stop stripping stdout — pass URLs through as-is |
+| **v1.5.1** | 2026-02-19 | Plain text URL format (still broken due to stdout stripping) |
+| **v1.5.0** | 2026-02-18 | Content blocks introduced (broke URL passing) |
+| **v1.2.0** | 2026-02-15 | Initial working version — JSON response with URLs in stdout |
 
 ---
 
-## License
+## Author
 
-MIT
+Built by **Kaffer AI** for **Timothy Escamilla**, CEO at New Carrot Farms LLC.
+
+Part of the AI infrastructure stack for business analytics, M&A due diligence, and operational intelligence.

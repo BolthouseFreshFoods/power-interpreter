@@ -13,7 +13,7 @@ Features:
 - Auto file storage in Postgres with public download URLs
 
 Author: Kaffer AI for Timothy Escamilla
-Version: 1.2.1
+Version: 1.7.2
 """
 
 import logging
@@ -46,12 +46,12 @@ async def lifespan(app: FastAPI):
     """Application lifecycle management"""
     # --- STARTUP ---
     logger.info("="*60)
-    logger.info("Power Interpreter MCP v1.2.1 starting...")
+    logger.info("Power Interpreter MCP v1.7.2 starting...")
     logger.info("="*60)
-    
+
     # Ensure directories exist
     settings.ensure_directories()
-    
+
     # Initialize database (graceful - don't crash if DB not ready)
     db_ok = False
     if settings.DATABASE_URL:
@@ -66,15 +66,15 @@ async def lifespan(app: FastAPI):
     else:
         logger.warning("No DATABASE_URL configured. Running without database.")
         logger.warning("Set DATABASE_URL to enable: jobs, sessions, datasets, file tracking")
-    
+
     # Start periodic cleanup (jobs + expired sandbox files)
     cleanup_task = None
     if db_ok:
         cleanup_task = asyncio.create_task(_periodic_cleanup())
-    
+
     # Log public URL for download links
     public_url = settings.public_base_url
-    
+
     logger.info("Power Interpreter ready!")
     logger.info(f"  Database: {'connected' if db_ok else 'NOT CONNECTED'}")
     logger.info(f"  Sandbox dir: {settings.SANDBOX_DIR}")
@@ -88,9 +88,9 @@ async def lifespan(app: FastAPI):
     logger.info(f"  Job timeout: {settings.JOB_TIMEOUT}s")
     logger.info(f"  MCP SSE transport: GET /mcp/sse (standard clients)")
     logger.info(f"  MCP JSON-RPC direct: POST /mcp/sse (SimTheory)")
-    
+
     yield
-    
+
     # --- SHUTDOWN ---
     logger.info("Power Interpreter shutting down...")
     if cleanup_task:
@@ -109,19 +109,19 @@ async def _periodic_cleanup():
     while True:
         try:
             await asyncio.sleep(3600)  # Every hour
-            
+
             # Clean up old jobs
             from app.engine.job_manager import job_manager
             count = await job_manager.cleanup_old_jobs()
             if count:
                 logger.info(f"Periodic cleanup: removed {count} old jobs")
-            
+
             # Clean up expired sandbox files
             try:
                 await _cleanup_expired_sandbox_files()
             except Exception as e:
                 logger.error(f"Sandbox file cleanup error: {e}")
-                
+
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -134,7 +134,7 @@ async def _cleanup_expired_sandbox_files():
         from app.database import get_session_factory
         from app.models import SandboxFile
         from sqlalchemy import delete
-        
+
         factory = get_session_factory()
         async with factory() as session:
             result = await session.execute(
@@ -160,7 +160,7 @@ app = FastAPI(
         "and run long-running analysis jobs without timeouts. "
         "Generated files get persistent download URLs via /dl/{file_id}."
     ),
-    version="1.2.1",
+    version="1.7.2",
     lifespan=lifespan,
     docs_url="/docs",
     redoc_url="/redoc",
@@ -365,7 +365,7 @@ async def _handle_single_jsonrpc(data: dict):
                 },
                 "serverInfo": {
                     "name": "Power Interpreter",
-                    "version": "1.2.1",
+                    "version": "1.7.2",
                 },
             },
         }
@@ -406,7 +406,7 @@ async def _handle_single_jsonrpc(data: dict):
             fn = tool.fn if hasattr(tool, 'fn') else tool
 
             # ============================================================
-            # FIX: Validate required arguments BEFORE calling the function
+            # Validate required arguments BEFORE calling the function
             # Prevents TypeError crashes when SimTheory sends empty args
             # ============================================================
             validation_error = _validate_tool_args(fn, tool_args, tool_name)

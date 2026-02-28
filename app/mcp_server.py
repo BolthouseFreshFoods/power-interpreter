@@ -3,7 +3,7 @@
 Defines the MCP tools that SimTheory.ai can call.
 This maps MCP tool calls to the FastAPI endpoints.
 
-MCP Tools (12):
+MCP Tools (32):
 - execute_code: Run Python code (sync, <60s)
 - submit_job: Submit long-running job (async)
 - get_job_status: Check job progress
@@ -16,8 +16,28 @@ MCP Tools (12):
 - query_dataset: SQL query against datasets
 - list_datasets: List loaded datasets
 - create_session: Create workspace session
+- ms_auth_status: Check Microsoft 365 auth status
+- ms_auth_start: Start Microsoft device login
+- onedrive_list_files: List OneDrive files/folders
+- onedrive_search: Search OneDrive
+- onedrive_download_file: Download from OneDrive
+- onedrive_upload_file: Upload to OneDrive
+- onedrive_create_folder: Create OneDrive folder
+- onedrive_delete_item: Delete OneDrive item
+- onedrive_move_item: Move OneDrive item
+- onedrive_copy_item: Copy OneDrive item
+- onedrive_share_item: Create sharing link
+- sharepoint_list_sites: List/search SharePoint sites
+- sharepoint_get_site: Get SharePoint site details
+- sharepoint_list_drives: List document libraries
+- sharepoint_list_files: List SharePoint files
+- sharepoint_download_file: Download from SharePoint
+- sharepoint_upload_file: Upload to SharePoint
+- sharepoint_search: Search SharePoint
+- sharepoint_list_lists: List SharePoint lists
+- sharepoint_list_items: List SharePoint list items
 
-Version: 1.8.2 - fix: load_dataset now documents universal format support
+Version: 1.9.0 - feat: Microsoft OneDrive + SharePoint integration (20 new tools)
 
 HISTORY:
   v1.2.0: Response was a JSON blob. URLs lived in stdout. AI parsed them. WORKED.
@@ -56,6 +76,12 @@ HISTORY:
            No more "Load a CSV file" — it loads ANY supported format.
            Backend: data_manager.py uses detect_format() + format-specific readers.
            The /api/data/load-csv endpoint is preserved as backwards-compatible alias.
+  v1.9.0: Microsoft OneDrive + SharePoint integration. 20 new MCP tools for
+           OneDrive file management (list, search, download, upload, create folder,
+           delete, move, copy, share) and SharePoint (list sites, get site,
+           list drives, list files, download, upload, search, lists, list items).
+           Uses Azure AD device code flow for auth. Tokens persisted to Postgres.
+           Safe bootstrap: skips if AZURE_TENANT_ID/AZURE_CLIENT_ID not set.
 """
 
 from mcp.server.fastmcp import FastMCP
@@ -71,6 +97,16 @@ logger = logging.getLogger(__name__)
 
 # MCP Server — name only, no description kwarg (not supported in installed fastmcp version)
 mcp = FastMCP("Power Interpreter")
+
+# ── Microsoft 365 Integration (OneDrive + SharePoint) ────────────────────────
+# Safe bootstrap: logs warning and skips if Azure env vars not configured.
+try:
+    from app.microsoft.bootstrap import init_microsoft_tools
+    _ms_auth, _ms_graph = init_microsoft_tools(mcp)
+except Exception as _ms_err:
+    logger.warning(f"Microsoft integration not loaded: {_ms_err}")
+    _ms_auth, _ms_graph = None, None
+# ─────────────────────────────────────────────────────────────────────────────
 
 # Internal API base URL
 _default_base = "http://127.0.0.1:8080"

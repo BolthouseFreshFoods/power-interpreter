@@ -66,6 +66,22 @@ def detect_format(file_path: str) -> str:
     return fmt
 
 
+def _safe_parse_uuid(value: str) -> Optional[uuid.UUID]:
+    """Safely parse a string as UUID, returning None for non-UUID values.
+    
+    The MCP server may pass session_id="default" when no explicit session
+    has been created. This helper prevents uuid.UUID("default") from
+    raising 'badly formed hexadecimal UUID string'.
+    """
+    if not value:
+        return None
+    try:
+        return uuid.UUID(value)
+    except (ValueError, AttributeError):
+        logger.debug(f"session_id '{value}' is not a valid UUID, treating as None")
+        return None
+
+
 def resolve_file_path(file_path: str) -> str:
     """Resolve a file path by searching multiple locations.
     
@@ -406,11 +422,13 @@ class DataManager:
             await self._create_auto_indexes(table_name, columns_info)
 
             # Save dataset metadata
+            # v1.9.1 FIX: Use _safe_parse_uuid to handle session_id="default"
+            parsed_session_id = _safe_parse_uuid(session_id)
             factory = get_session_factory()
             async with factory() as session:
                 dataset = Dataset(
                     id=uuid.UUID(dataset_id),
-                    session_id=uuid.UUID(session_id) if session_id else None,
+                    session_id=parsed_session_id,
                     name=dataset_name,
                     table_name=table_name,
                     description=f"Loaded from {Path(file_path).name} ({fmt})",
@@ -597,7 +615,10 @@ class DataManager:
         async with factory() as session:
             query = select(Dataset).order_by(Dataset.created_at.desc())
             if session_id:
-                query = query.where(Dataset.session_id == uuid.UUID(session_id))
+                # v1.9.1 FIX: Use _safe_parse_uuid to handle non-UUID session IDs
+                parsed_id = _safe_parse_uuid(session_id)
+                if parsed_id:
+                    query = query.where(Dataset.session_id == parsed_id)
 
             result = await session.execute(query)
             datasets = result.scalars().all()

@@ -5,6 +5,8 @@ All methods return structured dicts ready for MCP tool responses.
 v1.9.3: Added save_to_sandbox parameter to onedrive_download and sharepoint_download.
          Improved _headers error message when refresh fails.
          Added _write_to_sandbox helper for persisting downloaded files to sandbox disk.
+v1.9.3a: Fixed sandbox path resolution — uses /app/sandbox_data (Railway actual path)
+          as primary candidate. Falls back through SANDBOX_DIR env var and common paths.
 """
 
 import logging
@@ -90,27 +92,36 @@ class GraphClient:
     def _get_sandbox_dir(session_id: str = "default") -> str:
         """Get the sandbox working directory for a session.
         
-        Checks common sandbox directory patterns used by Power Interpreter.
-        Falls back to /tmp if nothing else is available.
+        Resolution order:
+        1. SANDBOX_DIR env var (if set by Railway/config)
+        2. /app/sandbox_data (Railway production path — confirmed in logs)
+        3. /app/sandbox
+        4. /tmp/sandbox
+        5. /tmp (last resort)
+        
+        If session_id is provided, tries session-specific subdirectory first.
         """
         # Check environment / settings for sandbox dir
-        sandbox_base = os.environ.get("SANDBOX_DIR", "/tmp/sandbox")
+        sandbox_base = os.environ.get("SANDBOX_DIR", "")
+        
+        if not sandbox_base:
+            # Try known paths in order of preference
+            # /app/sandbox_data is the confirmed Railway production path
+            for candidate in ["/app/sandbox_data", "/app/sandbox", "/tmp/sandbox"]:
+                if os.path.isdir(candidate):
+                    sandbox_base = candidate
+                    break
+            
+            if not sandbox_base:
+                sandbox_base = "/app/sandbox_data"
         
         # Try session-specific directory first
-        session_dir = os.path.join(sandbox_base, session_id)
-        if os.path.isdir(session_dir):
-            return session_dir
+        if session_id and session_id != "default":
+            session_dir = os.path.join(sandbox_base, session_id)
+            if os.path.isdir(session_dir):
+                return session_dir
         
-        # Try base sandbox dir
-        if os.path.isdir(sandbox_base):
-            return sandbox_base
-        
-        # Try common Railway paths
-        for candidate in ["/app/sandbox", "/tmp/sandbox", "/tmp"]:
-            if os.path.isdir(candidate):
-                return candidate
-        
-        # Last resort: create it
+        # Use base sandbox dir
         os.makedirs(sandbox_base, exist_ok=True)
         return sandbox_base
 
@@ -128,7 +139,7 @@ class GraphClient:
         filepath = os.path.join(sandbox_dir, filename)
         
         # Ensure directory exists
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        os.makedirs(os.path.dirname(filepath) if os.path.dirname(filepath) != sandbox_dir else sandbox_dir, exist_ok=True)
         
         with open(filepath, "wb") as f:
             f.write(content)
@@ -206,12 +217,17 @@ class GraphClient:
                 filepath = self._write_to_sandbox(filename, content, session_id)
                 result["sandbox_path"] = filepath
                 result["saved_to_sandbox"] = True
+                result["message"] = (
+                    f"File '{filename}' saved to sandbox. "
+                    f"Use it in execute_code with: pd.read_excel('{filename}') "
+                    f"or open('{filepath}', 'rb')"
+                )
                 logger.info(
                     f"OneDrive download -> sandbox: {filename} "
                     f"({len(content):,} bytes) at {filepath}"
                 )
             except Exception as e:
-                logger.error(f"Failed to write {filename} to sandbox: {e}")
+                logger.error(f"Failed to write {filename} to sandbox: {e}", exc_info=True)
                 # Fall back to base64 if sandbox write fails
                 result["content_base64"] = base64.b64encode(content).decode("utf-8")
                 result["saved_to_sandbox"] = False
@@ -393,12 +409,16 @@ class GraphClient:
                 filepath = self._write_to_sandbox(filename, content, session_id)
                 result["sandbox_path"] = filepath
                 result["saved_to_sandbox"] = True
+                result["message"] = (
+                    f"File '{filename}' saved to sandbox. "
+                    f"Use it in execute_code with the filename directly."
+                )
                 logger.info(
                     f"SharePoint download -> sandbox: {filename} "
                     f"({len(content):,} bytes) at {filepath}"
                 )
             except Exception as e:
-                logger.error(f"Failed to write {filename} to sandbox: {e}")
+                logger.error(f"Failed to write {filename} to sandbox: {e}", exc_info=True)
                 result["content_base64"] = base64.b64encode(content).decode("utf-8")
                 result["saved_to_sandbox"] = False
                 result["sandbox_error"] = str(e)

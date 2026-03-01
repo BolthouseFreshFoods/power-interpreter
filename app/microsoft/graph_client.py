@@ -1,10 +1,15 @@
 """
 Microsoft Graph API client for OneDrive and SharePoint operations.
 All methods return structured dicts ready for MCP tool responses.
+
+v1.9.3: Added save_to_sandbox parameter to onedrive_download and sharepoint_download.
+         Improved _headers error message when refresh fails.
+         Added _write_to_sandbox helper for persisting downloaded files to sandbox disk.
 """
 
 import logging
 import base64
+import os
 from typing import Optional, Dict, Any
 
 import httpx
@@ -25,7 +30,8 @@ class GraphClient:
         token = await self._auth.get_access_token(user_id)
         if not token:
             raise PermissionError(
-                "Not authenticated. Use ms_auth_start to begin device login."
+                "Not authenticated. Use ms_auth_start to begin device login. "
+                "(Token may have expired and refresh failed — check logs for details.)"
             )
         return {"Authorization": f"Bearer {token}"}
 
@@ -77,6 +83,62 @@ class GraphClient:
         return resp.json()
 
     # ═══════════════════════════════════════════════════════════════
+    #  SANDBOX FILE BRIDGE (v1.9.3)
+    # ═══════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _get_sandbox_dir(session_id: str = "default") -> str:
+        """Get the sandbox working directory for a session.
+        
+        Checks common sandbox directory patterns used by Power Interpreter.
+        Falls back to /tmp if nothing else is available.
+        """
+        # Check environment / settings for sandbox dir
+        sandbox_base = os.environ.get("SANDBOX_DIR", "/tmp/sandbox")
+        
+        # Try session-specific directory first
+        session_dir = os.path.join(sandbox_base, session_id)
+        if os.path.isdir(session_dir):
+            return session_dir
+        
+        # Try base sandbox dir
+        if os.path.isdir(sandbox_base):
+            return sandbox_base
+        
+        # Try common Railway paths
+        for candidate in ["/app/sandbox", "/tmp/sandbox", "/tmp"]:
+            if os.path.isdir(candidate):
+                return candidate
+        
+        # Last resort: create it
+        os.makedirs(sandbox_base, exist_ok=True)
+        return sandbox_base
+
+    @staticmethod
+    def _write_to_sandbox(filename: str, content: bytes,
+                          session_id: str = "default") -> str:
+        """Write downloaded file bytes directly to the sandbox filesystem.
+        
+        Returns the full path where the file was saved.
+        
+        v1.9.3: This is the critical bridge between OneDrive download
+        and the sandbox where execute_code runs.
+        """
+        sandbox_dir = GraphClient._get_sandbox_dir(session_id)
+        filepath = os.path.join(sandbox_dir, filename)
+        
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        
+        with open(filepath, "wb") as f:
+            f.write(content)
+        
+        logger.info(
+            f"Sandbox write: {filename} ({len(content):,} bytes) -> {filepath}"
+        )
+        return filepath
+
+    # ═══════════════════════════════════════════════════════════════
     #  ONEDRIVE
     # ═══════════════════════════════════════════════════════════════
 
@@ -117,16 +179,48 @@ class GraphClient:
         items = [self._format_item(i) for i in data.get("value", [])]
         return {"count": len(items), "query": query, "items": items}
 
-    async def onedrive_download(self, user_id: str, item_id: str) -> dict:
-        """Download a file from OneDrive. Returns base64 content + metadata."""
+    async def onedrive_download(self, user_id: str, item_id: str,
+                                save_to_sandbox: bool = True,
+                                session_id: str = "default") -> dict:
+        """Download a file from OneDrive.
+        
+        v1.9.3: When save_to_sandbox=True (default), writes the file directly
+        to the sandbox filesystem so execute_code can access it immediately.
+        Returns metadata + sandbox_path instead of bloated base64 in the
+        MCP JSON response.
+        """
         meta = await self._get(user_id, f"/me/drive/items/{item_id}")
         content = await self._get_bytes(user_id, f"/me/drive/items/{item_id}/content")
-        return {
-            "name": meta.get("name"),
+        
+        filename = meta.get("name", f"download_{item_id}")
+        mime_type = meta.get("file", {}).get("mimeType", "application/octet-stream")
+        
+        result = {
+            "name": filename,
             "size": len(content),
-            "mimeType": meta.get("file", {}).get("mimeType", "application/octet-stream"),
-            "content_base64": base64.b64encode(content).decode("utf-8"),
+            "mimeType": mime_type,
         }
+        
+        if save_to_sandbox:
+            try:
+                filepath = self._write_to_sandbox(filename, content, session_id)
+                result["sandbox_path"] = filepath
+                result["saved_to_sandbox"] = True
+                logger.info(
+                    f"OneDrive download -> sandbox: {filename} "
+                    f"({len(content):,} bytes) at {filepath}"
+                )
+            except Exception as e:
+                logger.error(f"Failed to write {filename} to sandbox: {e}")
+                # Fall back to base64 if sandbox write fails
+                result["content_base64"] = base64.b64encode(content).decode("utf-8")
+                result["saved_to_sandbox"] = False
+                result["sandbox_error"] = str(e)
+        else:
+            result["content_base64"] = base64.b64encode(content).decode("utf-8")
+            result["saved_to_sandbox"] = False
+        
+        return result
 
     async def onedrive_upload(self, user_id: str, path: str,
                               content_base64: str, content_type: str = None) -> dict:
@@ -267,8 +361,14 @@ class GraphClient:
         return {"count": len(items), "site_id": site_id, "items": items}
 
     async def sharepoint_download(self, user_id: str, site_id: str,
-                                  item_id: str, drive_id: str = None) -> dict:
-        """Download a file from SharePoint."""
+                                  item_id: str, drive_id: str = None,
+                                  save_to_sandbox: bool = True,
+                                  session_id: str = "default") -> dict:
+        """Download a file from SharePoint.
+        
+        v1.9.3: When save_to_sandbox=True (default), writes the file directly
+        to the sandbox filesystem so execute_code can access it immediately.
+        """
         if drive_id:
             meta_ep = f"/drives/{drive_id}/items/{item_id}"
             content_ep = f"/drives/{drive_id}/items/{item_id}/content"
@@ -278,12 +378,35 @@ class GraphClient:
 
         meta = await self._get(user_id, meta_ep)
         content = await self._get_bytes(user_id, content_ep)
-        return {
-            "name": meta.get("name"),
+        
+        filename = meta.get("name", f"download_{item_id}")
+        mime_type = meta.get("file", {}).get("mimeType", "application/octet-stream")
+        
+        result = {
+            "name": filename,
             "size": len(content),
-            "mimeType": meta.get("file", {}).get("mimeType", "application/octet-stream"),
-            "content_base64": base64.b64encode(content).decode("utf-8"),
+            "mimeType": mime_type,
         }
+        
+        if save_to_sandbox:
+            try:
+                filepath = self._write_to_sandbox(filename, content, session_id)
+                result["sandbox_path"] = filepath
+                result["saved_to_sandbox"] = True
+                logger.info(
+                    f"SharePoint download -> sandbox: {filename} "
+                    f"({len(content):,} bytes) at {filepath}"
+                )
+            except Exception as e:
+                logger.error(f"Failed to write {filename} to sandbox: {e}")
+                result["content_base64"] = base64.b64encode(content).decode("utf-8")
+                result["saved_to_sandbox"] = False
+                result["sandbox_error"] = str(e)
+        else:
+            result["content_base64"] = base64.b64encode(content).decode("utf-8")
+            result["saved_to_sandbox"] = False
+        
+        return result
 
     async def sharepoint_upload(self, user_id: str, site_id: str,
                                 path: str, content_base64: str,

@@ -1,7 +1,10 @@
-"""
-MCP Tool registrations for OneDrive & SharePoint.
+"""MCP Tool registrations for OneDrive & SharePoint.
 Import and call register_microsoft_tools(mcp, graph_client, auth_manager)
 from your existing mcp_server.py
+
+v1.9.2: Fixed auth status to check Postgres. Replaced fire-and-forget polling
+         with explicit two-step flow (ms_auth_start + ms_auth_poll).
+         Added try/except to all auth tools.
 """
 
 import json
@@ -22,28 +25,68 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
         Args:
             user_id: Microsoft email (e.g. tescamilla@bolthousefresh.com)
         """
-        authenticated = auth_manager.is_authenticated(user_id)
-        return json.dumps({
-            "authenticated": authenticated,
-            "user_id": user_id,
-            "message": (
-                "Authenticated and ready for OneDrive/SharePoint."
-                if authenticated
-                else "Not authenticated. Use ms_auth_start to begin sign-in."
-            ),
-        }, indent=2)
+        try:
+            # Full check: memory + Postgres + token refresh
+            authenticated = await auth_manager.is_authenticated_async(user_id)
+            return json.dumps({
+                "authenticated": authenticated,
+                "user_id": user_id,
+                "message": (
+                    "Authenticated and ready for OneDrive/SharePoint."
+                    if authenticated
+                    else "Not authenticated. Use ms_auth_start to begin sign-in."
+                ),
+            }, indent=2)
+        except Exception as e:
+            logger.error(f"ms_auth_status error for {user_id}: {e}", exc_info=True)
+            return json.dumps({
+                "authenticated": False,
+                "user_id": user_id,
+                "error": str(e),
+                "message": "Error checking auth status. Use ms_auth_start to re-authenticate.",
+            }, indent=2)
 
     @mcp.tool()
     async def ms_auth_start(user_id: str) -> str:
         """Start Microsoft device login for OneDrive/SharePoint access.
 
+        Returns a device code and URL. The user must visit the URL and enter
+        the code. After entering the code, call ms_auth_poll to complete login.
+
         Args:
             user_id: Microsoft email (e.g. tescamilla@bolthousefresh.com)
         """
-        import asyncio
-        result = await auth_manager.start_device_login(user_id)
-        asyncio.create_task(auth_manager.poll_device_login(user_id))
-        return json.dumps(result, indent=2)
+        try:
+            result = await auth_manager.start_device_login(user_id)
+            # v1.9.2: Do NOT fire-and-forget poll. Return device code to user.
+            # User calls ms_auth_poll after entering the code.
+            return json.dumps(result, indent=2)
+        except Exception as e:
+            logger.error(f"ms_auth_start error for {user_id}: {e}", exc_info=True)
+            return json.dumps({
+                "status": "error",
+                "message": f"Failed to start Microsoft login: {str(e)}",
+            }, indent=2)
+
+    @mcp.tool()
+    async def ms_auth_poll(user_id: str) -> str:
+        """Complete Microsoft device login after user has entered the code.
+
+        Call this AFTER ms_auth_start, once the user confirms they have
+        visited the URL and entered the device code.
+
+        Args:
+            user_id: Microsoft email (e.g. tescamilla@bolthousefresh.com)
+        """
+        try:
+            result = await auth_manager.poll_device_login(user_id)
+            return json.dumps(result, indent=2)
+        except Exception as e:
+            logger.error(f"ms_auth_poll error for {user_id}: {e}", exc_info=True)
+            return json.dumps({
+                "status": "error",
+                "message": f"Polling failed: {str(e)}",
+            }, indent=2)
 
     # ── ONEDRIVE TOOLS ──────────────────────────────────────────────
 
@@ -371,4 +414,5 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
         )
         return json.dumps(result, indent=2)
 
-    logger.info("Microsoft OneDrive + SharePoint tools registered (20 tools)")
+    # v1.9.2: 21 tools (added ms_auth_poll)
+    logger.info("Microsoft OneDrive + SharePoint tools registered (21 tools)")

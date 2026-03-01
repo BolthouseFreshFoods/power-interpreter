@@ -14,7 +14,7 @@ Features:
 - Microsoft OneDrive + SharePoint integration (v1.9.0)
 
 Author: Kaffer AI for Timothy Escamilla
-Version: 1.9.1
+Version: 1.9.2
 
 HISTORY:
   v1.7.2: fetch_from_url route fix, stable release
@@ -28,6 +28,8 @@ HISTORY:
   v1.9.0: Microsoft OneDrive + SharePoint integration (20 new MCP tools).
   v1.9.1: Fix Microsoft bootstrap ordering — moved init after base tools
            so a Microsoft failure can never take down the 12 core tools.
+  v1.9.2: Fix Microsoft token persistence — SQLAlchemy rewrite, ensure_db_table
+           in lifespan, ms_auth_poll tool, memory guard module.
 """
 
 import logging
@@ -60,7 +62,7 @@ async def lifespan(app: FastAPI):
     """Application lifecycle management"""
     # --- STARTUP ---
     logger.info("="*60)
-    logger.info("Power Interpreter MCP v1.9.1 starting...")
+    logger.info("Power Interpreter MCP v1.9.2 starting...")
     logger.info("="*60)
 
     # Ensure directories exist
@@ -80,6 +82,20 @@ async def lifespan(app: FastAPI):
     else:
         logger.warning("No DATABASE_URL configured. Running without database.")
         logger.warning("Set DATABASE_URL to enable: jobs, sessions, datasets, file tracking")
+
+    # ── Initialize Microsoft token persistence (v1.9.2) ──────────
+    if db_ok:
+        try:
+            from app.mcp_server import _ms_auth
+            if _ms_auth:
+                await _ms_auth.ensure_db_table()
+                logger.info("Microsoft token persistence: ENABLED (Postgres)")
+            else:
+                logger.info("Microsoft token persistence: SKIPPED (no auth manager)")
+        except Exception as e:
+            logger.warning(f"Microsoft token table setup failed: {e}")
+            logger.warning("Microsoft auth will work but tokens won't persist across deploys")
+    # ── END Microsoft token persistence ──────────────────────────
 
     # Start periodic cleanup (jobs + expired sandbox files)
     cleanup_task = None
@@ -175,9 +191,9 @@ app = FastAPI(
         "and run long-running analysis jobs without timeouts. "
         "Generated files get persistent download URLs via /dl/{file_id}. "
         "Charts served at /charts/{session_id}/{filename}. "
-        "Microsoft OneDrive + SharePoint integration (v1.9.0+)."
+        "Microsoft OneDrive + SharePoint integration (v1.9.2)."
     ),
-    version="1.9.1",
+    version="1.9.2",
     lifespan=lifespan,
     docs_url="/docs",
     redoc_url="/redoc",
@@ -294,7 +310,7 @@ async def serve_chart(session_id: str, filename: str):
                 headers={
                     "Content-Disposition": f'inline; filename="{filename}"',
                     "Cache-Control": "public, max-age=3600",
-                    "X-Power-Interpreter": "chart-serve-v1.9.1",
+                    "X-Power-Interpreter": "chart-serve-v1.9.2",
                 }
             )
 
@@ -501,7 +517,7 @@ async def _handle_single_jsonrpc(data: dict):
                 },
                 "serverInfo": {
                     "name": "Power Interpreter",
-                    "version": "1.9.1",
+                    "version": "1.9.2",
                 },
             },
         }

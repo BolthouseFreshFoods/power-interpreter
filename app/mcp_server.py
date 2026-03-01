@@ -3,7 +3,7 @@
 Defines the MCP tools that SimTheory.ai can call.
 This maps MCP tool calls to the FastAPI endpoints.
 
-MCP Tools (32):
+MCP Tools (33):
 - execute_code: Run Python code (sync, <60s)
 - submit_job: Submit long-running job (async)
 - get_job_status: Check job progress
@@ -18,6 +18,7 @@ MCP Tools (32):
 - create_session: Create workspace session
 - ms_auth_status: Check Microsoft 365 auth status (OneDrive/SharePoint)
 - ms_auth_start: Start Microsoft device login flow
+- ms_auth_poll: Complete Microsoft device login after code entry
 - onedrive_list_files: List files/folders in OneDrive
 - onedrive_search: Search OneDrive by name or content
 - onedrive_download_file: Download file from OneDrive (base64)
@@ -37,7 +38,7 @@ MCP Tools (32):
 - sharepoint_list_lists: List SharePoint lists
 - sharepoint_list_items: List items in a SharePoint list
 
-Version: 1.9.1 - fix: safe Microsoft init after base tools
+Version: 1.9.2 - fix: token persistence, auth poll, memory guard
 
 HISTORY:
   v1.2.0: Response was a JSON blob. URLs lived in stdout. AI parsed them. WORKED.
@@ -86,6 +87,13 @@ HISTORY:
            and ZERO base tools registered. Moved Microsoft init to BOTTOM of file
            (after all 12 base tools) and wrapped in try/except. Now a Microsoft
            failure can never take down the core tools.
+  v1.9.2: FIX — Token persistence rewrite. auth_manager now uses SQLAlchemy
+           instead of asyncpg (db_pool was never passed, tokens lost on every
+           redeploy). Added ms_auth_poll tool (explicit two-step auth flow).
+           Removed fire-and-forget asyncio.create_task() from ms_auth_start.
+           Added is_authenticated_async() that checks Postgres.
+           Added ensure_db_table() call in main.py lifespan.
+           Added memory_guard.py for subprocess memory isolation.
 """
 
 from mcp.server.fastmcp import FastMCP
@@ -106,6 +114,8 @@ mcp = FastMCP("Power Interpreter")
 # Initialized AFTER base tools are registered (see bottom of file).
 # v1.9.1: Moved here from top-level import to prevent Microsoft failures
 # from blocking the 12 base tool registrations.
+# v1.9.2: Auth manager now uses SQLAlchemy. ensure_db_table() called in
+# main.py lifespan after database init.
 _ms_auth, _ms_graph = None, None
 
 # Internal API base URL
@@ -880,21 +890,22 @@ async def create_session(
 
 
 # ============================================================
-# MICROSOFT 365 INTEGRATION (v1.9.0)
+# MICROSOFT 365 INTEGRATION (v1.9.2)
 # ============================================================
 # v1.9.1 FIX: Registered AFTER all 12 base tools so a Microsoft
 # failure can never prevent the core tools from loading.
 #
-# Previously at lines 102-103 (top of file), an import failure
-# would crash the entire module before any @mcp.tool() ran.
-# Now the 12 base tools are always safe.
+# v1.9.2 FIX: Removed db_pool param. Auth manager uses SQLAlchemy.
+#              Added ms_auth_poll tool (21 Microsoft tools total).
+#              Token persistence enabled via ensure_db_table() in lifespan.
+#              Removed fire-and-forget asyncio.create_task() from ms_auth_start.
 # ============================================================
 
 try:
     from app.microsoft.bootstrap import init_microsoft_tools
     _ms_auth, _ms_graph = init_microsoft_tools(mcp)
     if _ms_auth:
-        logger.info("Microsoft OneDrive + SharePoint integration: ENABLED (%s additional tools)", "20")
+        logger.info("Microsoft OneDrive + SharePoint integration: ENABLED (%s additional tools)", "21")
     else:
         logger.info("Microsoft OneDrive + SharePoint integration: SKIPPED (no Azure credentials)")
 except Exception as e:

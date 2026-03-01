@@ -11,9 +11,10 @@ Features:
 - Pre-installed data science libraries
 - Persistent session state (kernel architecture)
 - Auto file storage in Postgres with public download URLs
+- Microsoft OneDrive + SharePoint integration (v1.9.0)
 
 Author: Kaffer AI for Timothy Escamilla
-Version: 1.8.1
+Version: 1.9.1
 
 HISTORY:
   v1.7.2: fetch_from_url route fix, stable release
@@ -24,6 +25,9 @@ HISTORY:
            didn't exist. Now serves chart PNG bytes from Postgres with
            correct Content-Type. Public endpoint, no auth (same as /dl/).
            Evidence: "GET /charts/chart-test-v181/chart_001.png 404"
+  v1.9.0: Microsoft OneDrive + SharePoint integration (20 new MCP tools).
+  v1.9.1: Fix Microsoft bootstrap ordering — moved init after base tools
+           so a Microsoft failure can never take down the 12 core tools.
 """
 
 import logging
@@ -56,7 +60,7 @@ async def lifespan(app: FastAPI):
     """Application lifecycle management"""
     # --- STARTUP ---
     logger.info("="*60)
-    logger.info("Power Interpreter MCP v1.8.1 starting...")
+    logger.info("Power Interpreter MCP v1.9.1 starting...")
     logger.info("="*60)
 
     # Ensure directories exist
@@ -170,9 +174,10 @@ app = FastAPI(
         "Execute code, manage files, query large datasets, "
         "and run long-running analysis jobs without timeouts. "
         "Generated files get persistent download URLs via /dl/{file_id}. "
-        "Charts served at /charts/{session_id}/{filename}."
+        "Charts served at /charts/{session_id}/{filename}. "
+        "Microsoft OneDrive + SharePoint integration (v1.9.0+)."
     ),
-    version="1.8.1",
+    version="1.9.1",
     lifespan=lifespan,
     docs_url="/docs",
     redoc_url="/redoc",
@@ -289,7 +294,7 @@ async def serve_chart(session_id: str, filename: str):
                 headers={
                     "Content-Disposition": f'inline; filename="{filename}"',
                     "Cache-Control": "public, max-age=3600",
-                    "X-Power-Interpreter": "chart-serve-v1.8.1",
+                    "X-Power-Interpreter": "chart-serve-v1.9.1",
                 }
             )
 
@@ -496,7 +501,7 @@ async def _handle_single_jsonrpc(data: dict):
                 },
                 "serverInfo": {
                     "name": "Power Interpreter",
-                    "version": "1.8.1",
+                    "version": "1.9.1",
                 },
             },
         }

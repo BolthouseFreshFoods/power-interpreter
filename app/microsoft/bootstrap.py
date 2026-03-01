@@ -9,6 +9,8 @@ This module is safe to import even if Azure env vars are not set —
 it will log a warning and skip registration.
 
 v1.9.2: Removed db_pool parameter. Auth manager now uses SQLAlchemy directly.
+v1.9.4: Changed import from mcp_tools -> tools (consolidated duplicate files).
+         mcp_tools.py is now a deprecated redirect.
 """
 
 import os
@@ -41,9 +43,11 @@ def init_microsoft_tools(mcp):
     try:
         from app.microsoft.auth_manager import MSAuthManager
         from app.microsoft.graph_client import GraphClient
-        from app.microsoft.mcp_tools import register_microsoft_tools
+        # v1.9.4: Import from tools.py (the canonical file)
+        # Previously imported from mcp_tools.py which was a stale duplicate
+        from app.microsoft.tools import register_microsoft_tools
 
-        auth_manager = MSAuthManager()  # No db_pool needed — uses SQLAlchemy
+        auth_manager = MSAuthManager()
         graph_client = GraphClient(auth_manager)
         register_microsoft_tools(mcp, graph_client, auth_manager)
 

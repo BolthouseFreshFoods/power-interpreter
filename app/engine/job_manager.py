@@ -12,6 +12,9 @@ Pattern:
   3. Client gets result when complete -> gets full output
 
 This ensures NO MCP call ever times out, even for 5-minute jobs.
+
+v1.9.5: Fixed ValueError when non-UUID session_id strings are passed
+         (e.g. 'default'). Added _safe_parse_session_id() helper.
 """
 
 import asyncio
@@ -28,6 +31,23 @@ from app.engine.executor import executor, ExecutionResult
 from app.database import get_session_factory
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_parse_session_id(session_id: str) -> Optional[uuid.UUID]:
+    """Safely parse a session_id string into a UUID.
+
+    If the string is a valid UUID, parse it directly.
+    If it's a friendly name like 'default', generate a deterministic UUID via uuid5.
+    Returns None if session_id is falsy.
+
+    v1.9.5: Fix for ValueError when non-UUID strings (e.g. 'default') are passed.
+    """
+    if not session_id:
+        return None
+    try:
+        return uuid.UUID(session_id)
+    except ValueError:
+        return uuid.uuid5(uuid.NAMESPACE_DNS, session_id)
 
 
 class JobManager:
@@ -57,7 +77,7 @@ class JobManager:
         async with factory() as session:
             job = Job(
                 id=uuid.UUID(job_id),
-                session_id=uuid.UUID(session_id) if session_id else None,
+                session_id=_safe_parse_session_id(session_id),
                 code=code,
                 status=JobStatus.PENDING,
                 submitted_at=datetime.utcnow(),
@@ -246,7 +266,7 @@ class JobManager:
             query = select(Job).order_by(Job.submitted_at.desc()).limit(limit)
             
             if session_id:
-                query = query.where(Job.session_id == uuid.UUID(session_id))
+                query = query.where(Job.session_id == _safe_parse_session_id(session_id))
             if status:
                 query = query.where(Job.status == JobStatus(status))
             

@@ -14,6 +14,7 @@ Executes Python code in a controlled environment with:
 - READ-ONLY UPLOAD ACCESS (v2.8.2) - sandbox can read uploaded files
 - SANDBOX PATH RECOGNITION (v2.8.3) - /app/sandbox_data in allowed paths
 - DATETIME MODULE FIX (v2.8.4) - datetime injected as MODULE, not class
+- DOCX SUPPORT (v2.8.5) - python-docx + transitive deps in allowlist
 
 CRITICAL BUG FIX (v2.6):
   'import matplotlib.pyplot as plt' was broken because:
@@ -89,7 +90,21 @@ v2.8.4 - datetime module injection fix
   3. _lazy_import returns True for datetime, so _preprocess_code
      comments out the import instead of rewriting it destructively
 
-Version: 2.8.4
+v2.8.5 - python-docx and transitive dependency support
+  'from docx import Document' was blocked because python-docx requires
+  zipfile, lxml, xml internally. These transitive dependencies were not
+  in the _lazy_import allowlist, causing NameError: 'zipfile' is not
+  defined when attempting to read .docx files.
+  
+  Fix:
+  1. Added docx, zipfile, lxml, xml, pkgutil, importlib, warnings,
+     abc, enum, weakref to _lazy_import allowlist
+  2. Added io, copy to _lazy_import (were in _build_safe_globals but
+     explicit 'import io' in user code would get BLOCKED)
+  3. Added .docx to STORABLE_EXTENSIONS for auto-download URLs
+  4. Document convenience alias pre-injected into sandbox_globals
+
+Version: 2.8.5
 """
 
 import asyncio
@@ -126,11 +141,13 @@ except ImportError:
 
 # ============================================================
 # File extensions we auto-store in Postgres for download URLs
+# v2.8.5: Added .docx for Word document support
 # ============================================================
 STORABLE_EXTENSIONS = {
     '.xlsx', '.xls', '.csv', '.tsv', '.json',
     '.pdf', '.png', '.jpg', '.jpeg', '.svg',
     '.html', '.txt', '.md', '.zip', '.parquet',
+    '.docx',
 }
 
 # Image extensions for inline rendering
@@ -1161,6 +1178,103 @@ class SandboxExecutor:
                 import glob
                 sandbox_globals['glob'] = glob
                 return True
+            # ============================================================
+            # v2.8.5: python-docx and transitive dependencies
+            # python-docx requires zipfile, lxml, xml internally.
+            # Without these in the allowlist, 'from docx import Document'
+            # fails with NameError: 'zipfile' is not defined.
+            # ============================================================
+            elif name == 'docx':
+                try:
+                    import docx
+                    sandbox_globals['docx'] = docx
+                    # Pre-import Document for convenience
+                    try:
+                        from docx import Document as _Document
+                        sandbox_globals['Document'] = _Document
+                    except ImportError:
+                        pass
+                    logger.info("Loaded python-docx (Document)")
+                    return True
+                except ImportError:
+                    logger.warning("python-docx not installed — run: pip install python-docx")
+                    return False
+            elif name == 'zipfile':
+                import zipfile
+                sandbox_globals['zipfile'] = zipfile
+                return True
+            elif name == 'lxml':
+                import lxml
+                try:
+                    import lxml.etree
+                except ImportError:
+                    pass
+                sandbox_globals['lxml'] = lxml
+                return True
+            elif name == 'xml':
+                import xml
+                try:
+                    import xml.etree
+                    import xml.etree.ElementTree
+                except ImportError:
+                    pass
+                try:
+                    import xml.dom
+                    import xml.dom.minidom
+                except ImportError:
+                    pass
+                try:
+                    import xml.parsers
+                    import xml.parsers.expat
+                except ImportError:
+                    pass
+                sandbox_globals['xml'] = xml
+                return True
+            elif name == 'pkgutil':
+                import pkgutil
+                sandbox_globals['pkgutil'] = pkgutil
+                return True
+            elif name == 'importlib':
+                import importlib
+                try:
+                    import importlib.resources
+                except ImportError:
+                    pass
+                try:
+                    import importlib.metadata
+                except ImportError:
+                    pass
+                sandbox_globals['importlib'] = importlib
+                return True
+            elif name == 'warnings':
+                import warnings
+                sandbox_globals['warnings'] = warnings
+                return True
+            elif name == 'abc':
+                import abc
+                sandbox_globals['abc'] = abc
+                return True
+            elif name == 'enum':
+                import enum
+                sandbox_globals['enum'] = enum
+                return True
+            elif name == 'weakref':
+                import weakref
+                sandbox_globals['weakref'] = weakref
+                return True
+            # ============================================================
+            # v2.8.5: io and copy — already in _build_safe_globals but
+            # need _lazy_import entries so explicit 'import io' or
+            # 'import copy' in user code doesn't get BLOCKED.
+            # ============================================================
+            elif name == 'io':
+                import io as io_module
+                sandbox_globals['io'] = io_module
+                return True
+            elif name == 'copy':
+                import copy as copy_module
+                sandbox_globals['copy'] = copy_module
+                return True
         except ImportError as e:
             logger.warning(f"Failed to import {name}: {e}")
             return False
@@ -1493,6 +1607,7 @@ class SandboxExecutor:
         v2.8.2: Upload paths permitted for read-only access.
         v2.8.3: /app/sandbox_data recognized as legitimate path.
         v2.8.4: datetime module preserved through import preprocessing.
+        v2.8.5: python-docx and transitive deps permitted through allowlist.
         """
         result = ExecutionResult()
         timeout = timeout or settings.MAX_EXECUTION_TIME

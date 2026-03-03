@@ -11,17 +11,18 @@ Features:
 - Pre-installed data science libraries
 - Persistent session state (kernel architecture)
 - Auto file storage in Postgres with public download URLs
-- Microsoft OneDrive + SharePoint integration
+- Microsoft OneDrive + SharePoint integration (v1.9.0)
 
 Author: Kaffer AI for Timothy Escamilla
 Version: 2.9.0
 
 HISTORY:
-  v1.9.0: Microsoft OneDrive + SharePoint integration (20 new MCP tools).
-  v1.9.1: Fix Microsoft bootstrap ordering — moved init after base tools.
-  v1.9.2: Fix Microsoft token persistence — SQLAlchemy rewrite.
-  v2.8.6: Version unification. All files share a single version number.
-  v2.9.0: Trimmed all 34 tool descriptions for token optimization (~57% reduction).
+  v1.7.2: fetch_from_url route fix, stable release
+  v1.8.1: Chart serving route + inline base64 image blocks
+  v1.9.0: Microsoft OneDrive + SharePoint integration (20 new MCP tools)
+  v1.9.2: Token persistence rewrite (SQLAlchemy), ms_auth_poll tool
+  v2.8.6: Version unification across all files
+  v2.9.0: Trimmed all 34 tool descriptions for token optimization (~57% reduction)
 """
 
 import logging
@@ -206,7 +207,12 @@ app.add_middleware(
 
 @app.get("/charts/{session_id}/{filename}")
 async def serve_chart(session_id: str, filename: str):
-    """Serve chart images by session_id and filename. Public endpoint."""
+    """Serve chart images by session_id and filename.
+
+    SimTheory auto-constructs these URLs from MCP tool responses.
+    Looks up the most recent matching file in Postgres and serves it.
+    Public endpoint — no authentication required.
+    """
     logger.info(f"Chart request: session={session_id} filename={filename}")
 
     try:
@@ -235,6 +241,7 @@ async def serve_chart(session_id: str, filename: str):
                     }
                 )
 
+            # Determine Content-Type
             content_type = getattr(file_record, 'content_type', None) or 'application/octet-stream'
             fname_lower = filename.lower()
             if fname_lower.endswith('.png'):
@@ -248,6 +255,7 @@ async def serve_chart(session_id: str, filename: str):
             elif fname_lower.endswith('.pdf'):
                 content_type = 'application/pdf'
 
+            # Get the binary data
             file_data = getattr(file_record, 'file_data', None)
             if file_data is None:
                 file_data = getattr(file_record, 'data', None)
@@ -551,17 +559,17 @@ async def _handle_single_jsonrpc(data: dict):
 # ROUTE MOUNTING
 # =============================================================================
 
-# --- PUBLIC ROUTES (no auth) ---
+# Public routes (no auth)
 app.include_router(health.router, tags=["Health"])
 
-# --- PUBLIC DOWNLOAD (no auth) ---
+# Public download (no auth)
 app.include_router(
     download_router,
     prefix="/dl",
     tags=["Downloads"],
 )
 
-# --- PROTECTED ROUTES (API key required) ---
+# Protected routes (API key required)
 app.include_router(
     execute.router,
     prefix="/api",
@@ -593,5 +601,5 @@ app.include_router(
     dependencies=[Depends(verify_api_key)],
 )
 
-# --- MCP SSE TRANSPORT (for standard MCP clients) ---
+# MCP SSE transport (for standard MCP clients)
 app.mount("/mcp", mcp.sse_app())

@@ -24,5 +24,5 @@ CHANGELOG (engine-layer – now unified with MCP server version):
   v2.8.4  datetime module injection fix (MODULE, not class)
   v2.8.5  python-docx + transitive deps (zipfile, lxml, xml …)
   v2.8.6  Timeout floor (100 s minimum), version unification
-  v2.9.0  Trimmed MCP tool descriptions for token optimisation
+  v2.9.0  Trimmed MCP tool descriptions for token optimisation (~57% reduction)
 """

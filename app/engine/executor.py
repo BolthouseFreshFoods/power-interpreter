@@ -15,6 +15,7 @@ Executes Python code in a controlled environment with:
 - SANDBOX PATH RECOGNITION (v2.8.3) - /app/sandbox_data in allowed paths
 - DATETIME MODULE FIX (v2.8.4) - datetime injected as MODULE, not class
 - DOCX SUPPORT (v2.8.5) - python-docx + transitive deps in allowlist
+- TIMEOUT FLOOR (v2.8.6) - minimum 100s execution time, AI cannot override
 
 CRITICAL BUG FIX (v2.6):
   'import matplotlib.pyplot as plt' was broken because:
@@ -104,7 +105,16 @@ v2.8.5 - python-docx and transitive dependency support
   3. Added .docx to STORABLE_EXTENSIONS for auto-download URLs
   4. Document convenience alias pre-injected into sandbox_globals
 
-Version: 2.8.5
+v2.8.6 - Timeout floor enforcement
+  AI model was passing timeout=55 in execute_code tool calls, causing
+  complex .docx template generation to time out. The config default is
+  300s but the AI was overriding it per-call.
+  
+  Fix: Enforce a minimum floor of 100 seconds. If the AI passes a
+  timeout below 100, the server silently raises it to 100. Values
+  above 100 are respected. Omitting timeout still uses the 300s default.
+
+Version: 2.8.6
 """
 
 import asyncio
@@ -128,6 +138,14 @@ from app.config import settings
 from app.engine.kernel_manager import kernel_manager
 
 logger = logging.getLogger(__name__)
+
+# ============================================================
+# v2.8.6: Minimum execution timeout floor (seconds)
+# AI models sometimes pass low timeouts (e.g. 55s) that are
+# insufficient for complex document generation. This floor
+# ensures the server never allows less than this value.
+# ============================================================
+MIN_EXECUTION_TIMEOUT = 100
 
 
 # Try to import resource module (Unix only, may fail in some containers)
@@ -1608,9 +1626,18 @@ class SandboxExecutor:
         v2.8.3: /app/sandbox_data recognized as legitimate path.
         v2.8.4: datetime module preserved through import preprocessing.
         v2.8.5: python-docx and transitive deps permitted through allowlist.
+        v2.8.6: Minimum timeout floor of 100s enforced server-side.
         """
         result = ExecutionResult()
-        timeout = timeout or settings.MAX_EXECUTION_TIME
+        # ============================================================
+        # v2.8.6: Enforce minimum timeout floor
+        # AI models sometimes pass low timeouts (e.g. timeout=55) that
+        # are insufficient for complex document generation. The server
+        # enforces a floor of MIN_EXECUTION_TIMEOUT seconds regardless
+        # of what the caller requests. Values above the floor and the
+        # config default (300s) are both respected as-is.
+        # ============================================================
+        timeout = max(timeout or settings.MAX_EXECUTION_TIME, MIN_EXECUTION_TIMEOUT)
 
         logger.info(f"Executing code: session={session_id}, timeout={timeout}s")
         logger.info(f"Code preview: {code[:200]}")

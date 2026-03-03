@@ -6,7 +6,11 @@ Built for [SimTheory.ai](https://simtheory.ai) — deployed on [Railway](https:/
 
 ## Version
 
-**v1.9.4** — March 2026
+**v2.8.6** — March 2026
+
+> Version unified across all files as of v2.8.6. Previously the MCP server layer
+> (main.py, mcp_server.py) and the sandbox engine (executor.py) had independent
+> version numbers. Now there is ONE version for the entire service.
 
 ## MCP Tools (34 total)
 
@@ -26,13 +30,13 @@ Built for [SimTheory.ai](https://simtheory.ai) — deployed on [Railway](https:/
 | `list_datasets` | List loaded datasets |
 | `create_session` | Create isolated workspace session |
 
-### Microsoft 365 Tools (22) — v1.9.4
+### Microsoft 365 Tools (22)
 | Tool | Description |
 |------|-------------|
 | `ms_auth_status` | Check Microsoft 365 auth status |
 | `ms_auth_start` | Start device code login flow |
 | `ms_auth_poll` | Complete device code login |
-| **`resolve_share_link`** | **NEW** — Resolve SharePoint/OneDrive sharing URL → metadata + sandbox download |
+| `resolve_share_link` | Resolve SharePoint/OneDrive sharing URL → metadata + sandbox download |
 | `onedrive_list_files` | List files/folders in OneDrive |
 | `onedrive_search` | Search OneDrive by name or content |
 | `onedrive_download_file` | Download from OneDrive → sandbox |
@@ -54,42 +58,58 @@ Built for [SimTheory.ai](https://simtheory.ai) — deployed on [Railway](https:/
 
 ## Key Features
 
-### v1.9.4 Changes
-- **`user_id` is now optional** on all 22 Microsoft tools — auto-resolves from the last authenticated user
-- **New `resolve_share_link` tool** — paste a SharePoint/OneDrive sharing URL and get the file downloaded to sandbox automatically
-- **Consolidated tool files** — `mcp_tools.py` deprecated in favor of `tools.py` (single source of truth)
-- **Improved auth tracking** — `_last_authenticated_user` persisted across token refreshes and Postgres loads
+### Sandbox Engine
+- **Persistent kernels** — variables, imports, and loaded files survive across calls
+- **Import allowlist** — pandas, numpy, matplotlib, seaborn, plotly, scipy, sklearn, statsmodels, openpyxl, reportlab, python-docx, and more
+- **Path normalization** — auto-fixes /tmp/ paths, doubled session prefixes, Windows paths
+- **Read-only upload access** — sandbox can read uploaded files from SimTheory
+- **Chart auto-capture** — matplotlib/plotly figures captured via plt.show() interception
+- **Timeout floor** — minimum 100s execution time, AI cannot override below this
+- **File auto-storage** — generated files stored in Postgres with public download URLs
+
+### Microsoft 365 Integration
+- **Device code OAuth 2.0** with token persistence to Postgres
+- **OneDrive** — full CRUD (list, search, upload, download, move, copy, share)
+- **SharePoint** — sites, document libraries, lists, search, upload/download
+- **Share link resolution** — paste a sharing URL, get the file in sandbox automatically
+- **Optional user_id** — auto-resolves from last authenticated user
 
 ### Architecture
-- **Sandbox**: Persistent Python kernel with session isolation
-- **Database**: PostgreSQL for datasets, tokens, and job state
-- **Auth**: Microsoft device code OAuth 2.0 with token persistence
-- **Charts**: Inline base64 image blocks (matplotlib, seaborn, plotly)
+- **Runtime**: FastAPI + Uvicorn on Railway
+- **Database**: PostgreSQL (datasets, tokens, job state, file storage)
+- **MCP Transport**: SSE (standard clients) + direct JSON-RPC (SimTheory)
+- **Charts**: Inline base64 ImageContent blocks
 - **Files**: Direct sandbox write from OneDrive/SharePoint downloads
 
 ## File Structure
 
 ```
 app/
-├── main.py                    # FastAPI app + lifespan
+├── main.py                    # FastAPI app + lifespan + JSON-RPC handler
 ├── mcp_server.py              # MCP tool definitions (12 core tools)
 ├── config.py                  # Settings
 ├── database.py                # SQLAlchemy async engine
 ├── microsoft/
 │   ├── __init__.py
-│   ├── auth_manager.py        # OAuth token management (v1.9.4)
-│   ├── bootstrap.py           # Init + registration (v1.9.4)
-│   ├── graph_client.py        # Microsoft Graph API client (v1.9.4)
-│   ├── tools.py               # 22 MCP tool registrations (v1.9.4) ← CANONICAL
+│   ├── auth_manager.py        # OAuth token management
+│   ├── bootstrap.py           # Init + registration
+│   ├── graph_client.py        # Microsoft Graph API client
+│   ├── tools.py               # 22 MCP tool registrations ← CANONICAL
 │   └── mcp_tools.py           # DEPRECATED redirect → tools.py
 ├── engine/
-│   ├── executor.py            # Code execution engine
+│   ├── executor.py            # Sandbox code execution engine
+│   ├── kernel_manager.py      # Persistent kernel sessions
+│   ├── data_manager.py        # Dataset loading
+│   ├── file_manager.py        # File I/O management
+│   ├── job_manager.py         # Async job queue
 │   └── memory_guard.py        # Memory isolation
 ├── routes/
 │   ├── execute.py             # /api/execute
 │   ├── files.py               # /api/files/*
 │   ├── jobs.py                # /api/jobs/*
-│   └── data.py                # /api/data/*
+│   ├── data.py                # /api/data/*
+│   ├── sessions.py            # /api/sessions
+│   └── health.py              # /health
 └── data_manager.py            # Dataset loading (CSV, Excel, PDF, JSON, Parquet)
 ```
 
@@ -119,16 +139,32 @@ POST https://power-interpreter-production-6396.up.railway.app/mcp/sse
 
 ## Version History
 
+> As of v2.8.6, the MCP server and sandbox engine share a single version number.
+> Earlier versions used separate numbering (v1.x for MCP server, v2.x for engine).
+
 | Version | Date | Changes |
 |---------|------|---------|
-| v1.9.4 | Mar 2026 | Optional user_id, resolve_share_link, file consolidation |
-| v1.9.3 | Mar 2026 | Sandbox file bridge for OneDrive/SharePoint downloads |
-| v1.9.2 | Mar 2026 | Token persistence rewrite (SQLAlchemy), ms_auth_poll |
-| v1.9.0 | Feb 2026 | Microsoft OneDrive + SharePoint integration (20 tools) |
-| v1.8.2 | Feb 2026 | Universal data loading (CSV, Excel, PDF, JSON, Parquet) |
-| v1.8.1 | Feb 2026 | Inline chart images via base64 ImageContent blocks |
-| v1.7.0 | Jan 2026 | fetch_from_url tool for direct CDN/URL downloads |
-| v1.6.0 | Jan 2026 | Auto file handling workflow improvements |
+| **v2.8.6** | **Mar 2026** | **Timeout floor (100s minimum), version unification across all files** |
+| v2.8.5 | Mar 2026 | python-docx + transitive dependency support (zipfile, lxml, xml, etc.) |
+| v2.8.4 | Mar 2026 | datetime module injection fix (preserved as MODULE, not class) |
+| v2.8.3 | Mar 2026 | /app/sandbox_data recognized in allowed read paths |
+| v2.8.2 | Mar 2026 | Read-only upload access (sandbox reads SimTheory uploads) |
+| v2.8.1 | Mar 2026 | /tmp/ path interception (redirect absolute paths to sandbox) |
+| v2.8.0 | Mar 2026 | Defensive path normalization (session prefix doubling fix) |
+| v2.7.0 | Mar 2026 | reportlab + matplotlib PDF backend support |
+| v2.6.0 | Mar 2026 | Inline chart rendering (matplotlib/plotly auto-capture) |
+| v2.1.0 | Feb 2026 | Auto file storage in Postgres with download URLs |
+| v2.0.0 | Feb 2026 | Persistent session state (kernel architecture) |
+| *v1.9.4* | *Mar 2026* | *Optional user_id on MS tools, resolve_share_link, file consolidation* |
+| *v1.9.3* | *Mar 2026* | *Sandbox file bridge for OneDrive/SharePoint downloads* |
+| *v1.9.2* | *Mar 2026* | *Token persistence rewrite (SQLAlchemy), ms_auth_poll* |
+| *v1.9.0* | *Feb 2026* | *Microsoft OneDrive + SharePoint integration (20 tools)* |
+| *v1.8.2* | *Feb 2026* | *Universal data loading (CSV, Excel, PDF, JSON, Parquet)* |
+| *v1.8.1* | *Feb 2026* | *Inline chart images via base64 ImageContent blocks* |
+| *v1.7.0* | *Jan 2026* | *fetch_from_url tool for direct CDN/URL downloads* |
+| *v1.6.0* | *Jan 2026* | *Auto file handling workflow improvements* |
+
+*Italicized entries are from the legacy v1.x MCP server numbering (pre-unification).*
 
 ---
 

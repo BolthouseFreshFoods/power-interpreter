@@ -6,7 +6,7 @@ Built for [SimTheory.ai](https://simtheory.ai) — deployed on [Railway](https:/
 
 ## Version
 
-**v2.8.6** — March 2026
+**v2.9.0** — March 2026
 
 > Version unified across all files as of v2.8.6. Previously the MCP server layer
 > (main.py, mcp_server.py) and the sandbox engine (executor.py) had independent
@@ -144,7 +144,8 @@ POST https://power-interpreter-production-6396.up.railway.app/mcp/sse
 
 | Version | Date | Changes |
 |---------|------|---------|
-| **v2.8.6** | **Mar 2026** | **Timeout floor (100s minimum), version unification across all files** |
+| **v2.9.0** | **Mar 2026** | **Trimmed all 34 tool descriptions for ~57% token reduction per message. No logic changes.** |
+| v2.8.6 | Mar 2026 | Timeout floor (100s minimum), version unification across all files |
 | v2.8.5 | Mar 2026 | python-docx + transitive dependency support (zipfile, lxml, xml, etc.) |
 | v2.8.4 | Mar 2026 | datetime module injection fix (preserved as MODULE, not class) |
 | v2.8.3 | Mar 2026 | /app/sandbox_data recognized in allowed read paths |

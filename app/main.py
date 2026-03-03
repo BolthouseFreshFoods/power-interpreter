@@ -14,7 +14,7 @@ Features:
 - Microsoft OneDrive + SharePoint integration (v1.9.0)
 
 Author: Kaffer AI for Timothy Escamilla
-Version: 1.9.2
+Version: 2.8.6
 
 HISTORY:
   v1.7.2: fetch_from_url route fix, stable release
@@ -30,6 +30,8 @@ HISTORY:
            so a Microsoft failure can never take down the 12 core tools.
   v1.9.2: Fix Microsoft token persistence — SQLAlchemy rewrite, ensure_db_table
            in lifespan, ms_auth_poll tool, memory guard module.
+  v2.8.6: Version unification. All files now share a single version number.
+           See executor.py for the full v2.x changelog (sandbox engine).
 """
 
 import logging
@@ -62,7 +64,7 @@ async def lifespan(app: FastAPI):
     """Application lifecycle management"""
     # --- STARTUP ---
     logger.info("="*60)
-    logger.info("Power Interpreter MCP v1.9.2 starting...")
+    logger.info("Power Interpreter MCP v2.8.6 starting...")
     logger.info("="*60)
 
     # Ensure directories exist
@@ -191,9 +193,9 @@ app = FastAPI(
         "and run long-running analysis jobs without timeouts. "
         "Generated files get persistent download URLs via /dl/{file_id}. "
         "Charts served at /charts/{session_id}/{filename}. "
-        "Microsoft OneDrive + SharePoint integration (v1.9.2)."
+        "Microsoft OneDrive + SharePoint integration."
     ),
-    version="1.9.2",
+    version="2.8.6",
     lifespan=lifespan,
     docs_url="/docs",
     redoc_url="/redoc",
@@ -310,7 +312,7 @@ async def serve_chart(session_id: str, filename: str):
                 headers={
                     "Content-Disposition": f'inline; filename="{filename}"',
                     "Cache-Control": "public, max-age=3600",
-                    "X-Power-Interpreter": "chart-serve-v1.9.2",
+                    "X-Power-Interpreter": "chart-serve-v2.8.6",
                 }
             )
 
@@ -517,7 +519,7 @@ async def _handle_single_jsonrpc(data: dict):
                 },
                 "serverInfo": {
                     "name": "Power Interpreter",
-                    "version": "1.9.2",
+                    "version": "2.8.6",
                 },
             },
         }

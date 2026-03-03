@@ -10,6 +10,7 @@ v1.9.3: Updated onedrive_download_file and sharepoint_download_file to save
 v1.9.4: Made user_id optional on ALL Microsoft tools — auto-resolves from
          auth_manager.get_default_user_id_async() when not provided.
          Added resolve_share_link tool (22 tools total).
+v2.8.6: Version unification — all files now share a single version number.
 """
 
 import json
@@ -573,5 +574,5 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
         except ValueError as e:
             return json.dumps({"error": True, "message": str(e)}, indent=2)
 
-    # v1.9.4: 22 tools (added resolve_share_link, made user_id optional everywhere)
-    logger.info("Microsoft OneDrive + SharePoint tools registered (22 tools, v1.9.4)")
+    # v2.8.6: Unified version across all files
+    logger.info("Microsoft OneDrive + SharePoint tools registered (22 tools, v2.8.6)")

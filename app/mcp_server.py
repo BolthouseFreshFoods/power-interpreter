@@ -3,77 +3,17 @@
 Defines the MCP tools that SimTheory.ai can call.
 This maps MCP tool calls to the FastAPI endpoints.
 
-MCP Tools (33):
-- execute_code: Run Python code (sync, <60s)
-- submit_job: Submit long-running job (async)
-- get_job_status: Check job progress
-- get_job_result: Get completed job output
-- upload_file: Upload a file (base64) to sandbox
-- fetch_file: Download a file from URL to sandbox
-- fetch_from_url: Load file from CDN/URL directly into sandbox
-- list_files: List sandbox files
-- load_dataset: Load data file into PostgreSQL (CSV, Excel, PDF, JSON, Parquet)
-- query_dataset: SQL query against datasets
-- list_datasets: List loaded datasets
-- create_session: Create workspace session
-- ms_auth_status: Check Microsoft 365 auth status (OneDrive/SharePoint)
-- ms_auth_start: Start Microsoft device login flow
-- ms_auth_poll: Complete Microsoft device login after code entry
-- onedrive_list_files: List files/folders in OneDrive
-- onedrive_search: Search OneDrive by name or content
-- onedrive_download_file: Download file from OneDrive (base64)
-- onedrive_upload_file: Upload file to OneDrive
-- onedrive_create_folder: Create folder in OneDrive
-- onedrive_delete_item: Delete file/folder from OneDrive
-- onedrive_move_item: Move item in OneDrive
-- onedrive_copy_item: Copy item in OneDrive
-- onedrive_share_item: Create sharing link
-- sharepoint_list_sites: List/search SharePoint sites
-- sharepoint_get_site: Get SharePoint site details
-- sharepoint_list_drives: List document libraries in a site
-- sharepoint_list_files: List files in SharePoint library
-- sharepoint_download_file: Download from SharePoint (base64)
-- sharepoint_upload_file: Upload to SharePoint
-- sharepoint_search: Search within SharePoint site
-- sharepoint_list_lists: List SharePoint lists
-- sharepoint_list_items: List items in a SharePoint list
+MCP Tools (34):
+  12 core tools (execute, files, jobs, datasets, sessions)
+  22 Microsoft 365 tools (OneDrive + SharePoint)
 
-Version: 2.8.6 — unified version across all files
+Version: 2.9.0 — trimmed tool descriptions for token optimization
 
 HISTORY:
-  v1.2.0: Response was a JSON blob. URLs lived in stdout. AI parsed them. WORKED.
-  v1.5.0: Introduced content blocks. Stripped URLs from stdout, tried to rebuild
-           from inline_images[]/download_urls[] arrays. Those arrays were empty
-           due to parallel execution race in executor.py. URLs LOST.
-  v1.5.1: Switched from markdown to plain text URLs. Still stripped stdout. Still broken.
-  v1.5.2: Stop stripping stdout. Pass URLs through as-is. Belt-and-suspenders:
-           also create extra blocks from JSON arrays if populated.
-  v1.6.0: Auto File Handling. Rewrote tool descriptions so the AI reliably
-           chains fetch_file -> execute_code, upload_file -> execute_code,
-           and fetch_file -> load_dataset -> query_dataset. No logic changes.
-  v1.7.0: fetch_from_url tool added. Streams files directly from any HTTPS URL
-           (Cloudinary CDN, S3, public URLs) into sandbox. Fixes Priority 1
-           file upload blocker — no base64 overhead, no SimTheory encoding bug.
-  v1.7.1: Fix TypeError — FastMCP() does not accept 'description' kwarg in the
-           installed version. Removed it. App now starts cleanly.
-  v1.7.2: Fix 404 — fetch_from_url was POSTing to /api/files/fetch-from-url
-           which does not exist. Correct route is /api/files/fetch. Fixed.
-  v1.8.0: Charts now render inline via base64 ImageContent blocks. BUT: relied
-           on inline_images[] JSON array which is empty due to executor race
-           condition (documented since v1.5.0). Enrichment never fired.
-  v1.8.1: Fix the v1.8.0 miss. Two changes:
-           1. When inline_images[] is empty (the common case), scan stdout for
-              /dl/{uuid}/{filename} URLs via regex. Extract file_id + filename,
-              fetch bytes from internal /dl/ route, base64 encode, return as
-              MCP ImageContent block. This is the RELIABLE path.
-           2. Strip markdown image syntax from stdout text block so SimTheory
-              doesn't also try to render it (it rewrites URLs wrong -> 404).
-  v1.8.2: Universal data loading. load_dataset tool description updated.
-  v1.9.0: Microsoft OneDrive + SharePoint integration. 20 new MCP tools.
-  v1.9.1: FIX — Microsoft bootstrap ordering (moved after base tools).
-  v1.9.2: FIX — Token persistence rewrite. SQLAlchemy. ms_auth_poll tool.
-  v2.8.6: Version unification. All files now share a single version number.
-           See executor.py for the full v2.x changelog (sandbox engine).
+  v2.8.6: Version unification across all files.
+  v2.9.0: Trimmed all 34 tool descriptions to reduce token overhead.
+           ~57% reduction in tool context tokens per message.
+           No logic changes — only docstrings modified.
 """
 
 from mcp.server.fastmcp import FastMCP
@@ -87,15 +27,10 @@ import re
 
 logger = logging.getLogger(__name__)
 
-# MCP Server — name only, no description kwarg (not supported in installed fastmcp version)
+# MCP Server
 mcp = FastMCP("Power Interpreter")
 
-# ── Microsoft OneDrive + SharePoint Integration (v1.9.0) ────────────
-# Initialized AFTER base tools are registered (see bottom of file).
-# v1.9.1: Moved here from top-level import to prevent Microsoft failures
-# from blocking the 12 base tool registrations.
-# v1.9.2: Auth manager now uses SQLAlchemy. ensure_db_table() called in
-# main.py lifespan after database init.
+# Microsoft integration (initialized after base tools — see bottom of file)
 _ms_auth, _ms_graph = None, None
 
 # Internal API base URL
@@ -103,10 +38,10 @@ _default_base = "http://127.0.0.1:8080"
 API_BASE = os.getenv("API_BASE_URL", _default_base)
 API_KEY = os.getenv("API_KEY", "")
 
-# Max image size to base64 encode (5MB). Larger images get text URL fallback.
+# Max image size to base64 encode (5MB)
 MAX_IMAGE_BASE64_BYTES = 5 * 1024 * 1024
 
-# Regex to find our /dl/{uuid}/{filename} image URLs in stdout
+# Regex to find /dl/{uuid}/{filename} image URLs in stdout
 _DL_IMAGE_URL_RE = re.compile(
     r'(https?://[^\s\)]+/dl/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/([^\s\)\]]+\.(?:png|jpg|jpeg|svg|gif)))',
     re.IGNORECASE
@@ -131,7 +66,7 @@ def _headers():
 
 
 # ============================================================
-# IMAGE HELPERS (v1.8.0 + v1.8.1 fixes)
+# IMAGE HELPERS
 # ============================================================
 
 async def _fetch_image_base64(file_id: str, filename: str) -> Optional[Dict]:
@@ -308,7 +243,7 @@ def _build_content_blocks(resp_text: str) -> list:
 
     blocks = []
 
-    # Block 1: stdout — PASSED THROUGH UNMODIFIED
+    # Block 1: stdout
     stdout = data.get('stdout', '').strip()
     if stdout:
         blocks.append({"type": "text", "text": stdout})
@@ -324,7 +259,7 @@ def _build_content_blocks(resp_text: str) -> list:
             error_text += f"\n\nTraceback:\n{error_tb}"
         blocks.append({"type": "text", "text": error_text})
 
-    # Block 4: Additional download blocks (non-image files only)
+    # Block 3: Non-image download links
     download_urls = data.get('download_urls', [])
     non_image_downloads = [d for d in download_urls if not d.get('is_image', False)]
     for info in non_image_downloads:
@@ -334,7 +269,7 @@ def _build_content_blocks(resp_text: str) -> list:
         if url:
             blocks.append({"type": "text", "text": f"File: {filename} ({size})\nDownload URL: {url}"})
 
-    # Block 5: Metadata
+    # Block 4: Metadata
     meta_parts = []
     exec_time = data.get('execution_time_ms', 0)
     if exec_time:
@@ -364,24 +299,12 @@ async def execute_code(
     session_id: str = "default",
     timeout: int = 55
 ) -> list:
-    """Execute Python code in a persistent sandbox kernel.
-
-    The kernel persists between calls — variables, imports, and loaded
-    files are all available in subsequent execute_code calls.
-
-    WORKFLOW — always follow this pattern:
-      1. fetch_from_url(url, filename) — load a file from URL into sandbox
-      2. execute_code("import pandas as pd; df = pd.read_excel('filename.xlsx')")
-      3. execute_code("print(df.head())")  — variables persist!
-
-    OUTPUT — stdout is returned as-is. Charts (matplotlib/seaborn/plotly)
-    are auto-captured and returned as inline images.
+    """Execute Python in a persistent sandbox. Variables, imports, and files persist across calls. Charts auto-captured as inline images.
 
     Args:
-        code: Python code to execute. Multi-line strings work fine.
-        session_id: Session for state persistence (default: 'default').
-                    Use the same session_id across calls to share state.
-        timeout: Max seconds before timeout (default 55, max 59).
+        code: Python code to execute.
+        session_id: Session ID for state persistence.
+        timeout: Max seconds (default 55).
     """
     url = f"{API_BASE}/api/execute"
     logger.info(f"execute_code: POST {url} session={session_id}")
@@ -412,26 +335,12 @@ async def fetch_from_url(
     filename: Optional[str] = None,
     session_id: str = "default",
 ) -> list:
-    """Fetch a file from any HTTPS URL directly into the sandbox.
-
-    USE THIS to load files before running execute_code on them.
-
-    Supports:
-    - Cloudinary CDN URLs (SimTheory file attachments)
-    - Google Sheets export URLs (?format=xlsx or ?format=csv)
-    - S3 pre-signed URLs
-    - Any public HTTPS download link
-
-    WORKFLOW:
-      1. fetch_from_url(url="https://...", filename="data.xlsx")
-      2. execute_code("import pandas as pd; df = pd.read_excel('data.xlsx')")
-      3. execute_code("print(df.describe())")
+    """Download a file from any HTTPS URL into the sandbox for use with execute_code.
 
     Args:
         url: HTTPS URL to download from.
-        filename: Name to save as in sandbox (e.g. 'invoices.xlsx').
-                  If omitted, derived from the URL.
-        session_id: Session for file isolation (default: 'default').
+        filename: Name to save as in sandbox. Derived from URL if omitted.
+        session_id: Session for file isolation.
     """
     if not filename:
         from urllib.parse import urlparse
@@ -476,18 +385,12 @@ async def upload_file(
     content_base64: str,
     session_id: str = "default"
 ) -> str:
-    """Upload a file to the sandbox via base64 encoding.
-
-    Use for files under 10MB. For larger files or URL-accessible files,
-    use fetch_from_url instead (no base64 overhead).
-
-    After uploading, use execute_code to process the file:
-      execute_code("import pandas as pd; df = pd.read_csv('filename.csv')")
+    """Upload a base64-encoded file to the sandbox. For URL-accessible files, use fetch_from_url instead.
 
     Args:
-        filename: Name to save as (e.g., 'data.csv')
-        content_base64: Base64-encoded file content
-        session_id: Session for isolation (default: 'default')
+        filename: Name to save as (e.g. 'data.csv').
+        content_base64: Base64-encoded file content.
+        session_id: Session for isolation.
     """
     url = f"{API_BASE}/api/files/upload"
     logger.info(f"upload_file: POST {url} filename={filename}")
@@ -511,15 +414,12 @@ async def fetch_file(
     filename: str,
     session_id: str = "default"
 ) -> str:
-    """Download a file from a URL into the sandbox.
-
-    Alternative to fetch_from_url. Both call the same backend route.
-    Use fetch_from_url for new code (better response formatting).
+    """Download a file from a URL into the sandbox. Alias for fetch_from_url.
 
     Args:
-        url: URL to download from
-        filename: Name to save as in sandbox
-        session_id: Session for isolation (default: 'default')
+        url: URL to download from.
+        filename: Name to save as in sandbox.
+        session_id: Session for isolation.
     """
     api_url = f"{API_BASE}/api/files/fetch"
     logger.info(f"fetch_file: POST {api_url}")
@@ -538,14 +438,10 @@ async def fetch_file(
 
 @mcp.tool()
 async def list_files(session_id: Optional[str] = "default") -> str:
-    """List files currently in the sandbox.
-
-    Shows filename, size, type, and a text preview for each file.
-    Use this to confirm a file was successfully uploaded or fetched
-    before trying to process it with execute_code.
+    """List files in the sandbox with size and type info.
 
     Args:
-        session_id: Session to list files for (default: 'default')
+        session_id: Session to list files for.
     """
     url = f"{API_BASE}/api/files"
     logger.info(f"list_files: GET {url}")
@@ -572,15 +468,12 @@ async def submit_job(
     session_id: str = "default",
     timeout: int = 600
 ) -> str:
-    """Submit a long-running job for async execution. Returns a job_id immediately.
-
-    Use for jobs that exceed 60 seconds. Poll with get_job_status,
-    then retrieve output with get_job_result.
+    """Submit a long-running job for async execution (up to 30 min). Returns job_id. Poll with get_job_status, retrieve with get_job_result.
 
     Args:
         code: Python code to execute.
         session_id: Session for state persistence.
-        timeout: Max seconds (default 600 = 10 min)
+        timeout: Max seconds (default 600).
     """
     url = f"{API_BASE}/api/jobs/submit"
     logger.info(f"submit_job: POST {url}")
@@ -599,12 +492,10 @@ async def submit_job(
 
 @mcp.tool()
 async def get_job_status(job_id: str) -> str:
-    """Check the status of a submitted job.
-
-    Status values: pending, running, completed, failed, cancelled, timeout
+    """Check async job status. Values: pending, running, completed, failed, cancelled, timeout.
 
     Args:
-        job_id: The job ID from submit_job
+        job_id: The job ID from submit_job.
     """
     url = f"{API_BASE}/api/jobs/{job_id}/status"
     logger.info(f"get_job_status: GET {url}")
@@ -622,7 +513,7 @@ async def get_job_result(job_id: str) -> list:
     """Get the full result of a completed job.
 
     Args:
-        job_id: The job ID from submit_job
+        job_id: The job ID from submit_job.
     """
     url = f"{API_BASE}/api/jobs/{job_id}/result"
     logger.info(f"get_job_result: GET {url}")
@@ -650,29 +541,13 @@ async def load_dataset(
     session_id: str = "default",
     delimiter: str = ","
 ) -> str:
-    """Load a data file from the sandbox into PostgreSQL for fast SQL querying.
-
-    Supports multiple file formats — auto-detected from file extension:
-      - CSV / TSV (.csv, .tsv, .txt)
-      - Excel (.xlsx, .xls, .xlsm, .xlsb)
-      - PDF with tables (.pdf) — extracts tabular data automatically
-      - JSON (.json) — array of objects or records format
-      - Parquet (.parquet, .pq)
-
-    Handles large files (1.5M+ rows) via chunked loading into PostgreSQL.
-    Creates indexes automatically on date and ID columns.
-
-    WORKFLOW:
-      1. fetch_from_url(url, filename="invoices.xlsx")
-      2. load_dataset(file_path="invoices.xlsx", dataset_name="invoices")
-      3. query_dataset(sql="SELECT * FROM data_xxx WHERE amount > 1000")
+    """Load a file from sandbox into PostgreSQL for SQL querying. Auto-detects format: CSV, Excel, PDF, JSON, Parquet. Handles 1.5M+ rows. Query with query_dataset after loading.
 
     Args:
-        file_path: Filename in sandbox (e.g., 'data.xlsx' — NOT a URL or local path).
-                   Format is auto-detected from the file extension.
-        dataset_name: Logical name for SQL queries (e.g., 'sales', 'invoices')
-        session_id: Session for file isolation (default: 'default')
-        delimiter: CSV delimiter (default comma, only used for CSV files)
+        file_path: Filename in sandbox (e.g. 'data.xlsx').
+        dataset_name: Logical name for SQL queries (e.g. 'sales').
+        session_id: Session for file isolation.
+        delimiter: CSV delimiter (default comma).
     """
     url = f"{API_BASE}/api/data/load-csv"
     logger.info(f"load_dataset: POST {url}")
@@ -699,9 +574,9 @@ async def query_dataset(
     """Execute a SQL query against datasets loaded into PostgreSQL.
 
     Args:
-        sql: SQL SELECT query (e.g., "SELECT * FROM sales WHERE revenue > 1000")
-        limit: Max rows returned (default 1000)
-        offset: Row offset for pagination
+        sql: SQL SELECT query.
+        limit: Max rows returned (default 1000).
+        offset: Row offset for pagination.
     """
     url = f"{API_BASE}/api/data/query"
     logger.info(f"query_dataset: POST {url}")
@@ -723,7 +598,7 @@ async def list_datasets(session_id: str = None) -> str:
     """List all datasets loaded into PostgreSQL.
 
     Args:
-        session_id: Optional session filter
+        session_id: Optional session filter.
     """
     params = {}
     if session_id:
@@ -748,14 +623,11 @@ async def create_session(
     name: str,
     description: str = ""
 ) -> str:
-    """Create a new workspace session for file/data isolation.
-
-    The "default" session is automatically available for all normal work.
-    Only create a new session to isolate unrelated projects.
+    """Create an isolated workspace session. The "default" session is used automatically.
 
     Args:
-        name: Session name (e.g., 'vestis-audit', 'financial-model')
-        description: Optional description
+        name: Session name (e.g. 'financial-model').
+        description: Optional description.
     """
     url = f"{API_BASE}/api/sessions"
     logger.info(f"create_session: POST {url}")

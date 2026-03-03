@@ -10,7 +10,7 @@ MCP Tools (33):
 - get_job_result: Get completed job output
 - upload_file: Upload a file (base64) to sandbox
 - fetch_file: Download a file from URL to sandbox
-- fetch_from_url: ★ Load file from CDN/URL directly into sandbox
+- fetch_from_url: Load file from CDN/URL directly into sandbox
 - list_files: List sandbox files
 - load_dataset: Load data file into PostgreSQL (CSV, Excel, PDF, JSON, Parquet)
 - query_dataset: SQL query against datasets
@@ -38,7 +38,7 @@ MCP Tools (33):
 - sharepoint_list_lists: List SharePoint lists
 - sharepoint_list_items: List items in a SharePoint list
 
-Version: 1.9.2 - fix: token persistence, auth poll, memory guard
+Version: 2.8.6 — unified version across all files
 
 HISTORY:
   v1.2.0: Response was a JSON blob. URLs lived in stdout. AI parsed them. WORKED.
@@ -68,32 +68,12 @@ HISTORY:
               MCP ImageContent block. This is the RELIABLE path.
            2. Strip markdown image syntax from stdout text block so SimTheory
               doesn't also try to render it (it rewrites URLs wrong -> 404).
-           Evidence from v1.8.0 smoke test logs:
-             - "Built 2 content blocks" = only text, no images (inline_images was empty)
-             - "GET /charts/chart-test-v180/chart_001.png 404" = SimTheory rewrote URL
-  v1.8.2: Universal data loading. load_dataset tool description updated to
-           reflect that the backend now auto-detects file format from extension:
-           CSV, Excel (.xlsx/.xls), PDF (table extraction), JSON, Parquet.
-           No more "Load a CSV file" — it loads ANY supported format.
-           Backend: data_manager.py uses detect_format() + format-specific readers.
-           The /api/data/load-csv endpoint is preserved as backwards-compatible alias.
-  v1.9.0: Microsoft OneDrive + SharePoint integration. 20 new MCP tools for
-           file management across OneDrive and SharePoint via Microsoft Graph API.
-           Uses device code OAuth flow. Tokens persisted to Postgres.
-           Safe init — skips gracefully if AZURE_TENANT_ID/AZURE_CLIENT_ID not set.
-           Railway env vars: AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET.
-  v1.9.1: FIX — Microsoft bootstrap was at lines 102-103, BEFORE the 12 base
-           @mcp.tool() decorators. If the import failed, the entire module crashed
-           and ZERO base tools registered. Moved Microsoft init to BOTTOM of file
-           (after all 12 base tools) and wrapped in try/except. Now a Microsoft
-           failure can never take down the core tools.
-  v1.9.2: FIX — Token persistence rewrite. auth_manager now uses SQLAlchemy
-           instead of asyncpg (db_pool was never passed, tokens lost on every
-           redeploy). Added ms_auth_poll tool (explicit two-step auth flow).
-           Removed fire-and-forget asyncio.create_task() from ms_auth_start.
-           Added is_authenticated_async() that checks Postgres.
-           Added ensure_db_table() call in main.py lifespan.
-           Added memory_guard.py for subprocess memory isolation.
+  v1.8.2: Universal data loading. load_dataset tool description updated.
+  v1.9.0: Microsoft OneDrive + SharePoint integration. 20 new MCP tools.
+  v1.9.1: FIX — Microsoft bootstrap ordering (moved after base tools).
+  v1.9.2: FIX — Token persistence rewrite. SQLAlchemy. ms_auth_poll tool.
+  v2.8.6: Version unification. All files now share a single version number.
+           See executor.py for the full v2.x changelog (sandbox engine).
 """
 
 from mcp.server.fastmcp import FastMCP
@@ -127,15 +107,12 @@ API_KEY = os.getenv("API_KEY", "")
 MAX_IMAGE_BASE64_BYTES = 5 * 1024 * 1024
 
 # Regex to find our /dl/{uuid}/{filename} image URLs in stdout
-# Matches: https://power-interpreter-production.up.railway.app/dl/f675f421-4c1c-4418-9c81-0c916c2afff7/chart_001.png
-# Also matches: http://127.0.0.1:8080/dl/... (internal)
 _DL_IMAGE_URL_RE = re.compile(
     r'(https?://[^\s\)]+/dl/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/([^\s\)\]]+\.(?:png|jpg|jpeg|svg|gif)))',
     re.IGNORECASE
 )
 
 # Regex to strip markdown image syntax from stdout
-# Matches: ![anything](url)  and also plain "Generated charts:\n\n" prefix
 _MARKDOWN_IMAGE_RE = re.compile(
     r'!\[[^\]]*\]\([^\)]*\.(?:png|jpg|jpeg|svg|gif)\)',
     re.IGNORECASE
@@ -158,15 +135,7 @@ def _headers():
 # ============================================================
 
 async def _fetch_image_base64(file_id: str, filename: str) -> Optional[Dict]:
-    """Fetch image bytes from internal /dl/ route, return MCP ImageContent block.
-
-    Uses the internal API_BASE (127.0.0.1:8080) to avoid going through
-    the public Railway domain. The /dl/ route is unauthenticated.
-
-    Returns:
-        {"type": "image", "data": "<base64>", "mimeType": "image/png"}
-        or None if fetch fails.
-    """
+    """Fetch image bytes from internal /dl/ route, return MCP ImageContent block."""
     from urllib.parse import quote
     encoded_filename = quote(filename)
     internal_url = f"{API_BASE}/dl/{file_id}/{encoded_filename}"
@@ -176,20 +145,13 @@ async def _fetch_image_base64(file_id: str, filename: str) -> Optional[Dict]:
             resp = await client.get(internal_url)
 
             if resp.status_code != 200:
-                logger.warning(
-                    f"Image fetch failed: {internal_url} -> HTTP {resp.status_code}"
-                )
+                logger.warning(f"Image fetch failed: {internal_url} -> HTTP {resp.status_code}")
                 return None
 
-            # Check size before encoding
             if len(resp.content) > MAX_IMAGE_BASE64_BYTES:
-                logger.warning(
-                    f"Image too large for base64: {filename} "
-                    f"({len(resp.content)} bytes > {MAX_IMAGE_BASE64_BYTES})"
-                )
+                logger.warning(f"Image too large for base64: {filename} ({len(resp.content)} bytes)")
                 return None
 
-            # Determine MIME type from response or filename
             content_type = resp.headers.get('content-type', '')
             if 'png' in content_type or filename.lower().endswith('.png'):
                 mime = 'image/png'
@@ -201,17 +163,9 @@ async def _fetch_image_base64(file_id: str, filename: str) -> Optional[Dict]:
                 mime = content_type.split(';')[0].strip() or 'image/png'
 
             b64 = base64.b64encode(resp.content).decode('utf-8')
+            logger.info(f"Image base64 encoded: {filename} ({len(resp.content)} bytes -> {len(b64)} chars, {mime})")
 
-            logger.info(
-                f"Image base64 encoded: {filename} "
-                f"({len(resp.content)} bytes -> {len(b64)} chars base64, {mime})"
-            )
-
-            return {
-                "type": "image",
-                "data": b64,
-                "mimeType": mime,
-            }
+            return {"type": "image", "data": b64, "mimeType": mime}
 
     except Exception as e:
         logger.warning(f"Image base64 fetch failed for {filename}: {e}")
@@ -219,14 +173,7 @@ async def _fetch_image_base64(file_id: str, filename: str) -> Optional[Dict]:
 
 
 def _extract_image_urls_from_stdout(stdout: str) -> List[Tuple[str, str, str]]:
-    """Extract /dl/{uuid}/{filename} image URLs from stdout text.
-
-    v1.8.1: This is the RELIABLE path. The executor appends chart URLs
-    to stdout as markdown: ![chart_001](https://.../dl/{uuid}/chart_001.png)
-    The inline_images[] JSON array is often empty due to a race condition.
-
-    Returns list of (full_url, file_id, filename) tuples.
-    """
+    """Extract /dl/{uuid}/{filename} image URLs from stdout text."""
     matches = _DL_IMAGE_URL_RE.findall(stdout)
     if matches:
         logger.info(f"Found {len(matches)} image URL(s) in stdout via regex")
@@ -236,30 +183,15 @@ def _extract_image_urls_from_stdout(stdout: str) -> List[Tuple[str, str, str]]:
 
 
 def _strip_image_markdown_from_text(text: str) -> str:
-    """Remove markdown image syntax and 'Generated charts:' prefix from text.
-
-    v1.8.1: We strip these because:
-    1. We're returning proper MCP ImageContent blocks (base64) instead
-    2. If we leave the markdown, SimTheory rewrites the URL wrong -> 404
-       Evidence: GET /charts/chart-test-v180/chart_001.png -> 404
-    """
+    """Remove markdown image syntax and 'Generated charts:' prefix from text."""
     cleaned = _MARKDOWN_IMAGE_RE.sub('', text)
     cleaned = _GENERATED_CHARTS_RE.sub('', cleaned)
-    # Clean up any leftover blank lines
     cleaned = re.sub(r'\n{3,}', '\n\n', cleaned).strip()
     return cleaned
 
 
 async def _enrich_blocks_with_images(blocks: list, resp_text: str) -> list:
-    """Replace text-based image URLs with native MCP ImageContent blocks.
-
-    v1.8.1 FIX: Two-path approach:
-      Path A: Use inline_images[] + download_urls[] from JSON (if populated)
-      Path B: Scan stdout for /dl/{uuid}/{filename} URLs via regex (RELIABLE)
-
-    After fetching images as base64, strip the markdown syntax from the
-    stdout text block so SimTheory doesn't also try to render it wrong.
-    """
+    """Replace text-based image URLs with native MCP ImageContent blocks."""
     try:
         data = json.loads(resp_text)
     except (json.JSONDecodeError, TypeError):
@@ -273,14 +205,11 @@ async def _enrich_blocks_with_images(blocks: list, resp_text: str) -> list:
     fallback_blocks = []
     images_found = False
 
-    # ------------------------------------------------------------------
-    # PATH A: Use inline_images[] + download_urls[] (v1.8.0 approach)
-    # ------------------------------------------------------------------
+    # PATH A: Use inline_images[] + download_urls[]
     if inline_images:
         logger.info(f"Path A: {len(inline_images)} inline_images in JSON")
         images_found = True
 
-        # Build file_id lookup from download_urls
         file_id_map = {}
         for dl in download_urls:
             if dl.get('is_image'):
@@ -303,7 +232,6 @@ async def _enrich_blocks_with_images(blocks: list, resp_text: str) -> list:
                     logger.info(f"Path A: image block created for {filename}")
                     continue
 
-            # Fallback: text URL
             if public_url:
                 fallback_blocks.append({
                     "type": "text",
@@ -311,9 +239,7 @@ async def _enrich_blocks_with_images(blocks: list, resp_text: str) -> list:
                 })
                 logger.warning(f"Path A: falling back to text URL for {filename}")
 
-    # ------------------------------------------------------------------
-    # PATH B: Scan stdout for /dl/ URLs (v1.8.1 — the RELIABLE path)
-    # ------------------------------------------------------------------
+    # PATH B: Scan stdout for /dl/ URLs (RELIABLE path)
     if not images_found and stdout:
         url_matches = _extract_image_urls_from_stdout(stdout)
 
@@ -327,18 +253,14 @@ async def _enrich_blocks_with_images(blocks: list, resp_text: str) -> list:
                     image_blocks.append(block)
                     logger.info(f"Path B: image block created for {filename}")
                 else:
-                    # Fallback: keep the public URL as text
                     fallback_blocks.append({
                         "type": "text",
                         "text": f"Chart: {filename}\nImage URL: {full_url}"
                     })
                     logger.warning(f"Path B: base64 fetch failed, text fallback for {filename}")
 
-    # ------------------------------------------------------------------
     # STRIP markdown image syntax from stdout text block
-    # ------------------------------------------------------------------
     if image_blocks and blocks:
-        # Find the stdout text block (always the first one) and clean it
         for i, block in enumerate(blocks):
             if block.get('type') == 'text':
                 original_text = block['text']
@@ -348,20 +270,14 @@ async def _enrich_blocks_with_images(blocks: list, resp_text: str) -> list:
                         blocks[i] = {"type": "text", "text": cleaned_text}
                         logger.info(f"Stripped image markdown from text block {i}")
                     else:
-                        # If stripping left nothing, remove the block entirely
                         blocks[i] = None
                         logger.info(f"Removed empty text block {i} after stripping")
-                # Only clean the first text block (stdout)
                 break
 
-        # Remove any None blocks
         blocks = [b for b in blocks if b is not None]
 
-    # ------------------------------------------------------------------
     # INSERT image blocks into response
-    # ------------------------------------------------------------------
     if image_blocks or fallback_blocks:
-        # Insert after first remaining text block (or at start if none)
         insert_pos = 0
         for i, block in enumerate(blocks):
             if block.get('type') == 'text':
@@ -384,20 +300,7 @@ async def _enrich_blocks_with_images(blocks: list, resp_text: str) -> list:
 # ============================================================
 
 def _build_content_blocks(resp_text: str) -> list:
-    """Build MCP content blocks from execute_code API response.
-
-    Returns a LIST of content blocks, not a JSON string.
-    main.py's tools/call handler will use these directly:
-      isinstance(result, list) -> content = result
-
-    CRITICAL DESIGN DECISION (v1.5.2):
-    We do NOT strip URLs from stdout HERE. Stdout is passed through as-is.
-    Image markdown stripping happens later in _enrich_blocks_with_images()
-    ONLY if we successfully create base64 ImageContent blocks to replace them.
-
-    v1.8.0: Removed Block 3 (inline_images text blocks).
-    v1.8.1: Images handled entirely by _enrich_blocks_with_images().
-    """
+    """Build MCP content blocks from execute_code API response."""
     try:
         data = json.loads(resp_text)
     except (json.JSONDecodeError, TypeError):
@@ -406,8 +309,6 @@ def _build_content_blocks(resp_text: str) -> list:
     blocks = []
 
     # Block 1: stdout — PASSED THROUGH UNMODIFIED
-    # (image markdown will be stripped later by _enrich_blocks_with_images
-    #  ONLY if base64 blocks are successfully created)
     stdout = data.get('stdout', '').strip()
     if stdout:
         blocks.append({"type": "text", "text": stdout})
@@ -423,15 +324,9 @@ def _build_content_blocks(resp_text: str) -> list:
             error_text += f"\n\nTraceback:\n{error_tb}"
         blocks.append({"type": "text", "text": error_text})
 
-    # Block 3: REMOVED (v1.8.0)
-    # Images handled by _enrich_blocks_with_images()
-
     # Block 4: Additional download blocks (non-image files only)
     download_urls = data.get('download_urls', [])
-    non_image_downloads = [
-        d for d in download_urls
-        if not d.get('is_image', False)
-    ]
+    non_image_downloads = [d for d in download_urls if not d.get('is_image', False)]
     for info in non_image_downloads:
         filename = info.get('filename', 'file')
         url = info.get('url', '')
@@ -452,7 +347,6 @@ def _build_content_blocks(resp_text: str) -> list:
     if meta_parts:
         blocks.append({"type": "text", "text": " | ".join(meta_parts)})
 
-    # Safety: always return at least one block
     if not blocks:
         blocks.append({"type": "text", "text": "Code executed successfully (no output)."})
 
@@ -499,13 +393,8 @@ async def execute_code(
                 json={"code": code, "session_id": session_id, "timeout": timeout}
             )
 
-            # Build text content blocks
             blocks = _build_content_blocks(resp.text)
-
-            # v1.8.1: Enrich with native image blocks (base64)
-            # Uses Path A (JSON arrays) or Path B (stdout regex)
             blocks = await _enrich_blocks_with_images(blocks, resp.text)
-
             return blocks
 
     except Exception as e:
@@ -544,13 +433,11 @@ async def fetch_from_url(
                   If omitted, derived from the URL.
         session_id: Session for file isolation (default: 'default').
     """
-    # Derive filename from URL if not provided
     if not filename:
         from urllib.parse import urlparse
         parsed = urlparse(url)
         filename = parsed.path.split('/')[-1].split('?')[0] or 'downloaded_file'
 
-    # FIXED v1.7.2: Call /api/files/fetch (correct route in files.py)
     api_url = f"{API_BASE}/api/files/fetch"
     logger.info(f"fetch_from_url: POST {api_url} url={url[:80]} filename={filename}")
 
@@ -743,12 +630,8 @@ async def get_job_result(job_id: str) -> list:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.get(url, headers=_headers())
 
-            # Build text blocks
             blocks = _build_content_blocks(resp.text)
-
-            # v1.8.1: Enrich with native image blocks (base64)
             blocks = await _enrich_blocks_with_images(blocks, resp.text)
-
             return blocks
 
     except Exception as e:
@@ -890,15 +773,10 @@ async def create_session(
 
 
 # ============================================================
-# MICROSOFT 365 INTEGRATION (v1.9.2)
+# MICROSOFT 365 INTEGRATION
 # ============================================================
-# v1.9.1 FIX: Registered AFTER all 12 base tools so a Microsoft
-# failure can never prevent the core tools from loading.
-#
-# v1.9.2 FIX: Removed db_pool param. Auth manager uses SQLAlchemy.
-#              Added ms_auth_poll tool (21 Microsoft tools total).
-#              Token persistence enabled via ensure_db_table() in lifespan.
-#              Removed fire-and-forget asyncio.create_task() from ms_auth_start.
+# Registered AFTER all 12 base tools so a Microsoft failure
+# can never prevent the core tools from loading.
 # ============================================================
 
 try:

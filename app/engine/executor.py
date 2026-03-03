@@ -1304,8 +1304,8 @@ class SandboxExecutor:
         CRITICAL FIX (v2.6): For 'import X.Y as Z', do NOT override Z
         if _lazy_import already set it correctly. Previously:
           import matplotlib.pyplot as plt
-          → _lazy_import sets plt = matplotlib.pyplot  ✓
-          → alias logic sets plt = matplotlib           ✗ (OVERWRITES!)
+          -> _lazy_import sets plt = matplotlib.pyplot  OK
+          -> alias logic sets plt = matplotlib           BAD (OVERWRITES!)
         
         Now: if the alias already exists in sandbox_globals after
         _lazy_import, we skip the alias override.

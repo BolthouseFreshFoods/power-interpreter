@@ -11,27 +11,17 @@ Features:
 - Pre-installed data science libraries
 - Persistent session state (kernel architecture)
 - Auto file storage in Postgres with public download URLs
-- Microsoft OneDrive + SharePoint integration (v1.9.0)
+- Microsoft OneDrive + SharePoint integration
 
 Author: Kaffer AI for Timothy Escamilla
-Version: 2.8.6
+Version: 2.9.0
 
 HISTORY:
-  v1.7.2: fetch_from_url route fix, stable release
-  v1.8.0: base64 ImageContent blocks in mcp_server.py (enrichment worked
-           but SimTheory doesn't render MCP image blocks)
-  v1.8.1: Added /charts/{session_id}/{filename} route. SimTheory constructs
-           image URLs at this path pattern. Previously 404'd because route
-           didn't exist. Now serves chart PNG bytes from Postgres with
-           correct Content-Type. Public endpoint, no auth (same as /dl/).
-           Evidence: "GET /charts/chart-test-v181/chart_001.png 404"
   v1.9.0: Microsoft OneDrive + SharePoint integration (20 new MCP tools).
-  v1.9.1: Fix Microsoft bootstrap ordering — moved init after base tools
-           so a Microsoft failure can never take down the 12 core tools.
-  v1.9.2: Fix Microsoft token persistence — SQLAlchemy rewrite, ensure_db_table
-           in lifespan, ms_auth_poll tool, memory guard module.
-  v2.8.6: Version unification. All files now share a single version number.
-           See executor.py for the full v2.x changelog (sandbox engine).
+  v1.9.1: Fix Microsoft bootstrap ordering — moved init after base tools.
+  v1.9.2: Fix Microsoft token persistence — SQLAlchemy rewrite.
+  v2.8.6: Version unification. All files share a single version number.
+  v2.9.0: Trimmed all 34 tool descriptions for token optimization (~57% reduction).
 """
 
 import logging
@@ -64,7 +54,7 @@ async def lifespan(app: FastAPI):
     """Application lifecycle management"""
     # --- STARTUP ---
     logger.info("="*60)
-    logger.info("Power Interpreter MCP v2.8.6 starting...")
+    logger.info("Power Interpreter MCP v2.9.0 starting...")
     logger.info("="*60)
 
     # Ensure directories exist
@@ -85,7 +75,7 @@ async def lifespan(app: FastAPI):
         logger.warning("No DATABASE_URL configured. Running without database.")
         logger.warning("Set DATABASE_URL to enable: jobs, sessions, datasets, file tracking")
 
-    # ── Initialize Microsoft token persistence (v1.9.2) ──────────
+    # ── Initialize Microsoft token persistence ──────────
     if db_ok:
         try:
             from app.mcp_server import _ms_auth
@@ -97,7 +87,6 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning(f"Microsoft token table setup failed: {e}")
             logger.warning("Microsoft auth will work but tokens won't persist across deploys")
-    # ── END Microsoft token persistence ──────────────────────────
 
     # Start periodic cleanup (jobs + expired sandbox files)
     cleanup_task = None
@@ -195,7 +184,7 @@ app = FastAPI(
         "Charts served at /charts/{session_id}/{filename}. "
         "Microsoft OneDrive + SharePoint integration."
     ),
-    version="2.8.6",
+    version="2.9.0",
     lifespan=lifespan,
     docs_url="/docs",
     redoc_url="/redoc",
@@ -212,31 +201,12 @@ app.add_middleware(
 
 
 # =============================================================================
-# CHART SERVING ROUTE (v1.8.1)
+# CHART SERVING ROUTE
 # =============================================================================
-# SimTheory constructs image URLs at:
-#   /charts/{session_id}/{filename}
-#
-# Evidence from logs:
-#   GET /charts/chart-test-v180/chart_001.png -> 404
-#   GET /charts/chart-test-v181/chart_001.png -> 404
-#
-# This route queries Postgres by session_id + filename and serves the
-# image bytes with correct Content-Type. Public, no auth (like /dl/).
-#
-# MUST be defined before /mcp mount to ensure FastAPI matches it.
-# =============================================================================
-
 
 @app.get("/charts/{session_id}/{filename}")
 async def serve_chart(session_id: str, filename: str):
-    """Serve chart images by session_id and filename.
-
-    SimTheory auto-constructs these URLs from MCP tool responses.
-    Looks up the most recent matching file in Postgres and serves it.
-
-    Public endpoint — no authentication required (same as /dl/).
-    """
+    """Serve chart images by session_id and filename. Public endpoint."""
     logger.info(f"Chart request: session={session_id} filename={filename}")
 
     try:
@@ -246,7 +216,6 @@ async def serve_chart(session_id: str, filename: str):
 
         factory = get_session_factory()
         async with factory() as db_session:
-            # Find the most recent file matching session_id + filename
             result = await db_session.execute(
                 select(SandboxFile)
                 .where(SandboxFile.session_id == session_id)
@@ -257,9 +226,7 @@ async def serve_chart(session_id: str, filename: str):
             file_record = result.scalar_one_or_none()
 
             if not file_record:
-                logger.warning(
-                    f"Chart not found: session={session_id} filename={filename}"
-                )
+                logger.warning(f"Chart not found: session={session_id} filename={filename}")
                 return JSONResponse(
                     status_code=404,
                     content={
@@ -268,7 +235,6 @@ async def serve_chart(session_id: str, filename: str):
                     }
                 )
 
-            # Determine Content-Type from filename or stored value
             content_type = getattr(file_record, 'content_type', None) or 'application/octet-stream'
             fname_lower = filename.lower()
             if fname_lower.endswith('.png'):
@@ -282,10 +248,8 @@ async def serve_chart(session_id: str, filename: str):
             elif fname_lower.endswith('.pdf'):
                 content_type = 'application/pdf'
 
-            # Get the binary data
             file_data = getattr(file_record, 'file_data', None)
             if file_data is None:
-                # Try alternate column name
                 file_data = getattr(file_record, 'data', None)
             if file_data is None:
                 file_data = getattr(file_record, 'content', None)
@@ -312,7 +276,7 @@ async def serve_chart(session_id: str, filename: str):
                 headers={
                     "Content-Disposition": f'inline; filename="{filename}"',
                     "Cache-Control": "public, max-age=3600",
-                    "X-Power-Interpreter": "chart-serve-v2.8.6",
+                    "X-Power-Interpreter": "chart-serve-v2.9.0",
                 }
             )
 
@@ -333,28 +297,13 @@ async def serve_chart(session_id: str, filename: str):
 # =============================================================================
 # DIRECT MCP JSON-RPC HANDLER (for SimTheory)
 # =============================================================================
-# SimTheory POSTs JSON-RPC to /mcp/sse without maintaining an SSE stream.
-# The SSE transport sends responses via the stream, not the HTTP body.
-# SimTheory expects the response IN the HTTP body.
-#
-# This handler bypasses the SSE transport entirely:
-# 1. Parses the JSON-RPC request
-# 2. Routes to the correct handler
-# 3. Calls tool functions directly
-# 4. Returns JSON-RPC response in the HTTP body
-#
-# MUST be defined BEFORE app.mount("/mcp", ...) so FastAPI matches it first.
-# GET /mcp/sse still goes to the SSE transport for standard MCP clients.
-# =============================================================================
 
 
 def _build_tool_schema(tool) -> dict:
     """Build the JSON Schema for a tool's input parameters."""
-    # Try to get schema from the tool object first
     if hasattr(tool, 'parameters') and tool.parameters:
         return tool.parameters
 
-    # Fall back to building from function signature
     fn = tool.fn if hasattr(tool, 'fn') else tool
     if not callable(fn):
         return {"type": "object", "properties": {}}
@@ -376,7 +325,6 @@ def _build_tool_schema(tool) -> dict:
                 str: "string",
             }
             ann = param.annotation
-            # Handle Optional types
             origin = getattr(ann, '__origin__', None)
             if origin is not None:
                 args = getattr(ann, '__args__', ())
@@ -401,7 +349,6 @@ def _build_tool_schema(tool) -> dict:
 def _get_tool_registry() -> dict:
     """Get all registered MCP tools as {name: tool_object}."""
     tools = {}
-    # FastMCP stores tools in _tool_manager._tools
     if hasattr(mcp, '_tool_manager') and hasattr(mcp._tool_manager, '_tools'):
         for name, tool in mcp._tool_manager._tools.items():
             tools[name] = tool
@@ -428,17 +375,13 @@ def _get_tools_list() -> list:
 
 
 def _validate_tool_args(fn, tool_args: dict, tool_name: str) -> str | None:
-    """
-    Validate that all required arguments are present before calling a tool.
-    Returns an error message string if validation fails, None if OK.
-    """
+    """Validate that all required arguments are present before calling a tool."""
     try:
         sig = inspect.signature(fn)
         missing = []
         for param_name, param in sig.parameters.items():
             if param_name in ('self', 'cls'):
                 continue
-            # If no default value, it's required
             if param.default is inspect.Parameter.empty:
                 if param_name not in tool_args:
                     missing.append(param_name)
@@ -448,19 +391,13 @@ def _validate_tool_args(fn, tool_args: dict, tool_name: str) -> str | None:
                 f"Please provide: {', '.join(missing)}"
             )
     except Exception:
-        pass  # If we can't inspect, let it through and fail naturally
+        pass
     return None
 
 
 @app.post("/mcp/sse")
 async def handle_mcp_jsonrpc(request: Request):
-    """
-    Direct MCP JSON-RPC handler for SimTheory.
-
-    Handles: initialize, notifications/initialized, tools/list,
-    tools/call, ping, and unknown methods.
-    """
-    # --- Parse body ---
+    """Direct MCP JSON-RPC handler for SimTheory."""
     try:
         body = await request.body()
         body_str = body.decode("utf-8", errors="replace")
@@ -475,7 +412,6 @@ async def handle_mcp_jsonrpc(request: Request):
             "id": None,
         }, status_code=400)
 
-    # --- Batch ---
     if isinstance(data, list):
         responses = []
         for item in data:
@@ -486,7 +422,6 @@ async def handle_mcp_jsonrpc(request: Request):
             return JSONResponse(content=responses)
         return Response(status_code=204)
 
-    # --- Single ---
     result = await _handle_single_jsonrpc(data)
     if result is None:
         return Response(status_code=204)
@@ -494,19 +429,19 @@ async def handle_mcp_jsonrpc(request: Request):
 
 
 async def _handle_single_jsonrpc(data: dict):
-    """Route a single JSON-RPC message. Returns dict or None for notifications."""
+    """Route a single JSON-RPC message."""
     method = data.get("method", "")
     msg_id = data.get("id")
     params = data.get("params", {})
 
     logger.info(f"MCP direct: method={method}  id={msg_id}")
 
-    # ---- Notifications (no id or notification method) ----
+    # Notifications
     if msg_id is None or method.startswith("notifications/"):
         logger.info(f"MCP direct: notification '{method}' ack")
         return None
 
-    # ---- initialize ----
+    # initialize
     if method == "initialize":
         logger.info("MCP direct: -> initialize response")
         return {
@@ -519,16 +454,16 @@ async def _handle_single_jsonrpc(data: dict):
                 },
                 "serverInfo": {
                     "name": "Power Interpreter",
-                    "version": "2.8.6",
+                    "version": "2.9.0",
                 },
             },
         }
 
-    # ---- ping ----
+    # ping
     if method == "ping":
         return {"jsonrpc": "2.0", "id": msg_id, "result": {}}
 
-    # ---- tools/list ----
+    # tools/list
     if method == "tools/list":
         tools = _get_tools_list()
         logger.info(f"MCP direct: -> {len(tools)} tools")
@@ -540,7 +475,7 @@ async def _handle_single_jsonrpc(data: dict):
             "result": {"tools": tools},
         }
 
-    # ---- tools/call ----
+    # tools/call
     if method == "tools/call":
         tool_name = params.get("name", "")
         tool_args = params.get("arguments", {})
@@ -559,10 +494,6 @@ async def _handle_single_jsonrpc(data: dict):
             tool = registry[tool_name]
             fn = tool.fn if hasattr(tool, 'fn') else tool
 
-            # ============================================================
-            # Validate required arguments BEFORE calling the function
-            # Prevents TypeError crashes when SimTheory sends empty args
-            # ============================================================
             validation_error = _validate_tool_args(fn, tool_args, tool_name)
             if validation_error:
                 logger.warning(f"MCP direct: {tool_name} argument validation failed: {validation_error}")
@@ -581,7 +512,6 @@ async def _handle_single_jsonrpc(data: dict):
             logger.info(f"MCP direct: {tool_name} returned {len(result_str)} chars")
             logger.info(f"MCP direct: result preview: {result_str[:300]}")
 
-            # Format as MCP content blocks
             if isinstance(result, str):
                 content = [{"type": "text", "text": result}]
             elif isinstance(result, dict):
@@ -608,7 +538,7 @@ async def _handle_single_jsonrpc(data: dict):
                 },
             }
 
-    # ---- Unknown method ----
+    # Unknown method
     logger.warning(f"MCP direct: unknown method '{method}'")
     return {
         "jsonrpc": "2.0",
@@ -625,8 +555,6 @@ async def _handle_single_jsonrpc(data: dict):
 app.include_router(health.router, tags=["Health"])
 
 # --- PUBLIC DOWNLOAD (no auth) ---
-# Files stored in Postgres via execute_code are served here.
-# URL format: /dl/{file_id} where file_id is a UUID
 app.include_router(
     download_router,
     prefix="/dl",
@@ -666,6 +594,4 @@ app.include_router(
 )
 
 # --- MCP SSE TRANSPORT (for standard MCP clients) ---
-# Still available at GET /mcp/sse for clients that use SSE properly.
-# POST /mcp/sse is intercepted by the direct handler above.
 app.mount("/mcp", mcp.sse_app())

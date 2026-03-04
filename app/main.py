@@ -14,7 +14,7 @@ Features:
 - Microsoft OneDrive + SharePoint integration (v1.9.0)
 
 Author: Kaffer AI for Timothy Escamilla
-Version: 2.9.0
+Version: 2.9.1
 
 HISTORY:
   v1.7.2: fetch_from_url route fix, stable release
@@ -23,6 +23,7 @@ HISTORY:
   v1.9.2: Token persistence rewrite (SQLAlchemy), ms_auth_poll tool
   v2.8.6: Version unification across all files
   v2.9.0: Trimmed all 34 tool descriptions for token optimization (~57% reduction)
+  v2.9.1: Smart error handling for empty execute_code args (Claude client-side bug)
 """
 
 import logging
@@ -55,7 +56,7 @@ async def lifespan(app: FastAPI):
     """Application lifecycle management"""
     # --- STARTUP ---
     logger.info("="*60)
-    logger.info("Power Interpreter MCP v2.9.0 starting...")
+    logger.info("Power Interpreter MCP v2.9.1 starting...")
     logger.info("="*60)
 
     # Ensure directories exist
@@ -185,7 +186,7 @@ app = FastAPI(
         "Charts served at /charts/{session_id}/{filename}. "
         "Microsoft OneDrive + SharePoint integration."
     ),
-    version="2.9.0",
+    version="2.9.1",
     lifespan=lifespan,
     docs_url="/docs",
     redoc_url="/redoc",
@@ -284,7 +285,7 @@ async def serve_chart(session_id: str, filename: str):
                 headers={
                     "Content-Disposition": f'inline; filename="{filename}"',
                     "Cache-Control": "public, max-age=3600",
-                    "X-Power-Interpreter": "chart-serve-v2.9.0",
+                    "X-Power-Interpreter": "chart-serve-v2.9.1",
                 }
             )
 
@@ -462,7 +463,7 @@ async def _handle_single_jsonrpc(data: dict):
                 },
                 "serverInfo": {
                     "name": "Power Interpreter",
-                    "version": "2.9.0",
+                    "version": "2.9.1",
                 },
             },
         }
@@ -504,12 +505,33 @@ async def _handle_single_jsonrpc(data: dict):
 
             validation_error = _validate_tool_args(fn, tool_args, tool_name)
             if validation_error:
-                logger.warning(f"MCP direct: {tool_name} argument validation failed: {validation_error}")
+                # ── Enhanced forensic logging (v2.9.1) ──────────────────
+                logger.warning(
+                    f"MCP direct: {tool_name} argument validation failed: {validation_error} | "
+                    f"Full params size: {len(json.dumps(params))} bytes | "
+                    f"Argument keys received: {list(tool_args.keys())} | "
+                    f"Arguments empty: {len(tool_args) == 0}"
+                )
+
+                # ── Smart error for execute_code with empty args (v2.9.1) ──
+                if tool_name == "execute_code" and len(tool_args) == 0:
+                    error_text = (
+                        "ERROR: No code was provided — the 'code' argument was empty. "
+                        "This typically happens when the code block is too large for a single tool call. "
+                        "Please try one of these approaches:\n"
+                        "1. Break your code into smaller sequential steps\n"
+                        "2. Write a shorter code snippet that saves to a .py file, then execute that file\n"
+                        "3. Simplify your approach — fewer lines per execution call\n"
+                        "4. If this keeps happening, start a fresh conversation to reset context"
+                    )
+                else:
+                    error_text = f"Error: {validation_error}"
+
                 return {
                     "jsonrpc": "2.0",
                     "id": msg_id,
                     "result": {
-                        "content": [{"type": "text", "text": f"Error: {validation_error}"}],
+                        "content": [{"type": "text", "text": error_text}],
                         "isError": True,
                     },
                 }

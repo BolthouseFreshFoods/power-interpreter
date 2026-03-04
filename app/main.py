@@ -23,7 +23,7 @@ HISTORY:
   v1.9.2: Token persistence rewrite (SQLAlchemy), ms_auth_poll tool
   v2.8.6: Version unification across all files
   v2.9.0: Trimmed all 34 tool descriptions for token optimization (~57% reduction)
-  v2.9.1: Smart error handling for empty execute_code args (Claude client-side bug)
+  v2.9.1: Smart error handling for empty execute_code args (model-agnostic)
 """
 
 import logging
@@ -514,6 +514,9 @@ async def _handle_single_jsonrpc(data: dict):
                 )
 
                 # ── Smart error for execute_code with empty args (v2.9.1) ──
+                # When an LLM sends execute_code with no arguments, this is
+                # typically caused by output token truncation on large code
+                # payloads. The actionable guidance helps the model self-correct.
                 if tool_name == "execute_code" and len(tool_args) == 0:
                     error_text = (
                         "ERROR: No code was provided — the 'code' argument was empty. "

@@ -3,7 +3,7 @@
 > **Source:** Production log analysis, 2026-03-06 (UTC 17:56 – 18:56)  
 > **Analyzed by:** Model Context Architect (MCA)  
 > **Status:** Staged — awaiting team smoke test completion before implementation  
-> **Branch:** `issues/performance-improvements`
+> **Branch:** `main`
 
 ---
 
@@ -18,10 +18,11 @@
 | 5 | [Cache tools/list manifest](#5-perf-pre-serialize-and-cache-toolslist-manifest) | Performance | Faster handshake | Low | Low |
 | 6 | [Consolidate SSE response](#6-perf-consolidate-execute_code-response-into-single-sse-message) | Performance | 1 fewer RT/call | Medium | Medium |
 | 7 | [Batch file processing](#7-feature-batch-file-processing-for-bulk-analysis-workflows) | Feature | **30-40x speedup** | Medium | Critical |
+| 8 | [Structured request logging](#8-observability-structured-request-logging-with-usersession-attribution) | Observability | Multi-user debugging | Low-Medium | High |
 
 ### Suggested Shipping Strategy
 
-- **Release 1 (Quick wins):** Items 1, 2, 3, 5 — low effort, no architectural changes, immediate value
+- **Release 1 (Quick wins):** Items 1, 2, 3, 5, 8 — low effort, no architectural changes, immediate value
 - **Release 2 (Infrastructure):** Items 4, 6 — transport and HTTP client layer changes, test carefully
 - **Release 3 (Feature):** Item 7 — highest-impact single change, needs design decisions
 
@@ -383,11 +384,119 @@ A new tool that downloads all files from a OneDrive folder into the sandbox in o
 
 ---
 
+## 8. [OBSERVABILITY] Structured request logging with user/session attribution
+
+**Type:** Observability  
+**Effort:** Low-Medium  
+**Priority:** High — required for multi-user debugging
+
+### Problem
+
+Railway HTTP-level logs provide **no user context**. The only information logged per request is:
+
+```
+INFO:     100.64.0.13:17452 - "POST /mcp/sse HTTP/1.1" 200 OK
+```
+
+This tells us: source IP (Railway's internal load balancer, not the actual user), HTTP method, path, and status code. It does **not** tell us:
+
+- **Which authenticated user's session** generated the request
+- **Which tool** was called (`resolve_share_link` vs `execute_code`)
+- **What parameters** were passed
+- A **session or correlation ID** to group related requests
+
+### Real-World Failure Case
+
+On 2026-03-06 at `18:34:23 UTC`, a `resolve_share_link` call returned `403 Forbidden` on a SharePoint path containing `/p/sherrill_reed/`. Without user attribution in the logs, it was **impossible to determine** whether:
+
+- **Marie's session** tried to access Sherrill's file (a permissions issue)
+- **Sherrill's own session** failed on an expired or malformed link
+- A **third user's session** triggered the call entirely
+- The **LLM hallucinated** a sharing link URL that doesn't exist
+
+The root cause attribution was based on **timing proximity between requests** — which is guesswork, not engineering.
+
+### Solution
+
+Add structured, tool-level logging that includes user and session context on every tool invocation:
+
+```python
+import hashlib
+import logging
+import json
+
+logger = logging.getLogger("power_interpreter")
+
+def log_tool_call(
+    session_id: str,
+    user_email: str | None,
+    tool_name: str,
+    status: str,
+    duration_ms: float,
+    error_code: int | None = None,
+    extra: dict | None = None
+):
+    """Structured log entry for every tool invocation."""
+    entry = {
+        "event": "tool_call",
+        "session_id": session_id[:8],  # Short ID for readability
+        "user": user_email or "anonymous",
+        "tool": tool_name,
+        "status": status,  # "success", "error", "timeout"
+        "duration_ms": round(duration_ms, 1),
+    }
+    if error_code:
+        entry["error_code"] = error_code
+    if extra:
+        entry.update(extra)
+
+    logger.info(json.dumps(entry))
+```
+
+### Example Output (What Railway Would Show)
+
+**Success case:**
+```json
+{"event": "tool_call", "session_id": "a8f3c1d2", "user": "marie.ludy@bolthousefresh.com", "tool": "execute_code", "status": "success", "duration_ms": 342.1}
+```
+
+**Error case (the 403 that caused confusion):**
+```json
+{"event": "tool_call", "session_id": "b7e2f4a1", "user": "sherrill_reed@bolthousefresh.com", "tool": "resolve_share_link", "status": "error", "error_code": 403, "duration_ms": 416.0, "share_url_hash": "a3f91a26c4b2"}
+```
+
+With this, the 403 investigation becomes: *"Sherrill's own session tried to resolve a link and got a 403 — expired link, not a cross-user access issue."* — **instant root cause, zero guessing.**
+
+### Privacy Considerations
+
+- **User email:** Already present in the authenticated session; logging it is consistent with the per-user auth model
+- **Share URLs:** Hashed (SHA-256 prefix) to enable correlation without exposing actual file paths
+- **Code content:** Never logged — only tool name, status, and duration
+- **Credentials:** Never logged — masked in existing startup logs (`***configured***`)
+
+### Implementation Scope
+
+Files to modify:
+- `mcp_server.py` — Add `log_tool_call()` wrapper around tool dispatch
+- `tools.py` — Pass session context to each tool handler
+- `main.py` — Ensure session ID and user email are propagated from SSE connection
+
+### Impact
+- **Instant root cause attribution** for any tool failure in multi-user environment
+- **Session-level request grouping** — see all actions by a single user in sequence
+- **Performance monitoring** — per-tool duration tracking without external APM
+- **Audit trail** — who accessed what, when (privacy-safe)
+- Directly prevents the guesswork that occurred during the 403 investigation
+
+---
+
 ## Appendix: Log Evidence
 
 - **Session date:** 2026-03-06
+- **Log window analyzed:** 17:56 – 23:14 UTC (full 3-hour production window)
 - **Active users observed:** Marie (via `marie.ludy@bolthousefresh.com`), Sherrill Reed (via `sherrill_reed@bolthousefresh.com`), plus additional concurrent sessions
 - **Total `execute_code` calls (Marie):** 27+ over ~15 minutes
 - **Success rate:** 100% — zero application errors
-- **Only real error:** `resolve_share_link` → 403 Forbidden on a scoped/expired SharePoint sharing link (permissions issue, not code)
-- **Railway severity misclassification:** 100% of Python `INFO` logs tagged as `error` due to stderr routing
+- **403 incident:** `resolve_share_link` on SharePoint path `/p/sherrill_reed/` — **user attribution unknown** due to lack of structured logging (see Change #8)
+- **Railway severity misclassification:** 100% of Python `INFO` logs tagged as `error` due to stderr routing (see Change #1)
+- **Deployment swap:** `948bd420` → `7a0f7d17` at 23:14 UTC — zero downtime, clean handoff

@@ -16,6 +16,7 @@ HISTORY:
            No logic changes — only docstrings modified.
   v2.9.1: Version alignment across all modules. Smart error handling
            for empty execute_code args. Kernel persistence patches.
+           Fixed MS tool count log (21→22).
 """
 
 from mcp.server.fastmcp import FastMCP
@@ -657,7 +658,7 @@ try:
     from app.microsoft.bootstrap import init_microsoft_tools
     _ms_auth, _ms_graph = init_microsoft_tools(mcp)
     if _ms_auth:
-        logger.info("Microsoft OneDrive + SharePoint integration: ENABLED (%s additional tools)", "21")
+        logger.info("Microsoft OneDrive + SharePoint integration: ENABLED (22 additional tools)")
     else:
         logger.info("Microsoft OneDrive + SharePoint integration: SKIPPED (no Azure credentials)")
 except Exception as e:

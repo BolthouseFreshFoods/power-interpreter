@@ -20,7 +20,7 @@ Power Interpreter is a Model Context Protocol (MCP) server that provides AI assi
 | **Data** | PostgreSQL storage, 1.5M+ row datasets, pandas/numpy |
 | **Files** | Upload, download, persistent storage with public URLs |
 | **Jobs** | Async queue for long-running operations (no timeouts) |
-| **Microsoft 365** | OneDrive + SharePoint integration (21 tools) |
+| **Microsoft 365** | OneDrive + SharePoint integration (22 tools) |
 | **Charts** | Auto-generated chart serving with persistent URLs |
 | **MCP** | Full MCP protocol support (SSE + JSON-RPC) |
 
@@ -41,62 +41,55 @@ SimTheory.ai ──► Power Interpreter MCP (Railway)
 
 ---
 
-## Tool Registry
+## MCP Tool Registry (34 tools)
 
-### Core Tools (22)
+All tools below are registered as MCP tools and callable by AI agents via the MCP protocol.
+
+### Core MCP Tools — 12 tools (mcp_server.py)
 
 | # | Tool | Description |
 |---|---|---|
-| 1 | `execute_code` | Execute Python code in sandboxed environment |
-| 2 | `upload_file` | Upload file to sandbox storage |
-| 3 | `download_file` | Download file from sandbox |
-| 4 | `list_files` | List files in sandbox directory |
-| 5 | `delete_file` | Delete a sandbox file |
-| 6 | `submit_job` | Submit async job for long-running operations |
+| 1 | `execute_code` | Execute Python in persistent sandbox |
+| 2 | `fetch_from_url` | Download file from HTTPS URL into sandbox |
+| 3 | `upload_file` | Upload base64-encoded file to sandbox |
+| 4 | `fetch_file` | Download file from URL (alias for fetch_from_url) |
+| 5 | `list_files` | List files in sandbox with size/type info |
+| 6 | `submit_job` | Submit long-running async job (up to 30 min) |
 | 7 | `get_job_status` | Check async job status |
 | 8 | `get_job_result` | Retrieve completed job results |
-| 9 | `cancel_job` | Cancel a running job |
-| 10 | `list_jobs` | List all jobs for a session |
-| 11 | `load_dataset` | Load large dataset into PostgreSQL |
-| 12 | `query_dataset` | Query dataset with SQL |
-| 13 | `list_datasets` | List available datasets |
-| 14 | `delete_dataset` | Delete a dataset |
-| 15 | `get_dataset_info` | Get dataset schema and stats |
-| 16 | `create_session` | Create new execution session |
-| 17 | `get_session` | Get session details |
-| 18 | `list_sessions` | List active sessions |
-| 19 | `delete_session` | Delete a session |
-| 20 | `fetch_from_url` | Fetch content from URL into sandbox |
-| 21 | `get_sandbox_status` | Get sandbox environment status |
-| 22 | `get_chart_url` | Get public URL for generated chart |
+| 9 | `load_dataset` | Load file into PostgreSQL for SQL querying |
+| 10 | `query_dataset` | Execute SQL against loaded datasets |
+| 11 | `list_datasets` | List datasets in PostgreSQL |
+| 12 | `create_session` | Create isolated workspace session |
 
-### Microsoft 365 Tools (21)
+### Microsoft 365 MCP Tools — 22 tools (microsoft/tools.py)
 
 | # | Tool | Description |
 |---|---|---|
-| 1 | `ms_auth` | Initiate Microsoft OAuth device code flow |
-| 2 | `ms_auth_poll` | Poll for OAuth completion |
-| 3 | `ms_auth_status` | Check current auth status |
-| 4 | `ms_logout` | Clear Microsoft tokens |
-| 5 | `sharepoint_list_sites` | List accessible SharePoint sites |
-| 6 | `sharepoint_get_site` | Get site details by name or URL |
-| 7 | `sharepoint_list_drives` | List document libraries for a site |
-| 8 | `sharepoint_list_files` | List files in a drive/folder |
-| 9 | `sharepoint_search_files` | Search files across SharePoint |
-| 10 | `sharepoint_download_file` | Download file to sandbox |
-| 11 | `sharepoint_upload_file` | Upload file from sandbox to SharePoint |
-| 12 | `sharepoint_create_folder` | Create folder in document library |
-| 13 | `sharepoint_delete_item` | Delete file or folder |
-| 14 | `sharepoint_move_item` | Move file or folder |
-| 15 | `sharepoint_copy_item` | Copy file or folder |
-| 16 | `sharepoint_get_file_info` | Get file metadata and properties |
-| 17 | `sharepoint_get_sharing_link` | Create sharing link for file |
-| 18 | `onedrive_list_files` | List files in user's OneDrive |
-| 19 | `onedrive_download_file` | Download from OneDrive to sandbox |
-| 20 | `onedrive_upload_file` | Upload from sandbox to OneDrive |
-| 21 | `onedrive_search` | Search files in OneDrive |
+| 1 | `ms_auth_status` | Check Microsoft 365 authentication status |
+| 2 | `ms_auth_start` | Start Microsoft device login flow |
+| 3 | `ms_auth_poll` | Complete Microsoft device login |
+| 4 | `resolve_share_link` | Resolve SharePoint/OneDrive sharing URL to file |
+| 5 | `onedrive_list_files` | List files and folders in OneDrive |
+| 6 | `onedrive_search` | Search OneDrive by name or content |
+| 7 | `onedrive_download_file` | Download file from OneDrive to sandbox |
+| 8 | `onedrive_upload_file` | Upload file to OneDrive (max 4MB) |
+| 9 | `onedrive_create_folder` | Create folder in OneDrive |
+| 10 | `onedrive_delete_item` | Delete file or folder from OneDrive |
+| 11 | `onedrive_move_item` | Move file or folder in OneDrive |
+| 12 | `onedrive_copy_item` | Copy file or folder in OneDrive |
+| 13 | `onedrive_share_item` | Create sharing link for OneDrive item |
+| 14 | `sharepoint_list_sites` | List or search accessible SharePoint sites |
+| 15 | `sharepoint_get_site` | Get details of a specific SharePoint site |
+| 16 | `sharepoint_list_drives` | List document libraries in a site |
+| 17 | `sharepoint_list_files` | List files in a document library |
+| 18 | `sharepoint_download_file` | Download file from SharePoint to sandbox |
+| 19 | `sharepoint_upload_file` | Upload file to SharePoint (max 4MB) |
+| 20 | `sharepoint_search` | Search files in a SharePoint site |
+| 21 | `sharepoint_list_lists` | List SharePoint lists in a site |
+| 22 | `sharepoint_list_items` | List items in a SharePoint list |
 
-**Total: 43 MCP tools**
+**Total: 34 MCP tools (12 core + 22 Microsoft)**
 
 ---
 
@@ -141,9 +134,8 @@ SimTheory.ai ──► Power Interpreter MCP (Railway)
 
 | Variable | Required | Description |
 |---|---|---|
-| `MS_CLIENT_ID` | Yes* | Azure AD app client ID |
-| `MS_TENANT_ID` | Yes* | Azure AD tenant ID |
-| `MS_CLIENT_SECRET` | No | For service principal auth |
+| `AZURE_CLIENT_ID` | Yes* | Azure AD app client ID |
+| `AZURE_TENANT_ID` | Yes* | Azure AD tenant ID |
 
 *Required only if Microsoft integration is enabled.
 
@@ -178,10 +170,10 @@ docker run -p 8080:8080 \
 
 | Version | Date | Changes |
 |---|---|---|
-| **v2.9.1** | 2026-03-04 | Smart error handling for empty execute_code args (model-agnostic) |
-| **v2.9.0** | 2026-03-03 | Trimmed all 34→43 tool descriptions for token optimization (~57% reduction) |
+| **v2.9.1** | 2026-03-04 | Smart error handling for empty execute_code args, version alignment, tool count fix |
+| **v2.9.0** | 2026-03-03 | Trimmed all 34 tool descriptions for token optimization (~57% reduction) |
 | **v1.9.2** | 2026-02-28 | Token persistence rewrite (SQLAlchemy), ms_auth_poll tool |
-| **v1.9.0** | 2026-02-27 | Microsoft OneDrive + SharePoint integration (20 new MCP tools) |
+| **v1.9.0** | 2026-02-27 | Microsoft OneDrive + SharePoint integration (22 new MCP tools) |
 | **v1.8.1** | 2026-02-25 | Chart serving route + inline base64 image blocks |
 | **v1.7.2** | 2026-02-23 | fetch_from_url route fix, stable release |
 | **v1.0.0** | 2026-02-14 | Initial release — Power Interpreter MCP v1.0 |
@@ -195,7 +187,7 @@ power-interpreter/
 ├── app/
 │   ├── __init__.py              # Package init + version (2.9.1)
 │   ├── main.py                  # FastAPI app, lifespan, MCP JSON-RPC handler
-│   ├── mcp_server.py            # MCP server setup + tool registration
+│   ├── mcp_server.py            # MCP server: 12 core tools + MS bootstrap
 │   ├── config.py                # Settings and environment config
 │   ├── auth.py                  # API key authentication
 │   ├── database.py              # PostgreSQL connection management
@@ -212,8 +204,8 @@ power-interpreter/
 │   ├── microsoft/
 │   │   ├── auth_manager.py      # Microsoft OAuth + token persistence
 │   │   ├── graph_client.py      # Microsoft Graph API client
-│   │   ├── tools.py             # SharePoint/OneDrive tool definitions
-│   │   ├── mcp_tools.py         # MCP tool wrappers
+│   │   ├── tools.py             # 22 SharePoint/OneDrive MCP tools
+│   │   ├── mcp_tools.py         # Deprecated redirect → tools.py
 │   │   └── bootstrap.py         # Microsoft integration bootstrap
 │   └── routes/
 │       ├── execute.py           # /api/execute endpoints

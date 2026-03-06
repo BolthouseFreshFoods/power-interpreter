@@ -19,12 +19,14 @@
 | 6 | [Consolidate SSE response](#6-perf-consolidate-execute_code-response-into-single-sse-message) | Performance | 1 fewer RT/call | Medium | Medium |
 | 7 | [Batch file processing](#7-feature-batch-file-processing-for-bulk-analysis-workflows) | Feature | **30-40x speedup** | Medium | Critical |
 | 8 | [Structured request logging](#8-observability-structured-request-logging-with-usersession-attribution) | Observability | Multi-user debugging | Low-Medium | High |
+| 9 | [Sandbox resilience & request queuing](#9-stability-sandbox-resilience-request-queuing-and-retry) | Stability | **Eliminates 500s** | Medium | **Critical** |
 
 ### Suggested Shipping Strategy
 
 - **Release 1 (Quick wins):** Items 1, 2, 3, 5, 8 — low effort, no architectural changes, immediate value
-- **Release 2 (Infrastructure):** Items 4, 6 — transport and HTTP client layer changes, test carefully
-- **Release 3 (Feature):** Item 7 — highest-impact single change, needs design decisions
+- **Release 2 (Stability):** Item 9 — critical for multi-user reliability, directly unblocks Marie
+- **Release 3 (Infrastructure):** Items 4, 6 — transport and HTTP client layer changes, test carefully
+- **Release 4 (Feature):** Item 7 — highest-impact single change, needs design decisions
 
 ---
 
@@ -490,13 +492,335 @@ Files to modify:
 
 ---
 
+## 9. [STABILITY] Sandbox resilience: request queuing and retry
+
+**Type:** Stability  
+**Effort:** Medium  
+**Priority:** Critical — users blocked by 500 errors
+
+### Problem
+
+On 2026-03-06 at approximately 11:30 AM Pacific, Marie experienced **repeated 500 Internal Server Errors** when performing basic sandbox operations (listing files, checking sandbox status). The failures were **intermittent** — one call would succeed, the next would fail with "Internal Server Error", then the next would succeed again.
+
+**User-visible behavior:**
+```
+✓ Listed all PDF files in the utility_analysis directory        → Success
+✗ Listed files in utility_analysis sandbox_data directory       → Internal Server Error
+✗ Checked if the code execution sandbox is active               → Internal Server Error
+✓ Listed all PDF files in the utility_analysis directory        → Success
+✗ Next call                                                     → Internal Server Error
+```
+
+The LLM assistant was forced to tell Marie: *"I'm going to be straight with you — the sandbox is experiencing heavy intermittent server errors right now."*
+
+**This is a production-blocking issue.** Marie was unable to complete her work.
+
+### Root Cause Analysis
+
+The sandbox is configured with:
+- **Max concurrent jobs:** 4
+- **Job timeout:** 1,800 seconds (30 minutes)
+- **Max memory:** 16,384 MB
+
+With Marie, Sherrill, and potentially other users active simultaneously at 11:30 AM, the likely causes are:
+
+1. **Concurrent job slot exhaustion** — All 4 job slots occupied. New requests get an immediate 500 instead of waiting for a slot to free up. No queuing, no backpressure, no retry.
+2. **Kernel crash without recovery** — If the Python kernel process crashes (OOM, segfault, or unhandled exception), subsequent requests to that kernel fail until the process is manually or automatically restarted. There is no health check → auto-restart cycle.
+3. **Database connection pool exhaustion** — Under concurrent load, PostgreSQL connections may max out, causing internal failures on token lookups or session management.
+4. **Sandbox file system pressure** — Multiple users accumulating files in `/app/sandbox_data` with 72-hour TTL can fill available disk space.
+
+### Solution
+
+#### A. Request Queue with Backpressure
+
+Instead of rejecting requests immediately when all job slots are full, implement an async queue that holds requests and processes them as slots become available:
+
+```python
+import asyncio
+from dataclasses import dataclass
+from typing import Any
+
+@dataclass
+class QueuedJob:
+    """A job waiting for a sandbox slot."""
+    session_id: str
+    tool_name: str
+    params: dict
+    future: asyncio.Future
+    enqueued_at: float
+
+class SandboxJobQueue:
+    """
+    Async job queue with backpressure for sandbox execution.
+    Instead of returning 500 when slots are full, jobs wait in a
+    bounded queue with a configurable timeout.
+    """
+
+    def __init__(
+        self,
+        max_concurrent: int = 4,
+        max_queue_size: int = 20,
+        queue_timeout: float = 30.0,  # Max seconds to wait in queue
+    ):
+        self._semaphore = asyncio.Semaphore(max_concurrent)
+        self._queue: asyncio.Queue[QueuedJob] = asyncio.Queue(maxsize=max_queue_size)
+        self._max_concurrent = max_concurrent
+        self._queue_timeout = queue_timeout
+        self._active_jobs = 0
+        self._total_queued = 0
+        self._total_processed = 0
+        self._total_timeout = 0
+
+    async def submit(self, func, *args, **kwargs) -> Any:
+        """
+        Submit a job for execution. Waits for an available slot
+        up to queue_timeout seconds before raising TimeoutError.
+        """
+        try:
+            # Try to acquire a slot immediately
+            acquired = self._semaphore._value > 0
+            if not acquired:
+                self._total_queued += 1
+                logger.info(json.dumps({
+                    "event": "job_queued",
+                    "active_jobs": self._active_jobs,
+                    "queue_depth": self._queue.qsize(),
+                    "max_concurrent": self._max_concurrent,
+                }))
+
+            # Wait for a slot with timeout
+            async with asyncio.timeout(self._queue_timeout):
+                await self._semaphore.acquire()
+
+            self._active_jobs += 1
+            try:
+                result = await func(*args, **kwargs)
+                self._total_processed += 1
+                return result
+            finally:
+                self._active_jobs -= 1
+                self._semaphore.release()
+
+        except TimeoutError:
+            self._total_timeout += 1
+            logger.warning(json.dumps({
+                "event": "job_queue_timeout",
+                "active_jobs": self._active_jobs,
+                "queue_depth": self._queue.qsize(),
+                "timeout_seconds": self._queue_timeout,
+            }))
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "sandbox_busy",
+                    "message": f"All {self._max_concurrent} sandbox slots are occupied. "
+                               f"Request waited {self._queue_timeout}s. Please retry.",
+                    "retry_after": 5,
+                    "active_jobs": self._active_jobs,
+                }
+            )
+
+    @property
+    def stats(self) -> dict:
+        return {
+            "active_jobs": self._active_jobs,
+            "max_concurrent": self._max_concurrent,
+            "total_processed": self._total_processed,
+            "total_queued": self._total_queued,
+            "total_timeouts": self._total_timeout,
+        }
+```
+
+**Key behaviors:**
+- Requests **wait** for a slot instead of failing immediately
+- Bounded queue (20) prevents unbounded memory growth
+- Configurable timeout (30s) — if a slot doesn't free up in 30 seconds, return `503 Service Unavailable` (not `500 Internal Server Error`) with a `retry_after` hint
+- The LLM receives a structured, actionable error instead of an opaque 500
+
+#### B. Kernel Health Check and Auto-Recovery
+
+Add a heartbeat mechanism that detects a dead kernel and restarts it before the next request:
+
+```python
+import asyncio
+import time
+
+class KernelHealthMonitor:
+    """
+    Monitors the sandbox kernel process and auto-restarts
+    if it becomes unresponsive.
+    """
+
+    def __init__(self, kernel_manager, check_interval: float = 10.0):
+        self._kernel = kernel_manager
+        self._check_interval = check_interval
+        self._last_healthy = time.monotonic()
+        self._restart_count = 0
+        self._running = False
+
+    async def start(self):
+        """Start the background health check loop."""
+        self._running = True
+        asyncio.create_task(self._health_loop())
+
+    async def _health_loop(self):
+        while self._running:
+            try:
+                is_alive = await self._check_kernel_health()
+                if is_alive:
+                    self._last_healthy = time.monotonic()
+                else:
+                    await self._restart_kernel(reason="health_check_failed")
+            except Exception as e:
+                logger.error(json.dumps({
+                    "event": "kernel_health_error",
+                    "error": str(e),
+                }))
+                await self._restart_kernel(reason="health_check_exception")
+
+            await asyncio.sleep(self._check_interval)
+
+    async def _check_kernel_health(self) -> bool:
+        """Send a lightweight probe to the kernel."""
+        try:
+            result = await asyncio.wait_for(
+                self._kernel.execute("1+1"),  # Minimal probe
+                timeout=5.0
+            )
+            return result is not None
+        except (asyncio.TimeoutError, Exception):
+            return False
+
+    async def _restart_kernel(self, reason: str):
+        """Kill and restart the kernel process."""
+        self._restart_count += 1
+        logger.warning(json.dumps({
+            "event": "kernel_restart",
+            "reason": reason,
+            "restart_count": self._restart_count,
+            "seconds_since_healthy": round(time.monotonic() - self._last_healthy, 1),
+        }))
+        await self._kernel.restart()
+        self._last_healthy = time.monotonic()
+
+    async def ensure_healthy(self):
+        """
+        Called before each tool execution.
+        If kernel is dead, restart it immediately rather than
+        letting the request fail with 500.
+        """
+        is_alive = await self._check_kernel_health()
+        if not is_alive:
+            await self._restart_kernel(reason="pre_request_check")
+```
+
+#### C. Graceful 503 Instead of 500
+
+Change error responses from opaque `500 Internal Server Error` to structured `503 Service Unavailable` with retry guidance:
+
+```python
+# Before (opaque 500 — LLM can't reason about it):
+HTTP 500 Internal Server Error
+{"detail": "Internal server error"}
+
+# After (structured 503 — LLM can wait and retry):
+HTTP 503 Service Unavailable
+{
+    "error": "sandbox_busy",
+    "message": "All 4 sandbox slots are occupied. Request waited 30s. Please retry.",
+    "retry_after": 5,
+    "active_jobs": 4,
+    "queue_stats": {
+        "total_processed": 142,
+        "total_queued": 23,
+        "total_timeouts": 1
+    }
+}
+```
+
+This lets the LLM tell the user: *"The sandbox is busy with other requests. I'll retry in a few seconds."* instead of *"Internal Server Error."*
+
+#### D. Integration — Request Flow
+
+```
+User request arrives
+        │
+        ▼
+┌─────────────────┐
+│ SandboxJobQueue  │  Is a slot available?
+│   .submit()      │
+└────────┬────────┘
+         │
+    ┌────┴────┐
+    │ YES     │ NO → Wait up to 30s → Timeout? → 503 + retry_after
+    │         │
+    ▼         │
+┌─────────────┴───┐
+│ KernelHealth     │  Is the kernel alive?
+│ .ensure_healthy()│
+└────────┬────────┘
+         │
+    ┌────┴────┐
+    │ YES     │ NO → Auto-restart kernel → Proceed
+    │         │
+    ▼         ▼
+┌─────────────────┐
+│ Execute tool     │  Run the actual operation
+│ (execute_code,   │
+│  list_files, etc)│
+└────────┬────────┘
+         │
+         ▼
+    Return result
+```
+
+### Implementation Scope
+
+Files to modify:
+- `main.py` — Initialize `SandboxJobQueue` and `KernelHealthMonitor` at startup
+- `mcp_server.py` — Wrap tool dispatch in `queue.submit()` and `health.ensure_healthy()`
+- New file: `queue.py` — `SandboxJobQueue` class
+- New file: `health.py` — `KernelHealthMonitor` class
+
+### Configuration (Environment Variables)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SANDBOX_MAX_CONCURRENT` | 4 | Max simultaneous sandbox jobs |
+| `SANDBOX_QUEUE_SIZE` | 20 | Max jobs waiting in queue |
+| `SANDBOX_QUEUE_TIMEOUT` | 30 | Seconds to wait for a slot |
+| `KERNEL_HEALTH_INTERVAL` | 10 | Seconds between health checks |
+| `KERNEL_HEALTH_TIMEOUT` | 5 | Seconds before probe is considered failed |
+
+### Testing Strategy
+
+1. **Simulate full slots:** Start 4 long-running `execute_code` jobs, send a 5th — verify it queues and completes when a slot frees
+2. **Simulate queue timeout:** Fill all slots and queue, send requests that exceed `queue_timeout` — verify 503 with retry guidance
+3. **Simulate kernel death:** Kill the kernel process, send a request — verify auto-restart and successful execution
+4. **Concurrent user simulation:** Run 3 simulated user sessions with interleaved tool calls — verify no 500s
+
+### Impact
+- **Eliminates the 500 Internal Server Errors** that blocked Marie
+- Users see *"busy, retrying"* instead of *"error"*
+- Kernel crashes are self-healing — no manual intervention needed
+- Queue stats provide visibility into concurrency pressure
+- LLM receives structured errors it can reason about and retry
+
+### Risk Assessment
+- **Low risk:** Queue is bounded (20 max), timeout is bounded (30s), no unbounded resource consumption
+- **Backward compatible:** Requests that previously succeeded immediately still succeed immediately — the queue only activates when slots are full
+- **Observable:** All queue events and kernel restarts are logged (pairs with Change #8)
+
+---
+
 ## Appendix: Log Evidence
 
 - **Session date:** 2026-03-06
-- **Log window analyzed:** 17:56 – 23:14 UTC (full 3-hour production window)
+- **Log window analyzed:** 11:30 AM Pacific (user report) + 17:56 – 23:14 UTC (full 3-hour production window)
 - **Active users observed:** Marie (via `marie.ludy@bolthousefresh.com`), Sherrill Reed (via `sherrill_reed@bolthousefresh.com`), plus additional concurrent sessions
 - **Total `execute_code` calls (Marie):** 27+ over ~15 minutes
-- **Success rate:** 100% — zero application errors
+- **Success rate (code execution):** 100% — zero application errors
+- **500 errors (sandbox operations):** Multiple intermittent failures at ~11:30 AM Pacific on file listing and sandbox status checks (see Change #9)
 - **403 incident:** `resolve_share_link` on SharePoint path `/p/sherrill_reed/` — **user attribution unknown** due to lack of structured logging (see Change #8)
 - **Railway severity misclassification:** 100% of Python `INFO` logs tagged as `error` due to stderr routing (see Change #1)
-- **Deployment swap:** `948bd420` → `7a0f7d17` at 23:14 UTC — zero downtime, clean handoff
+- **Deployment swap:** `948bd420` → `7a0f7d17` → `e1d924b7` — zero downtime, clean handoffs

@@ -24,26 +24,39 @@ Power Interpreter bridges AI assistants (via Simtheory.ai or any MCP-compatible 
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│  Simtheory.ai / MCP Client                               │
-│  (POST /mcp/sse — JSON-RPC direct)                       │
-└──────────────┬───────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│  Simtheory.ai / MCP Client                                   │
+│  (POST /mcp/sse — JSON-RPC direct)                           │
+└──────────────┬───────────────────────────────────────────────┘
                │
                ▼
-┌──────────────────────────────────────────────────────────┐
-│  Power Interpreter MCP Server (FastAPI + Uvicorn)         │
-│                                                           │
-│  ┌─────────────┐  ┌──────────────┐  ┌─────────────────┐  │
-│  │ mcp_server   │  │ tools        │  │ bootstrap       │  │
-│  │ (22 tools)   │  │ (OneDrive/SP)│  │ (kernel init)   │  │
-│  └──────┬──────┘  └──────┬───────┘  └────────┬────────┘  │
-│         │                │                    │           │
-│         ▼                ▼                    ▼           │
-│  ┌─────────────────────────────────────────────────────┐  │
-│  │  Python Sandbox Kernel (/usr/local/bin/python3)     │  │
-│  │  Max Memory: 16 GB  │  Max Jobs: 4  │  Timeout: 30m │  │
-│  └─────────────────────────────────────────────────────┘  │
-└──────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│  Power Interpreter MCP Server (FastAPI + Uvicorn)             │
+│                                                               │
+│  ┌─────────────┐  ┌──────────────┐  ┌─────────────────┐      │
+│  │ mcp_server   │  │ tools        │  │ bootstrap       │      │
+│  │ (22 tools)   │  │ (OneDrive/SP)│  │ (kernel init)   │      │
+│  └──────┬──────┘  └──────┬───────┘  └────────┬────────┘      │
+│         │                │                    │               │
+│         ▼                ▼                    ▼               │
+│  ┌────────────────────────────────────────────────────────┐   │
+│  │  SandboxJobQueue (Change #9)                           │   │
+│  │  Async request queue with backpressure                 │   │
+│  │  Max concurrent: 4  │  Queue: 20  │  Timeout: 30s     │   │
+│  └────────────────────────┬───────────────────────────────┘   │
+│                           │                                   │
+│                           ▼                                   │
+│  ┌────────────────────────────────────────────────────────┐   │
+│  │  KernelHealthMonitor (Change #9)                       │   │
+│  │  Heartbeat probe │ Auto-restart on failure             │   │
+│  └────────────────────────┬───────────────────────────────┘   │
+│                           │                                   │
+│                           ▼                                   │
+│  ┌────────────────────────────────────────────────────────┐   │
+│  │  Python Sandbox Kernel (/usr/local/bin/python3)        │   │
+│  │  Max Memory: 16 GB  │  Max Jobs: 4  │  Timeout: 30m   │   │
+│  └────────────────────────────────────────────────────────┘   │
+└──────────────────────────────────────────────────────────────┘
                │                    │
                ▼                    ▼
      ┌──────────────┐     ┌──────────────────┐
@@ -131,7 +144,7 @@ power-interpreter/
 ├── .env.example         # Environment variable template
 ├── migrations/          # Database migrations (PostgreSQL)
 └── docs/
-    └── CHANGE-REQUESTS.md  # Staged performance improvements (8 items)
+    └── CHANGE-REQUESTS.md  # Staged improvements (9 items)
 ```
 
 ---
@@ -171,6 +184,11 @@ The server is deployed on Railway with auto-deploy on push to `main`.
 | `AZURE_CLIENT_ID` | Yes | Microsoft Entra app registration client ID |
 | `AZURE_TENANT_ID` | Yes | Microsoft Entra tenant ID |
 | `SIMTHEORY_AUTH_TOKEN` | No | Simtheory.ai MCP registration token |
+| `SANDBOX_MAX_CONCURRENT` | No | Max simultaneous sandbox jobs (default: 4) |
+| `SANDBOX_QUEUE_SIZE` | No | Max jobs waiting in queue (default: 20) |
+| `SANDBOX_QUEUE_TIMEOUT` | No | Seconds to wait for a slot (default: 30) |
+| `KERNEL_HEALTH_INTERVAL` | No | Seconds between health checks (default: 10) |
+| `KERNEL_HEALTH_TIMEOUT` | No | Seconds before probe fails (default: 5) |
 
 ---
 
@@ -182,9 +200,44 @@ The server is deployed on Railway with auto-deploy on push to `main`.
 | File TTL | 72 hours |
 | Max execution time | 300 seconds |
 | Max memory | 16,384 MB (16 GB) |
-| Max concurrent jobs | 4 |
+| Max concurrent jobs | 4 (configurable via `SANDBOX_MAX_CONCURRENT`) |
+| Job queue depth | 20 (configurable via `SANDBOX_QUEUE_SIZE`) |
+| Queue timeout | 30 seconds (configurable via `SANDBOX_QUEUE_TIMEOUT`) |
 | Job timeout | 1,800 seconds (30 minutes) |
 | Sandbox directory | `/app/sandbox_data` |
+
+---
+
+## Resilience Model (Staged — Change #9)
+
+Power Interpreter is designed to handle concurrent multi-user load gracefully:
+
+```
+Request arrives
+      │
+      ▼
+┌─────────────────┐
+│ SandboxJobQueue  │  Slot available?
+└────────┬────────┘
+    ┌────┴────┐
+    │ YES     │ NO → Wait up to 30s → Timeout? → 503 + retry_after
+    ▼         │
+┌─────────────┴───┐
+│ KernelHealth     │  Kernel alive?
+└────────┬────────┘
+    ┌────┴────┐
+    │ YES     │ NO → Auto-restart → Proceed
+    ▼         ▼
+┌─────────────────┐
+│ Execute tool     │
+└────────┬────────┘
+         ▼
+    Return result
+```
+
+- **No more 500s** from slot exhaustion — requests queue and wait
+- **Self-healing kernel** — crashed kernels restart automatically
+- **Structured 503** — LLM receives actionable retry guidance instead of opaque errors
 
 ---
 
@@ -201,18 +254,28 @@ Power Interpreter is registered as an MCP tool in the GROW by Bolthouse Fresh wo
 
 ## Staged Improvements
 
-See [`docs/CHANGE-REQUESTS.md`](docs/CHANGE-REQUESTS.md) for 8 staged performance and observability improvements identified from production log analysis:
+See [`docs/CHANGE-REQUESTS.md`](docs/CHANGE-REQUESTS.md) for 9 staged performance, observability, and stability improvements identified from production log analysis:
 
-| # | Change | Priority |
-|---|--------|----------|
-| 1 | stderr → stdout logging fix | High |
-| 2 | Single-call file download | High |
-| 3 | Trim response payload | High |
-| 4 | httpx connection pooling | Medium |
-| 5 | Cache tools/list manifest | Low |
-| 6 | Consolidate SSE response | Medium |
-| 7 | Batch file processing | Critical |
-| 8 | Structured request logging | High |
+| # | Change | Type | Priority |
+|---|--------|------|----------|
+| 1 | stderr → stdout logging fix | Bug Fix | High |
+| 2 | Single-call file download | Performance | High |
+| 3 | Trim response payload | Performance | High |
+| 4 | httpx connection pooling | Performance | Medium |
+| 5 | Cache tools/list manifest | Performance | Low |
+| 6 | Consolidate SSE response | Performance | Medium |
+| 7 | Batch file processing | Feature | Critical |
+| 8 | Structured request logging | Observability | High |
+| 9 | Sandbox resilience & request queuing | Stability | Critical |
+
+### Shipping Strategy
+
+| Release | Items | Focus |
+|---------|-------|-------|
+| **Release 1** | 1, 2, 3, 5, 8 | Quick wins — logging, download speed, observability |
+| **Release 2** | 9 | Stability — eliminates 500 errors under concurrent load |
+| **Release 3** | 4, 6 | Infrastructure — transport and HTTP client optimization |
+| **Release 4** | 7 | Feature — batch processing (30-40x speedup) |
 
 ---
 

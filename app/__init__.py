@@ -6,10 +6,12 @@ A robust, sandboxed Python execution environment with:
 - File management with persistent storage
 - Pre-installed data science libraries
 - MCP protocol support for SimTheory.ai
+- Microsoft OneDrive + SharePoint integration
+- Persistent kernel architecture (session state across calls)
 
 Author: Kaffer AI for Timothy Escamilla
-Version: 1.0.0
+Version: 2.9.1
 """
 
-__version__ = "1.0.0"
+__version__ = "2.9.1"
 __author__ = "Kaffer AI"

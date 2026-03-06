@@ -7,13 +7,15 @@ MCP Tools (34):
   12 core tools (execute, files, jobs, datasets, sessions)
   22 Microsoft 365 tools (OneDrive + SharePoint)
 
-Version: 2.9.0 — trimmed tool descriptions for token optimization
+Version: 2.9.1 — version alignment + kernel persistence patches
 
 HISTORY:
   v2.8.6: Version unification across all files.
   v2.9.0: Trimmed all 34 tool descriptions to reduce token overhead.
            ~57% reduction in tool context tokens per message.
            No logic changes — only docstrings modified.
+  v2.9.1: Version alignment across all modules. Smart error handling
+           for empty execute_code args. Kernel persistence patches.
 """
 
 from mcp.server.fastmcp import FastMCP

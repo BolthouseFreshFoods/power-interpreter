@@ -1,172 +1,254 @@
-# Power Interpreter MCP
+# 🔌 Power Interpreter MCP
 
-A Model Context Protocol (MCP) server that provides AI assistants with Python code execution, file management, data analysis, and Microsoft 365 integration (OneDrive + SharePoint).
+**v2.9.1** — General-purpose sandboxed Python execution engine with PostgreSQL storage, async job queue, and large dataset support (1.5M+ rows). Deployed on Railway for SimTheory.ai integration.
 
-Built for [SimTheory.ai](https://simtheory.ai) — deployed on [Railway](https://railway.app).
-
-## Version
-
-**v2.9.0** — March 2026
-
-> Version unified across all files as of v2.8.6. Previously the MCP server layer
-> (main.py, mcp_server.py) and the sandbox engine (executor.py) had independent
-> version numbers. Now there is ONE version for the entire service.
-
-## MCP Tools (34 total)
-
-### Core Tools (12)
-| Tool | Description |
-|------|-------------|
-| `execute_code` | Run Python in a persistent sandbox kernel (variables persist across calls) |
-| `submit_job` | Submit long-running jobs (async, up to 30 min) |
-| `get_job_status` | Check async job progress |
-| `get_job_result` | Retrieve completed job output |
-| `upload_file` | Upload file to sandbox (base64) |
-| `fetch_file` | Download file from URL to sandbox |
-| `fetch_from_url` | Stream file from any HTTPS URL into sandbox (CDN, S3, Google Sheets) |
-| `list_files` | List sandbox files |
-| `load_dataset` | Load data into PostgreSQL (CSV, Excel, PDF, JSON, Parquet) |
-| `query_dataset` | SQL query against loaded datasets |
-| `list_datasets` | List loaded datasets |
-| `create_session` | Create isolated workspace session |
-
-### Microsoft 365 Tools (22)
-| Tool | Description |
-|------|-------------|
-| `ms_auth_status` | Check Microsoft 365 auth status |
-| `ms_auth_start` | Start device code login flow |
-| `ms_auth_poll` | Complete device code login |
-| `resolve_share_link` | Resolve SharePoint/OneDrive sharing URL → metadata + sandbox download |
-| `onedrive_list_files` | List files/folders in OneDrive |
-| `onedrive_search` | Search OneDrive by name or content |
-| `onedrive_download_file` | Download from OneDrive → sandbox |
-| `onedrive_upload_file` | Upload to OneDrive |
-| `onedrive_create_folder` | Create folder in OneDrive |
-| `onedrive_delete_item` | Delete file/folder |
-| `onedrive_move_item` | Move item |
-| `onedrive_copy_item` | Copy item |
-| `onedrive_share_item` | Create sharing link |
-| `sharepoint_list_sites` | List/search SharePoint sites |
-| `sharepoint_get_site` | Get site details |
-| `sharepoint_list_drives` | List document libraries |
-| `sharepoint_list_files` | List files in library |
-| `sharepoint_download_file` | Download from SharePoint → sandbox |
-| `sharepoint_upload_file` | Upload to SharePoint |
-| `sharepoint_search` | Search within SharePoint site |
-| `sharepoint_list_lists` | List SharePoint lists |
-| `sharepoint_list_items` | List items in a list |
-
-## Key Features
-
-### Sandbox Engine
-- **Persistent kernels** — variables, imports, and loaded files survive across calls
-- **Import allowlist** — pandas, numpy, matplotlib, seaborn, plotly, scipy, sklearn, statsmodels, openpyxl, reportlab, python-docx, and more
-- **Path normalization** — auto-fixes /tmp/ paths, doubled session prefixes, Windows paths
-- **Read-only upload access** — sandbox can read uploaded files from SimTheory
-- **Chart auto-capture** — matplotlib/plotly figures captured via plt.show() interception
-- **Timeout floor** — minimum 100s execution time, AI cannot override below this
-- **File auto-storage** — generated files stored in Postgres with public download URLs
-
-### Microsoft 365 Integration
-- **Device code OAuth 2.0** with token persistence to Postgres
-- **OneDrive** — full CRUD (list, search, upload, download, move, copy, share)
-- **SharePoint** — sites, document libraries, lists, search, upload/download
-- **Share link resolution** — paste a sharing URL, get the file in sandbox automatically
-- **Optional user_id** — auto-resolves from last authenticated user
-
-### Architecture
-- **Runtime**: FastAPI + Uvicorn on Railway
-- **Database**: PostgreSQL (datasets, tokens, job state, file storage)
-- **MCP Transport**: SSE (standard clients) + direct JSON-RPC (SimTheory)
-- **Charts**: Inline base64 ImageContent blocks
-- **Files**: Direct sandbox write from OneDrive/SharePoint downloads
-
-## File Structure
-
-```
-app/
-├── main.py                    # FastAPI app + lifespan + JSON-RPC handler
-├── mcp_server.py              # MCP tool definitions (12 core tools)
-├── config.py                  # Settings
-├── database.py                # SQLAlchemy async engine
-├── microsoft/
-│   ├── __init__.py
-│   ├── auth_manager.py        # OAuth token management
-│   ├── bootstrap.py           # Init + registration
-│   ├── graph_client.py        # Microsoft Graph API client
-│   ├── tools.py               # 22 MCP tool registrations ← CANONICAL
-│   └── mcp_tools.py           # DEPRECATED redirect → tools.py
-├── engine/
-│   ├── executor.py            # Sandbox code execution engine
-│   ├── kernel_manager.py      # Persistent kernel sessions
-│   ├── data_manager.py        # Dataset loading
-│   ├── file_manager.py        # File I/O management
-│   ├── job_manager.py         # Async job queue
-│   └── memory_guard.py        # Memory isolation
-├── routes/
-│   ├── execute.py             # /api/execute
-│   ├── files.py               # /api/files/*
-│   ├── jobs.py                # /api/jobs/*
-│   ├── data.py                # /api/data/*
-│   ├── sessions.py            # /api/sessions
-│   └── health.py              # /health
-└── data_manager.py            # Dataset loading (CSV, Excel, PDF, JSON, Parquet)
-```
-
-## Environment Variables
-
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `API_KEY` | Yes | API key for MCP authentication |
-| `DATABASE_URL` | Yes | PostgreSQL connection string |
-| `AZURE_TENANT_ID` | For Microsoft | Azure AD tenant ID |
-| `AZURE_CLIENT_ID` | For Microsoft | Azure AD app client ID |
-| `AZURE_CLIENT_SECRET` | For Microsoft | Azure AD app client secret |
-| `SANDBOX_DIR` | No | Override sandbox directory (default: `/app/sandbox_data`) |
-| `PUBLIC_URL` | No | Public URL for download links |
-
-## Deployment
-
-Deployed on Railway with automatic deploys from `main` branch.
-
-```bash
-# Health check
-curl https://power-interpreter-production-6396.up.railway.app/health
-
-# MCP SSE endpoint (for SimTheory)
-POST https://power-interpreter-production-6396.up.railway.app/mcp/sse
-```
-
-## Version History
-
-> As of v2.8.6, the MCP server and sandbox engine share a single version number.
-> Earlier versions used separate numbering (v1.x for MCP server, v2.x for engine).
-
-| Version | Date | Changes |
-|---------|------|---------|
-| **v2.9.0** | **Mar 2026** | **Trimmed all 34 tool descriptions for ~57% token reduction per message. No logic changes.** |
-| v2.8.6 | Mar 2026 | Timeout floor (100s minimum), version unification across all files |
-| v2.8.5 | Mar 2026 | python-docx + transitive dependency support (zipfile, lxml, xml, etc.) |
-| v2.8.4 | Mar 2026 | datetime module injection fix (preserved as MODULE, not class) |
-| v2.8.3 | Mar 2026 | /app/sandbox_data recognized in allowed read paths |
-| v2.8.2 | Mar 2026 | Read-only upload access (sandbox reads SimTheory uploads) |
-| v2.8.1 | Mar 2026 | /tmp/ path interception (redirect absolute paths to sandbox) |
-| v2.8.0 | Mar 2026 | Defensive path normalization (session prefix doubling fix) |
-| v2.7.0 | Mar 2026 | reportlab + matplotlib PDF backend support |
-| v2.6.0 | Mar 2026 | Inline chart rendering (matplotlib/plotly auto-capture) |
-| v2.1.0 | Feb 2026 | Auto file storage in Postgres with download URLs |
-| v2.0.0 | Feb 2026 | Persistent session state (kernel architecture) |
-| *v1.9.4* | *Mar 2026* | *Optional user_id on MS tools, resolve_share_link, file consolidation* |
-| *v1.9.3* | *Mar 2026* | *Sandbox file bridge for OneDrive/SharePoint downloads* |
-| *v1.9.2* | *Mar 2026* | *Token persistence rewrite (SQLAlchemy), ms_auth_poll* |
-| *v1.9.0* | *Feb 2026* | *Microsoft OneDrive + SharePoint integration (20 tools)* |
-| *v1.8.2* | *Feb 2026* | *Universal data loading (CSV, Excel, PDF, JSON, Parquet)* |
-| *v1.8.1* | *Feb 2026* | *Inline chart images via base64 ImageContent blocks* |
-| *v1.7.0* | *Jan 2026* | *fetch_from_url tool for direct CDN/URL downloads* |
-| *v1.6.0* | *Jan 2026* | *Auto file handling workflow improvements* |
-
-*Italicized entries are from the legacy v1.x MCP server numbering (pre-unification).*
+> **Author:** Kaffer AI for Timothy Escamilla  
+> **Organization:** Bolthouse Fresh Foods / New Carrot Farms LLC  
+> **Platform:** [SimTheory.ai](https://simtheory.ai) MCP Integration
 
 ---
 
-*Built by Timothy Escamilla for Bolthouse Fresh Foods / New Carrot Farms LLC*
+## Overview
+
+Power Interpreter is a Model Context Protocol (MCP) server that provides AI assistants with Python code execution, file management, data analysis, and Microsoft 365 integration capabilities — all running in a secure sandboxed environment.
+
+### Key Capabilities
+
+| Category | Features |
+|---|---|
+| **Code Execution** | Sandboxed Python with pre-installed data science libraries |
+| **Data** | PostgreSQL storage, 1.5M+ row datasets, pandas/numpy |
+| **Files** | Upload, download, persistent storage with public URLs |
+| **Jobs** | Async queue for long-running operations (no timeouts) |
+| **Microsoft 365** | OneDrive + SharePoint integration (21 tools) |
+| **Charts** | Auto-generated chart serving with persistent URLs |
+| **MCP** | Full MCP protocol support (SSE + JSON-RPC) |
+
+---
+
+## Architecture
+
+```
+SimTheory.ai ──► Power Interpreter MCP (Railway)
+                    ├── Sandbox Executor (Python)
+                    ├── Kernel Manager (persistent sessions)
+                    ├── Job Manager (async queue)
+                    ├── File Manager (Postgres + /dl/ URLs)
+                    ├── Data Manager (1.5M+ row datasets)
+                    ├── Microsoft Graph Client (OneDrive/SharePoint)
+                    └── PostgreSQL (storage, tokens, sessions)
+```
+
+---
+
+## Tool Registry
+
+### Core Tools (22)
+
+| # | Tool | Description |
+|---|---|---|
+| 1 | `execute_code` | Execute Python code in sandboxed environment |
+| 2 | `upload_file` | Upload file to sandbox storage |
+| 3 | `download_file` | Download file from sandbox |
+| 4 | `list_files` | List files in sandbox directory |
+| 5 | `delete_file` | Delete a sandbox file |
+| 6 | `submit_job` | Submit async job for long-running operations |
+| 7 | `get_job_status` | Check async job status |
+| 8 | `get_job_result` | Retrieve completed job results |
+| 9 | `cancel_job` | Cancel a running job |
+| 10 | `list_jobs` | List all jobs for a session |
+| 11 | `load_dataset` | Load large dataset into PostgreSQL |
+| 12 | `query_dataset` | Query dataset with SQL |
+| 13 | `list_datasets` | List available datasets |
+| 14 | `delete_dataset` | Delete a dataset |
+| 15 | `get_dataset_info` | Get dataset schema and stats |
+| 16 | `create_session` | Create new execution session |
+| 17 | `get_session` | Get session details |
+| 18 | `list_sessions` | List active sessions |
+| 19 | `delete_session` | Delete a session |
+| 20 | `fetch_from_url` | Fetch content from URL into sandbox |
+| 21 | `get_sandbox_status` | Get sandbox environment status |
+| 22 | `get_chart_url` | Get public URL for generated chart |
+
+### Microsoft 365 Tools (21)
+
+| # | Tool | Description |
+|---|---|---|
+| 1 | `ms_auth` | Initiate Microsoft OAuth device code flow |
+| 2 | `ms_auth_poll` | Poll for OAuth completion |
+| 3 | `ms_auth_status` | Check current auth status |
+| 4 | `ms_logout` | Clear Microsoft tokens |
+| 5 | `sharepoint_list_sites` | List accessible SharePoint sites |
+| 6 | `sharepoint_get_site` | Get site details by name or URL |
+| 7 | `sharepoint_list_drives` | List document libraries for a site |
+| 8 | `sharepoint_list_files` | List files in a drive/folder |
+| 9 | `sharepoint_search_files` | Search files across SharePoint |
+| 10 | `sharepoint_download_file` | Download file to sandbox |
+| 11 | `sharepoint_upload_file` | Upload file from sandbox to SharePoint |
+| 12 | `sharepoint_create_folder` | Create folder in document library |
+| 13 | `sharepoint_delete_item` | Delete file or folder |
+| 14 | `sharepoint_move_item` | Move file or folder |
+| 15 | `sharepoint_copy_item` | Copy file or folder |
+| 16 | `sharepoint_get_file_info` | Get file metadata and properties |
+| 17 | `sharepoint_get_sharing_link` | Create sharing link for file |
+| 18 | `onedrive_list_files` | List files in user's OneDrive |
+| 19 | `onedrive_download_file` | Download from OneDrive to sandbox |
+| 20 | `onedrive_upload_file` | Upload from sandbox to OneDrive |
+| 21 | `onedrive_search` | Search files in OneDrive |
+
+**Total: 43 MCP tools**
+
+---
+
+## Endpoints
+
+| Endpoint | Method | Auth | Purpose |
+|---|---|---|---|
+| `/health` | GET | None | Health check |
+| `/mcp/sse` | GET | None | MCP SSE transport (standard clients) |
+| `/mcp/sse` | POST | None | MCP JSON-RPC direct (SimTheory) |
+| `/dl/{file_id}` | GET | None | Public file downloads |
+| `/charts/{session_id}/{filename}` | GET | None | Chart image serving |
+| `/api/execute` | POST | API Key | Direct code execution |
+| `/api/jobs/*` | Various | API Key | Job management |
+| `/api/files/*` | Various | API Key | File management |
+| `/api/data/*` | Various | API Key | Dataset management |
+| `/api/sessions/*` | Various | API Key | Session management |
+| `/docs` | GET | None | OpenAPI documentation |
+
+---
+
+## Configuration
+
+### Environment Variables
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `API_KEY` | Yes | — | API key for protected endpoints |
+| `DATABASE_URL` | Yes | — | PostgreSQL connection string |
+| `PORT` | No | `8080` | Server port |
+| `LOG_LEVEL` | No | `INFO` | Logging level |
+| `SANDBOX_DIR` | No | `/app/sandbox_data` | Sandbox file directory |
+| `SANDBOX_FILE_MAX_MB` | No | `50` | Max file size (MB) |
+| `SANDBOX_FILE_TTL_HOURS` | No | `72` | File expiration (hours) |
+| `MAX_EXECUTION_TIME` | No | `300` | Code execution timeout (seconds) |
+| `MAX_MEMORY_MB` | No | `16384` | Max memory per execution (MB) |
+| `MAX_CONCURRENT_JOBS` | No | `4` | Max parallel async jobs |
+| `JOB_TIMEOUT` | No | `1800` | Async job timeout (seconds) |
+| `RAILWAY_PUBLIC_DOMAIN` | Auto | — | Set by Railway for public URLs |
+
+### Microsoft 365 Integration
+
+| Variable | Required | Description |
+|---|---|---|
+| `MS_CLIENT_ID` | Yes* | Azure AD app client ID |
+| `MS_TENANT_ID` | Yes* | Azure AD tenant ID |
+| `MS_CLIENT_SECRET` | No | For service principal auth |
+
+*Required only if Microsoft integration is enabled.
+
+---
+
+## Deployment
+
+### Railway (Production)
+
+The app is deployed on Railway with automatic deploys from the `main` branch.
+
+```
+Railway Project: power-interpreter
+Service: power-interpreter
+Environment: production
+URL: https://power-interpreter-production-6396.up.railway.app
+```
+
+### Docker
+
+```bash
+docker build -t power-interpreter .
+docker run -p 8080:8080 \
+  -e API_KEY=your-key \
+  -e DATABASE_URL=postgresql://... \
+  power-interpreter
+```
+
+---
+
+## Version History
+
+| Version | Date | Changes |
+|---|---|---|
+| **v2.9.1** | 2026-03-04 | Smart error handling for empty execute_code args (model-agnostic) |
+| **v2.9.0** | 2026-03-03 | Trimmed all 34→43 tool descriptions for token optimization (~57% reduction) |
+| **v1.9.2** | 2026-02-28 | Token persistence rewrite (SQLAlchemy), ms_auth_poll tool |
+| **v1.9.0** | 2026-02-27 | Microsoft OneDrive + SharePoint integration (20 new MCP tools) |
+| **v1.8.1** | 2026-02-25 | Chart serving route + inline base64 image blocks |
+| **v1.7.2** | 2026-02-23 | fetch_from_url route fix, stable release |
+| **v1.0.0** | 2026-02-14 | Initial release — Power Interpreter MCP v1.0 |
+
+---
+
+## Project Structure
+
+```
+power-interpreter/
+├── app/
+│   ├── __init__.py              # Package init + version (2.9.1)
+│   ├── main.py                  # FastAPI app, lifespan, MCP JSON-RPC handler
+│   ├── mcp_server.py            # MCP server setup + tool registration
+│   ├── config.py                # Settings and environment config
+│   ├── auth.py                  # API key authentication
+│   ├── database.py              # PostgreSQL connection management
+│   ├── models.py                # SQLAlchemy models
+│   ├── data_manager.py          # Large dataset operations
+│   ├── fetch_from_url.py        # URL content fetching
+│   ├── engine/
+│   │   ├── executor.py          # Sandboxed Python execution engine
+│   │   ├── kernel_manager.py    # Kernel lifecycle management
+│   │   ├── job_manager.py       # Async job queue
+│   │   ├── file_manager.py      # File storage and serving
+│   │   ├── data_manager.py      # Dataset PostgreSQL operations
+│   │   └── memory_guard.py      # Memory limit enforcement
+│   ├── microsoft/
+│   │   ├── auth_manager.py      # Microsoft OAuth + token persistence
+│   │   ├── graph_client.py      # Microsoft Graph API client
+│   │   ├── tools.py             # SharePoint/OneDrive tool definitions
+│   │   ├── mcp_tools.py         # MCP tool wrappers
+│   │   └── bootstrap.py         # Microsoft integration bootstrap
+│   └── routes/
+│       ├── execute.py           # /api/execute endpoints
+│       ├── jobs.py              # /api/jobs endpoints
+│       ├── files.py             # /api/files + /dl/ endpoints
+│       ├── data.py              # /api/data endpoints
+│       ├── sessions.py          # /api/sessions endpoints
+│       └── health.py            # /health endpoint
+├── patches/                     # Bug fix patches (pending integration)
+│   ├── fix_empty_args_validation.py
+│   ├── fix_kernel_persistence.py
+│   └── kernel_startup.py
+├── Dockerfile
+├── requirements.txt
+├── railway.toml
+├── start.py
+├── .env.example
+└── README.md
+```
+
+---
+
+## Pending Fixes (Branch: `fix/kernel-persistence-and-preload`)
+
+### 1. Empty Args Validation
+Improved error response when `execute_code` is called with empty arguments. Returns MCP-compliant structured error with retry instructions.
+
+### 2. Kernel State Persistence
+Persistent kernel manager that maps `session_id` → kernel instance, keeping Python state (imports, variables) alive across consecutive `execute_code` calls.
+
+### 3. Library Pre-load
+Pre-imports common libraries (PDF, data, document handling) when new kernels are created, so frequently needed tools are immediately available.
+
+---
+
+## License
+
+Proprietary — Bolthouse Fresh Foods / New Carrot Farms LLC. All rights reserved.

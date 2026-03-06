@@ -1,11 +1,12 @@
 """MCP Tool registrations for OneDrive & SharePoint.
 
-Version: 2.9.0 — trimmed tool descriptions for token optimization
+Version: 2.9.1 — trimmed tool descriptions for token optimization
 
 HISTORY:
   v1.9.4: Made user_id optional, added resolve_share_link (22 tools).
   v2.8.6: Version unification across all files.
   v2.9.0: Trimmed all 22 tool descriptions to reduce token overhead.
+  v2.9.1: Version string alignment across all modules.
 """
 
 import json
@@ -542,5 +543,5 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
         except ValueError as e:
             return json.dumps({"error": True, "message": str(e)}, indent=2)
 
-    # v2.9.0: Trimmed descriptions, unified version
-    logger.info("Microsoft OneDrive + SharePoint tools registered (22 tools, v2.9.0)")
+    # v2.9.1: Version alignment across all modules
+    logger.info("Microsoft OneDrive + SharePoint tools registered (22 tools, v2.9.1)")

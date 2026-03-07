@@ -1,6 +1,6 @@
 # Power Interpreter MCP — Change Requests
 
-> **Source:** Production log analysis, 2026-03-06 (UTC 17:56 – 18:56)  
+> **Source:** Production log analysis, 2026-03-06 (UTC 17:56 – 23:59+)  
 > **Analyzed by:** Model Context Architect (MCA)  
 > **Status:** Staged — awaiting team smoke test completion before implementation  
 > **Branch:** `main`
@@ -20,13 +20,16 @@
 | 7 | [Batch file processing](#7-feature-batch-file-processing-for-bulk-analysis-workflows) | Feature | **30-40x speedup** | Medium | Critical |
 | 8 | [Structured request logging](#8-observability-structured-request-logging-with-usersession-attribution) | Observability | Multi-user debugging | Low-Medium | High |
 | 9 | [Sandbox resilience & request queuing](#9-stability-sandbox-resilience-request-queuing-and-retry) | Stability | **Eliminates 500s** | Medium | **Critical** |
+| 10 | [Response size guardrails](#10-stability-response-size-guardrails--pagination-and-token-budget) | Stability | **Prevents context overflow** | Medium | **Critical** |
+| 11 | [Chunked file transfer & smart format conversion](#11-data-handling-chunked-file-transfer--smart-format-conversion) | Data Handling | **Production-scale files** | Medium-High | **Critical** |
 
 ### Suggested Shipping Strategy
 
 - **Release 1 (Quick wins):** Items 1, 2, 3, 5, 8 — low effort, no architectural changes, immediate value
-- **Release 2 (Stability):** Item 9 — critical for multi-user reliability, directly unblocks Marie
-- **Release 3 (Infrastructure):** Items 4, 6 — transport and HTTP client layer changes, test carefully
-- **Release 4 (Feature):** Item 7 — highest-impact single change, needs design decisions
+- **Release 2 (Stability):** Items 9, 10 — critical for multi-user reliability and context overflow prevention
+- **Release 3 (Data Handling):** Item 11 — chunked transfers and format conversion for production-scale files
+- **Release 4 (Infrastructure):** Items 4, 6 — transport and HTTP client layer changes, test carefully
+- **Release 5 (Feature):** Item 7 — highest-impact single change, needs design decisions
 
 ---
 
@@ -560,7 +563,7 @@ class SandboxJobQueue:
         self,
         max_concurrent: int = 4,
         max_queue_size: int = 20,
-        queue_timeout: float = 30.0,  # Max seconds to wait in queue
+        queue_timeout: float = 30.0,
     ):
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._queue: asyncio.Queue[QueuedJob] = asyncio.Queue(maxsize=max_queue_size)
@@ -572,23 +575,11 @@ class SandboxJobQueue:
         self._total_timeout = 0
 
     async def submit(self, func, *args, **kwargs) -> Any:
-        """
-        Submit a job for execution. Waits for an available slot
-        up to queue_timeout seconds before raising TimeoutError.
-        """
         try:
-            # Try to acquire a slot immediately
             acquired = self._semaphore._value > 0
             if not acquired:
                 self._total_queued += 1
-                logger.info(json.dumps({
-                    "event": "job_queued",
-                    "active_jobs": self._active_jobs,
-                    "queue_depth": self._queue.qsize(),
-                    "max_concurrent": self._max_concurrent,
-                }))
 
-            # Wait for a slot with timeout
             async with asyncio.timeout(self._queue_timeout):
                 await self._semaphore.acquire()
 
@@ -603,12 +594,6 @@ class SandboxJobQueue:
 
         except TimeoutError:
             self._total_timeout += 1
-            logger.warning(json.dumps({
-                "event": "job_queue_timeout",
-                "active_jobs": self._active_jobs,
-                "queue_depth": self._queue.qsize(),
-                "timeout_seconds": self._queue_timeout,
-            }))
             raise HTTPException(
                 status_code=503,
                 detail={
@@ -616,75 +601,28 @@ class SandboxJobQueue:
                     "message": f"All {self._max_concurrent} sandbox slots are occupied. "
                                f"Request waited {self._queue_timeout}s. Please retry.",
                     "retry_after": 5,
-                    "active_jobs": self._active_jobs,
                 }
             )
-
-    @property
-    def stats(self) -> dict:
-        return {
-            "active_jobs": self._active_jobs,
-            "max_concurrent": self._max_concurrent,
-            "total_processed": self._total_processed,
-            "total_queued": self._total_queued,
-            "total_timeouts": self._total_timeout,
-        }
 ```
-
-**Key behaviors:**
-- Requests **wait** for a slot instead of failing immediately
-- Bounded queue (20) prevents unbounded memory growth
-- Configurable timeout (30s) — if a slot doesn't free up in 30 seconds, return `503 Service Unavailable` (not `500 Internal Server Error`) with a `retry_after` hint
-- The LLM receives a structured, actionable error instead of an opaque 500
 
 #### B. Kernel Health Check and Auto-Recovery
 
-Add a heartbeat mechanism that detects a dead kernel and restarts it before the next request:
-
 ```python
-import asyncio
-import time
-
 class KernelHealthMonitor:
-    """
-    Monitors the sandbox kernel process and auto-restarts
-    if it becomes unresponsive.
-    """
-
     def __init__(self, kernel_manager, check_interval: float = 10.0):
         self._kernel = kernel_manager
         self._check_interval = check_interval
-        self._last_healthy = time.monotonic()
         self._restart_count = 0
-        self._running = False
 
-    async def start(self):
-        """Start the background health check loop."""
-        self._running = True
-        asyncio.create_task(self._health_loop())
-
-    async def _health_loop(self):
-        while self._running:
-            try:
-                is_alive = await self._check_kernel_health()
-                if is_alive:
-                    self._last_healthy = time.monotonic()
-                else:
-                    await self._restart_kernel(reason="health_check_failed")
-            except Exception as e:
-                logger.error(json.dumps({
-                    "event": "kernel_health_error",
-                    "error": str(e),
-                }))
-                await self._restart_kernel(reason="health_check_exception")
-
-            await asyncio.sleep(self._check_interval)
+    async def ensure_healthy(self):
+        is_alive = await self._check_kernel_health()
+        if not is_alive:
+            await self._restart_kernel(reason="pre_request_check")
 
     async def _check_kernel_health(self) -> bool:
-        """Send a lightweight probe to the kernel."""
         try:
             result = await asyncio.wait_for(
-                self._kernel.execute("1+1"),  # Minimal probe
+                self._kernel.execute("1+1"),
                 timeout=5.0
             )
             return result is not None
@@ -692,95 +630,21 @@ class KernelHealthMonitor:
             return False
 
     async def _restart_kernel(self, reason: str):
-        """Kill and restart the kernel process."""
         self._restart_count += 1
-        logger.warning(json.dumps({
-            "event": "kernel_restart",
-            "reason": reason,
-            "restart_count": self._restart_count,
-            "seconds_since_healthy": round(time.monotonic() - self._last_healthy, 1),
-        }))
         await self._kernel.restart()
-        self._last_healthy = time.monotonic()
-
-    async def ensure_healthy(self):
-        """
-        Called before each tool execution.
-        If kernel is dead, restart it immediately rather than
-        letting the request fail with 500.
-        """
-        is_alive = await self._check_kernel_health()
-        if not is_alive:
-            await self._restart_kernel(reason="pre_request_check")
 ```
 
 #### C. Graceful 503 Instead of 500
 
-Change error responses from opaque `500 Internal Server Error` to structured `503 Service Unavailable` with retry guidance:
-
 ```python
-# Before (opaque 500 — LLM can't reason about it):
-HTTP 500 Internal Server Error
-{"detail": "Internal server error"}
-
-# After (structured 503 — LLM can wait and retry):
-HTTP 503 Service Unavailable
+# Before: HTTP 500 Internal Server Error — opaque, session-killing
+# After:  HTTP 503 Service Unavailable — structured, retryable
 {
     "error": "sandbox_busy",
     "message": "All 4 sandbox slots are occupied. Request waited 30s. Please retry.",
-    "retry_after": 5,
-    "active_jobs": 4,
-    "queue_stats": {
-        "total_processed": 142,
-        "total_queued": 23,
-        "total_timeouts": 1
-    }
+    "retry_after": 5
 }
 ```
-
-This lets the LLM tell the user: *"The sandbox is busy with other requests. I'll retry in a few seconds."* instead of *"Internal Server Error."*
-
-#### D. Integration — Request Flow
-
-```
-User request arrives
-        │
-        ▼
-┌─────────────────┐
-│ SandboxJobQueue  │  Is a slot available?
-│   .submit()      │
-└────────┬────────┘
-         │
-    ┌────┴────┐
-    │ YES     │ NO → Wait up to 30s → Timeout? → 503 + retry_after
-    │         │
-    ▼         │
-┌─────────────┴───┐
-│ KernelHealth     │  Is the kernel alive?
-│ .ensure_healthy()│
-└────────┬────────┘
-         │
-    ┌────┴────┐
-    │ YES     │ NO → Auto-restart kernel → Proceed
-    │         │
-    ▼         ▼
-┌─────────────────┐
-│ Execute tool     │  Run the actual operation
-│ (execute_code,   │
-│  list_files, etc)│
-└────────┬────────┘
-         │
-         ▼
-    Return result
-```
-
-### Implementation Scope
-
-Files to modify:
-- `main.py` — Initialize `SandboxJobQueue` and `KernelHealthMonitor` at startup
-- `mcp_server.py` — Wrap tool dispatch in `queue.submit()` and `health.ensure_healthy()`
-- New file: `queue.py` — `SandboxJobQueue` class
-- New file: `health.py` — `KernelHealthMonitor` class
 
 ### Configuration (Environment Variables)
 
@@ -792,35 +656,500 @@ Files to modify:
 | `KERNEL_HEALTH_INTERVAL` | 10 | Seconds between health checks |
 | `KERNEL_HEALTH_TIMEOUT` | 5 | Seconds before probe is considered failed |
 
-### Testing Strategy
-
-1. **Simulate full slots:** Start 4 long-running `execute_code` jobs, send a 5th — verify it queues and completes when a slot frees
-2. **Simulate queue timeout:** Fill all slots and queue, send requests that exceed `queue_timeout` — verify 503 with retry guidance
-3. **Simulate kernel death:** Kill the kernel process, send a request — verify auto-restart and successful execution
-4. **Concurrent user simulation:** Run 3 simulated user sessions with interleaved tool calls — verify no 500s
-
 ### Impact
 - **Eliminates the 500 Internal Server Errors** that blocked Marie
 - Users see *"busy, retrying"* instead of *"error"*
 - Kernel crashes are self-healing — no manual intervention needed
-- Queue stats provide visibility into concurrency pressure
-- LLM receives structured errors it can reason about and retry
 
-### Risk Assessment
-- **Low risk:** Queue is bounded (20 max), timeout is bounded (30s), no unbounded resource consumption
-- **Backward compatible:** Requests that previously succeeded immediately still succeed immediately — the queue only activates when slots are full
-- **Observable:** All queue events and kernel restarts are logged (pairs with Change #8)
+---
+
+## 10. [STABILITY] Response size guardrails — pagination and token budget
+
+**Type:** Stability  
+**Effort:** Medium  
+**Priority:** Critical — sessions killed by context overflow
+
+### Problem
+
+On 2026-03-06 at `23:59 UTC`, Marie's session connected and called a file listing tool that returned **all 200+ Power Usage Report PDFs** with full OneDrive metadata (item IDs, filenames, sizes). The tool response consumed approximately **204,516 tokens** — exceeding Anthropic's 200,000 token context window maximum.
+
+**The Anthropic API rejected the prompt:**
+```
+Anthropic API error: Error code: 400 - {'type': 'error', 'error': {'type':
+'invalid_request_error', 'message': 'prompt is too long: 204516 tokens > 200000
+maximum'}, 'request_id': 'req_011CYnjbUpfA93hxF9iVZuHf'}
+```
+
+**This is a hard wall.** Once the context window fills, the entire session is dead. Marie can't even send a message to ask for help — the LLM cannot process any input.
+
+### Root Cause
+
+Tool responses are returned to the LLM **unbounded**. There is no:
+- Maximum token budget per tool response
+- Pagination for large result sets
+- Summarization fallback for oversized responses
+- Filtering of internal identifiers (OneDrive item IDs) that the LLM doesn't need
+
+Each file entry in the listing included:
+```
+("01NBYD6HFM6AVWMHL7QFBYLWW224EDWSBD", "Power Usage Report - 10-14-25 7AM.pdf", 60838)
+```
+
+Multiply by 200+ files with full OneDrive IDs = ~200K+ tokens for a single tool call.
+
+### Solution
+
+#### A. Global Tool Response Token Budget
+
+Every tool response passes through a guardrail before being returned to the LLM:
+
+```python
+import math
+
+# Conservative: no single tool response should exceed 25% of context window
+MAX_TOOL_RESPONSE_TOKENS = 50_000
+CHARS_PER_TOKEN = 4  # rough estimate for English text
+MAX_TOOL_RESPONSE_CHARS = MAX_TOOL_RESPONSE_TOKENS * CHARS_PER_TOKEN  # 200,000 chars
+
+def enforce_response_budget(tool_name: str, result: str | dict) -> dict:
+    """Enforce token budget on tool responses before returning to LLM."""
+    
+    if isinstance(result, dict):
+        serialized = json.dumps(result)
+    else:
+        serialized = str(result)
+    
+    estimated_tokens = math.ceil(len(serialized) / CHARS_PER_TOKEN)
+    
+    if estimated_tokens <= MAX_TOOL_RESPONSE_TOKENS:
+        return result  # Within budget, return as-is
+    
+    # Over budget — truncate with metadata
+    return {
+        "status": "truncated",
+        "warning": f"Response truncated: {estimated_tokens:,} tokens exceeded "
+                   f"{MAX_TOOL_RESPONSE_TOKENS:,} token budget",
+        "tool": tool_name,
+        "original_size_tokens": estimated_tokens,
+        "truncated_to_tokens": MAX_TOOL_RESPONSE_TOKENS,
+        "data": serialized[:MAX_TOOL_RESPONSE_CHARS],
+        "message": "Use pagination parameters to retrieve remaining results."
+    }
+```
+
+#### B. Paginated File Listings
+
+The `list_files` and `list_onedrive_files` tools must support pagination:
+
+```python
+async def list_files(
+    path: str = "/",
+    page: int = 1,
+    page_size: int = 50,
+    sort_by: str = "name",
+) -> dict:
+    """List files with mandatory pagination."""
+    
+    all_files = await _get_directory_contents(path)
+    total_files = len(all_files)
+    total_pages = math.ceil(total_files / page_size)
+    
+    # Slice for requested page
+    start = (page - 1) * page_size
+    end = start + page_size
+    page_files = all_files[start:end]
+    
+    return {
+        "status": "success",
+        "path": path,
+        "files": [
+            {
+                "name": f.name,
+                "size_kb": round(f.size / 1024, 1),
+                "modified": f.modified.isoformat(),
+                # NO OneDrive item IDs — LLM doesn't need them
+            }
+            for f in page_files
+        ],
+        "pagination": {
+            "page": page,
+            "page_size": page_size,
+            "total_files": total_files,
+            "total_pages": total_pages,
+            "has_next": page < total_pages,
+        },
+        "summary": f"Showing {len(page_files)} of {total_files} files (page {page}/{total_pages})"
+    }
+```
+
+#### C. Smart Summarization for Large Directories
+
+When a directory has more than `page_size` files, the first response should include a summary:
+
+```python
+# Instead of dumping 200+ file entries:
+{
+    "status": "success",
+    "summary": {
+        "total_files": 237,
+        "total_size_mb": 48.3,
+        "file_types": {"pdf": 235, "json": 2},
+        "date_range": "2025-10-01 to 2026-03-06",
+        "largest_file": {"name": "Power Usage Report - 01-15-26 7AM.pdf", "size_mb": 2.1},
+        "smallest_file": {"name": "Power Usage Report - 10-14-25 7AM.pdf", "size_kb": 59.4}
+    },
+    "files": [...first 50 files...],
+    "pagination": {"page": 1, "total_pages": 5, "has_next": true},
+    "message": "237 files found. Showing first 50. Use page=2 for next batch."
+}
+```
+
+#### D. Strip Internal IDs from LLM Responses
+
+OneDrive item IDs (`01NBYD6HFM6AVWMHL7QFBYLWW224EDWSBD`) are internal identifiers used by the Graph API. The LLM never needs to see them — they should be stored server-side in a session-scoped lookup table and referenced by index or filename.
+
+```python
+# Before (wastes ~40 tokens per file on opaque IDs):
+("01NBYD6HFM6AVWMHL7QFBYLWW224EDWSBD", "Power Usage Report - 10-14-25 7AM.pdf", 60838)
+
+# After (LLM-friendly, ~10 tokens per file):
+{"name": "Power Usage Report - 10-14-25 7AM.pdf", "size_kb": 59.4}
+```
+
+The OneDrive ID is still stored server-side so the MCP can resolve it when the user asks to open or download a specific file by name.
+
+### Configuration (Environment Variables)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MAX_TOOL_RESPONSE_TOKENS` | 50000 | Max tokens per tool response |
+| `FILE_LIST_PAGE_SIZE` | 50 | Default files per page |
+| `FILE_LIST_MAX_PAGE_SIZE` | 200 | Maximum files per page |
+
+### Implementation Scope
+
+Files to modify:
+- `mcp_server.py` — Add `enforce_response_budget()` middleware around all tool responses
+- `tools.py` — Add pagination to `list_files`, `list_onedrive_files`, `search_onedrive`
+- New file: `response_budget.py` — Token budgeting and truncation logic
+
+### Testing Strategy
+
+1. **Simulate large listing:** Create 250 files, call `list_files()` — verify paginated response ≤ 50K tokens
+2. **Simulate overflow:** Force a 200K+ token response — verify truncation with metadata
+3. **Verify LLM can paginate:** Ensure paginated responses include clear navigation instructions
+4. **Verify ID stripping:** Confirm OneDrive item IDs are absent from LLM-facing responses
+
+### Impact
+- **Prevents context window overflow** — no single tool response can kill a session
+- **Reduces token waste** — stripping internal IDs saves ~30 tokens per file × 200+ files
+- **Enables large directory workflows** — 200+ file directories work with pagination instead of exploding
+- **Directly prevents** the exact failure Marie experienced at 23:59 UTC
+
+---
+
+## 11. [DATA HANDLING] Chunked file transfer & smart format conversion
+
+**Type:** Data Handling  
+**Effort:** Medium-High  
+**Priority:** Critical — no chunking or format conversion exists in current code
+
+### Problem
+
+Code search across the entire Power Interpreter repository reveals **zero implementation** of:
+
+| Feature | Search Results | Status |
+|---------|---------------|--------|
+| Chunked upload | 0 matches for `chunk`, `chunked`, `chunking` | **Not implemented** |
+| Chunked download | Same — 0 matches | **Not implemented** |
+| Excel → CSV conversion | 0 matches for `csv`, `xlsx`, `capacity` | **Not implemented** |
+| File size guardrails | 0 matches for `MAX_FILE`, `max_size`, `truncat` | **Not implemented** |
+| Response pagination | 0 matches for `pagina` | **Not implemented** |
+
+The sandbox supports **16 GB of memory** and a **50 MB max file size**, but there is no intelligent handling of:
+
+1. **Large file transfers** — A 45 MB Excel file is uploaded/downloaded as a single HTTP payload. No streaming, no chunking, no resume-on-failure.
+2. **Excel row limits** — Microsoft Excel's `.xlsx` format has a hard limit of **1,048,576 rows**. If a dataset exceeds this, the file is silently truncated or the operation fails.
+3. **Format optimization** — Large tabular datasets are stored as `.xlsx` (binary XML, larger) when `.csv` (plain text, smaller, no row limit) would be more appropriate.
+
+### Real-World Implications
+
+Bolthouse Fresh Foods processes production data daily. Scenarios where this matters:
+
+- **Power usage reports**: 200+ daily PDFs, each containing tabular data that may be consolidated into large datasets
+- **Production line data**: Sensor readings can exceed 1M+ rows over a reporting period
+- **Financial reports**: Multi-sheet workbooks with cross-references
+- **Bulk analysis**: Marie's 200+ file workflow requires downloading and processing all files
+
+### Solution
+
+#### A. Chunked File Transfer
+
+Implement streaming upload and download with configurable chunk sizes:
+
+```python
+import aiofiles
+import os
+from typing import AsyncIterator
+
+# Configurable chunk size (default 5 MB)
+CHUNK_SIZE = int(os.getenv("FILE_CHUNK_SIZE", 5 * 1024 * 1024))  # 5 MB
+
+async def chunked_upload(
+    file_path: str,
+    destination: str,
+    chunk_size: int = CHUNK_SIZE,
+) -> dict:
+    """
+    Upload a file in chunks with progress tracking.
+    Supports resume on failure.
+    """
+    file_size = os.path.getsize(file_path)
+    total_chunks = math.ceil(file_size / chunk_size)
+    uploaded_bytes = 0
+    
+    async with aiofiles.open(file_path, 'rb') as f:
+        for chunk_num in range(total_chunks):
+            chunk = await f.read(chunk_size)
+            
+            # Upload chunk with retry
+            for attempt in range(3):
+                try:
+                    await _upload_chunk(
+                        destination=destination,
+                        chunk=chunk,
+                        chunk_num=chunk_num,
+                        total_chunks=total_chunks,
+                        offset=uploaded_bytes,
+                    )
+                    uploaded_bytes += len(chunk)
+                    break
+                except Exception as e:
+                    if attempt == 2:
+                        return {
+                            "status": "partial",
+                            "uploaded_bytes": uploaded_bytes,
+                            "total_bytes": file_size,
+                            "failed_at_chunk": chunk_num,
+                            "error": str(e),
+                            "message": "Upload can be resumed from failed chunk."
+                        }
+                    await asyncio.sleep(1 * (attempt + 1))  # backoff
+    
+    return {
+        "status": "success",
+        "file": os.path.basename(file_path),
+        "size_mb": round(file_size / (1024 * 1024), 2),
+        "chunks": total_chunks,
+    }
+
+
+async def chunked_download(
+    source: str,
+    destination: str,
+    chunk_size: int = CHUNK_SIZE,
+) -> AsyncIterator[bytes]:
+    """
+    Download a file in chunks with streaming.
+    Memory-efficient — never loads full file into RAM.
+    """
+    async with aiofiles.open(destination, 'wb') as f:
+        async for chunk in _stream_from_source(source, chunk_size):
+            await f.write(chunk)
+            yield chunk  # Allow progress tracking
+```
+
+#### B. Smart Format Detection and Conversion
+
+Automatically detect when Excel format is inappropriate and convert to CSV:
+
+```python
+import pandas as pd
+import os
+
+# Excel hard limits
+EXCEL_MAX_ROWS = 1_048_576
+EXCEL_MAX_COLS = 16_384
+EXCEL_PRACTICAL_SIZE_MB = 25  # Beyond this, Excel becomes sluggish
+
+async def smart_file_output(
+    df: pd.DataFrame,
+    requested_filename: str,
+    session_id: str,
+) -> dict:
+    """
+    Intelligently choose output format based on data characteristics.
+    Converts to CSV when Excel limits would be exceeded.
+    """
+    row_count = len(df)
+    col_count = len(df.columns)
+    base_name, requested_ext = os.path.splitext(requested_filename)
+    
+    # Decision: Excel or CSV?
+    needs_csv = False
+    conversion_reason = None
+    
+    if row_count > EXCEL_MAX_ROWS:
+        needs_csv = True
+        conversion_reason = (
+            f"Dataset has {row_count:,} rows, exceeding Excel's "
+            f"{EXCEL_MAX_ROWS:,} row limit"
+        )
+    elif col_count > EXCEL_MAX_COLS:
+        needs_csv = True
+        conversion_reason = (
+            f"Dataset has {col_count:,} columns, exceeding Excel's "
+            f"{EXCEL_MAX_COLS:,} column limit"
+        )
+    
+    if needs_csv and requested_ext in ('.xlsx', '.xls'):
+        # Auto-convert to CSV
+        actual_filename = f"{base_name}.csv"
+        output_path = f"/app/sandbox_data/{session_id}/{actual_filename}"
+        df.to_csv(output_path, index=False)
+        file_size = os.path.getsize(output_path)
+        
+        return {
+            "status": "converted",
+            "original_format": requested_ext,
+            "actual_format": ".csv",
+            "filename": actual_filename,
+            "path": output_path,
+            "rows": row_count,
+            "columns": col_count,
+            "size_mb": round(file_size / (1024 * 1024), 2),
+            "reason": conversion_reason,
+            "message": f"Automatically converted to CSV: {conversion_reason}. "
+                       f"CSV has no row limit and is {round(file_size / (1024*1024), 1)} MB."
+        }
+    
+    # Standard Excel output
+    output_path = f"/app/sandbox_data/{session_id}/{requested_filename}"
+    df.to_excel(output_path, index=False, engine='openpyxl')
+    file_size = os.path.getsize(output_path)
+    
+    # Warn if Excel file is very large (will be slow to open)
+    warning = None
+    estimated_size_mb = file_size / (1024 * 1024)
+    if estimated_size_mb > EXCEL_PRACTICAL_SIZE_MB:
+        warning = (
+            f"File is {estimated_size_mb:.1f} MB. Excel may be slow to open. "
+            f"Consider requesting CSV format for better performance."
+        )
+    
+    return {
+        "status": "success",
+        "filename": requested_filename,
+        "path": output_path,
+        "rows": row_count,
+        "columns": col_count,
+        "size_mb": round(estimated_size_mb, 2),
+        "warning": warning,
+    }
+```
+
+#### C. File Size Guardrails
+
+Enforce limits at the transfer layer, not just configuration:
+
+```python
+MAX_UPLOAD_SIZE = int(os.getenv("MAX_UPLOAD_SIZE", 50 * 1024 * 1024))  # 50 MB
+MAX_SANDBOX_STORAGE = int(os.getenv("MAX_SANDBOX_STORAGE", 2 * 1024 * 1024 * 1024))  # 2 GB per session
+
+async def validate_file_transfer(
+    file_path: str,
+    session_id: str,
+    direction: str = "upload",
+) -> dict | None:
+    """Validate file size and sandbox capacity before transfer."""
+    
+    file_size = os.path.getsize(file_path)
+    
+    # Check individual file size
+    if file_size > MAX_UPLOAD_SIZE:
+        return {
+            "status": "rejected",
+            "error": "file_too_large",
+            "file_size_mb": round(file_size / (1024 * 1024), 2),
+            "max_size_mb": round(MAX_UPLOAD_SIZE / (1024 * 1024), 2),
+            "message": f"File is {file_size / (1024*1024):.1f} MB, "
+                       f"exceeding the {MAX_UPLOAD_SIZE / (1024*1024):.0f} MB limit."
+        }
+    
+    # Check sandbox capacity
+    session_usage = await _get_session_disk_usage(session_id)
+    if session_usage + file_size > MAX_SANDBOX_STORAGE:
+        return {
+            "status": "rejected",
+            "error": "sandbox_full",
+            "current_usage_mb": round(session_usage / (1024 * 1024), 2),
+            "file_size_mb": round(file_size / (1024 * 1024), 2),
+            "max_storage_mb": round(MAX_SANDBOX_STORAGE / (1024 * 1024), 2),
+            "message": f"Sandbox storage is {session_usage / (1024*1024):.0f} MB / "
+                       f"{MAX_SANDBOX_STORAGE / (1024*1024):.0f} MB. "
+                       f"Clean up old files to free space."
+        }
+    
+    return None  # Validation passed
+```
+
+### Configuration (Environment Variables)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FILE_CHUNK_SIZE` | 5242880 (5 MB) | Chunk size for file transfers |
+| `MAX_UPLOAD_SIZE` | 52428800 (50 MB) | Max individual file size |
+| `MAX_SANDBOX_STORAGE` | 2147483648 (2 GB) | Max storage per session |
+| `EXCEL_AUTO_CONVERT_THRESHOLD` | 1048576 | Row count that triggers CSV conversion |
+| `EXCEL_SIZE_WARNING_MB` | 25 | File size that triggers Excel performance warning |
+
+### Implementation Scope
+
+Files to modify:
+- `tools.py` — Add chunked upload/download to file transfer tools
+- New file: `file_handler.py` — `chunked_upload()`, `chunked_download()`, `smart_file_output()`, `validate_file_transfer()`
+- New file: `format_converter.py` — Excel ↔ CSV conversion logic with limit detection
+- `mcp_server.py` — Wire file handler into tool dispatch
+
+### Decision Matrix: When to Use Each Format
+
+| Condition | Action | Output Format |
+|-----------|--------|---------------|
+| Rows ≤ 1,048,576 AND size ≤ 25 MB | Keep as requested | `.xlsx` |
+| Rows > 1,048,576 | Auto-convert + notify | `.csv` |
+| Size > 25 MB AND rows ≤ limit | Warn user | `.xlsx` with warning |
+| Size > 50 MB | Reject OR chunk transfer | Error / chunked `.csv` |
+| User explicitly requests CSV | Honor request | `.csv` |
+| Multi-sheet workbook | Keep as Excel | `.xlsx` |
+
+### Testing Strategy
+
+1. **Chunked upload**: Upload a 45 MB file — verify chunked transfer with progress
+2. **Chunked download**: Download from sandbox — verify streaming chunks
+3. **Resume on failure**: Kill connection mid-transfer — verify resume from last chunk
+4. **Excel overflow**: Create 1.1M row DataFrame, request `.xlsx` — verify auto-CSV conversion with notification
+5. **Size warning**: Create 30 MB Excel file — verify performance warning
+6. **Sandbox capacity**: Fill sandbox to near limit — verify rejection with clear message
+
+### Impact
+- **Chunked transfer** prevents timeouts and enables large file workflows
+- **Smart format conversion** prevents silent data truncation when Excel limits are exceeded
+- **File size guardrails** enforced in code, not just configuration
+- **Resume capability** prevents wasted time on failed transfers
+- **Production-scale data** workflows become reliable for the entire team
 
 ---
 
 ## Appendix: Log Evidence
 
 - **Session date:** 2026-03-06
-- **Log window analyzed:** 11:30 AM Pacific (user report) + 17:56 – 23:14 UTC (full 3-hour production window)
+- **Log window analyzed:** 11:30 AM Pacific (user report) + 17:56 – 23:59+ UTC (full production window)
 - **Active users observed:** Marie (via `marie.ludy@bolthousefresh.com`), Sherrill Reed (via `sherrill_reed@bolthousefresh.com`), plus additional concurrent sessions
 - **Total `execute_code` calls (Marie):** 27+ over ~15 minutes
 - **Success rate (code execution):** 100% — zero application errors
 - **500 errors (sandbox operations):** Multiple intermittent failures at ~11:30 AM Pacific on file listing and sandbox status checks (see Change #9)
 - **403 incident:** `resolve_share_link` on SharePoint path `/p/sherrill_reed/` — **user attribution unknown** due to lack of structured logging (see Change #8)
+- **Context overflow incident:** 204,516 tokens > 200,000 maximum at 23:59 UTC — session killed by unbounded file listing response (see Change #10)
+- **Code search results:** Zero matches for `chunk`, `csv`, `xlsx`, `pagina`, `MAX_FILE`, or `truncat` in application code — confirming no chunking, format conversion, or pagination exists (see Change #11)
 - **Railway severity misclassification:** 100% of Python `INFO` logs tagged as `error` due to stderr routing (see Change #1)
-- **Deployment swap:** `948bd420` → `7a0f7d17` → `e1d924b7` — zero downtime, clean handoffs
+- **Deployment chain:** `948bd420` → `7a0f7d17` → `e1d924b7` → `365d8514` — zero downtime, all clean handoffs

@@ -40,6 +40,12 @@ Power Interpreter bridges AI assistants (via Simtheory.ai or any MCP-compatible 
 │         │                │                    │               │
 │         ▼                ▼                    ▼               │
 │  ┌────────────────────────────────────────────────────────┐   │
+│  │  Response Budget Guard (Change #10)                    │   │
+│  │  Max 50K tokens per tool response │ Pagination         │   │
+│  └────────────────────────┬───────────────────────────────┘   │
+│                           │                                   │
+│                           ▼                                   │
+│  ┌────────────────────────────────────────────────────────┐   │
 │  │  SandboxJobQueue (Change #9)                           │   │
 │  │  Async request queue with backpressure                 │   │
 │  │  Max concurrent: 4  │  Queue: 20  │  Timeout: 30s     │   │
@@ -49,6 +55,12 @@ Power Interpreter bridges AI assistants (via Simtheory.ai or any MCP-compatible 
 │  ┌────────────────────────────────────────────────────────┐   │
 │  │  KernelHealthMonitor (Change #9)                       │   │
 │  │  Heartbeat probe │ Auto-restart on failure             │   │
+│  └────────────────────────┬───────────────────────────────┘   │
+│                           │                                   │
+│                           ▼                                   │
+│  ┌────────────────────────────────────────────────────────┐   │
+│  │  File Handler (Change #11)                             │   │
+│  │  Chunked transfer │ Excel↔CSV │ Size guardrails        │   │
 │  └────────────────────────┬───────────────────────────────┘   │
 │                           │                                   │
 │                           ▼                                   │
@@ -144,7 +156,7 @@ power-interpreter/
 ├── .env.example         # Environment variable template
 ├── migrations/          # Database migrations (PostgreSQL)
 └── docs/
-    └── CHANGE-REQUESTS.md  # Staged improvements (9 items)
+    └── CHANGE-REQUESTS.md  # Staged improvements (11 items)
 ```
 
 ---
@@ -189,6 +201,12 @@ The server is deployed on Railway with auto-deploy on push to `main`.
 | `SANDBOX_QUEUE_TIMEOUT` | No | Seconds to wait for a slot (default: 30) |
 | `KERNEL_HEALTH_INTERVAL` | No | Seconds between health checks (default: 10) |
 | `KERNEL_HEALTH_TIMEOUT` | No | Seconds before probe fails (default: 5) |
+| `MAX_TOOL_RESPONSE_TOKENS` | No | Max tokens per tool response (default: 50000) |
+| `FILE_LIST_PAGE_SIZE` | No | Default files per page (default: 50) |
+| `FILE_CHUNK_SIZE` | No | Chunk size for file transfers (default: 5 MB) |
+| `MAX_UPLOAD_SIZE` | No | Max individual file size (default: 50 MB) |
+| `MAX_SANDBOX_STORAGE` | No | Max storage per session (default: 2 GB) |
+| `EXCEL_AUTO_CONVERT_THRESHOLD` | No | Row count triggering CSV conversion (default: 1048576) |
 
 ---
 
@@ -196,15 +214,44 @@ The server is deployed on Railway with auto-deploy on push to `main`.
 
 | Limit | Value |
 |-------|-------|
-| Max file size | 50 MB |
+| Max file size | 50 MB (configurable) |
 | File TTL | 72 hours |
 | Max execution time | 300 seconds |
 | Max memory | 16,384 MB (16 GB) |
-| Max concurrent jobs | 4 (configurable via `SANDBOX_MAX_CONCURRENT`) |
-| Job queue depth | 20 (configurable via `SANDBOX_QUEUE_SIZE`) |
-| Queue timeout | 30 seconds (configurable via `SANDBOX_QUEUE_TIMEOUT`) |
+| Max concurrent jobs | 4 (configurable) |
+| Job queue depth | 20 (configurable) |
+| Queue timeout | 30 seconds (configurable) |
 | Job timeout | 1,800 seconds (30 minutes) |
+| Max storage per session | 2 GB (configurable) |
+| File chunk size | 5 MB (configurable) |
+| Excel auto-convert threshold | 1,048,576 rows |
 | Sandbox directory | `/app/sandbox_data` |
+
+---
+
+## Data Handling (Staged — Change #11)
+
+Power Interpreter is designed to handle production-scale data files intelligently:
+
+### Chunked File Transfer
+- Large files are uploaded and downloaded in **configurable chunks** (default 5 MB)
+- Transfers support **resume on failure** — no need to restart from scratch
+- Memory-efficient streaming — never loads full file into RAM
+
+### Smart Format Conversion (Excel ↔ CSV)
+
+| Condition | Action | Output |
+|-----------|--------|--------|
+| Rows ≤ 1,048,576 | Keep as requested | `.xlsx` |
+| Rows > 1,048,576 | Auto-convert + notify user | `.csv` |
+| File > 25 MB | Warn about Excel performance | `.xlsx` with warning |
+| File > 50 MB | Reject or chunk transfer | Error / chunked `.csv` |
+| Multi-sheet workbook | Keep as Excel | `.xlsx` |
+
+### File Size Guardrails
+- Individual file size enforced at transfer layer (not just config)
+- Per-session storage tracked and limited (default 2 GB)
+- Clear, actionable error messages when limits are exceeded
 
 ---
 
@@ -254,7 +301,7 @@ Power Interpreter is registered as an MCP tool in the GROW by Bolthouse Fresh wo
 
 ## Staged Improvements
 
-See [`docs/CHANGE-REQUESTS.md`](docs/CHANGE-REQUESTS.md) for 9 staged performance, observability, and stability improvements identified from production log analysis:
+See [`docs/CHANGE-REQUESTS.md`](docs/CHANGE-REQUESTS.md) for 11 staged performance, observability, stability, and data handling improvements identified from production log analysis:
 
 | # | Change | Type | Priority |
 |---|--------|------|----------|
@@ -267,15 +314,18 @@ See [`docs/CHANGE-REQUESTS.md`](docs/CHANGE-REQUESTS.md) for 9 staged performanc
 | 7 | Batch file processing | Feature | Critical |
 | 8 | Structured request logging | Observability | High |
 | 9 | Sandbox resilience & request queuing | Stability | Critical |
+| 10 | Response size guardrails & pagination | Stability | Critical |
+| 11 | Chunked file transfer & smart format conversion | Data Handling | Critical |
 
 ### Shipping Strategy
 
 | Release | Items | Focus |
 |---------|-------|-------|
 | **Release 1** | 1, 2, 3, 5, 8 | Quick wins — logging, download speed, observability |
-| **Release 2** | 9 | Stability — eliminates 500 errors under concurrent load |
-| **Release 3** | 4, 6 | Infrastructure — transport and HTTP client optimization |
-| **Release 4** | 7 | Feature — batch processing (30-40x speedup) |
+| **Release 2** | 9, 10 | Stability — eliminates 500s and context overflow |
+| **Release 3** | 11 | Data handling — chunked transfers, format conversion |
+| **Release 4** | 4, 6 | Infrastructure — transport and HTTP client optimization |
+| **Release 5** | 7 | Feature — batch processing (30-40x speedup) |
 
 ---
 

@@ -1,24 +1,27 @@
 """Power Interpreter - Start Script
 
-Reads the PORT environment variable (set by Railway) and starts uvicorn.
-Uses single worker to avoid multiprocessing issues on Railway.
-"""
+Railway uses: python start.py
+This is the entrypoint that Railway calls.
 
-import os
+v2.9.2: Added sys.stderr redirect to fix Railway severity misclassification (Change #1)
+"""
+import sys
 import uvicorn
+import os
+
+# ── Fix Railway severity misclassification (Change #1) ──────────────────
+# Railway tags ALL stderr output as severity:"error", but Python's
+# logging module, Rich Console (used by FastMCP), and httpx all
+# default to stderr. This process-level redirect ensures INFO logs
+# are correctly tagged as severity:"info" in Railway's log viewer.
+# Must be set BEFORE uvicorn imports main.py (which triggers FastMCP/Rich).
+sys.stderr = sys.stdout
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    
-    print(f"Starting Power Interpreter on port {port}")
-    print(f"  DATABASE_URL: {'***configured***' if os.environ.get('DATABASE_URL') else 'NOT SET (will start without DB)'}")
-    print(f"  API_KEY: {'***configured***' if os.environ.get('API_KEY') else 'NOT SET (dev mode)'}")
-    
+    port = int(os.environ.get("PORT", 8080))
     uvicorn.run(
-        "app.main:app",
+        "main:app",
         host="0.0.0.0",
         port=port,
-        workers=1,  # Single worker - avoids multiprocessing issues on Railway
         log_level="info",
-        access_log=True,
     )

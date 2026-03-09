@@ -546,7 +546,7 @@ async def _handle_single_jsonrpc(data: dict):
                     },
                 }
 
-                       logger.info(f"MCP direct: invoking {tool_name}...")
+            logger.info(f"MCP direct: invoking {tool_name}...")
             result = await fn(**tool_args)
             result_str = str(result)
             original_len = len(result_str)

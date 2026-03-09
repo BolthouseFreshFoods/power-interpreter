@@ -1,6 +1,6 @@
 """v2.9.3 Model Resilience Patches — Wrapper for SandboxExecutor
 
-Wraps executor.execute_code() to add model-resilience layers WITHOUT
+Wraps executor.execute() to add model-resilience layers WITHOUT
 modifying the 80KB executor.py file directly.
 
 Changes applied:
@@ -71,10 +71,10 @@ def _detect_missing_import_from_message(error_message: str) -> str | None:
 def apply_patches(executor_instance) -> None:
     """Apply v2.9.3 resilience patches to a SandboxExecutor instance.
 
-    Monkey-patches execute_code() to add preprocessing, prelude injection,
+    Monkey-patches execute() to add preprocessing, prelude injection,
     and post-failure recovery. Safe to call multiple times (idempotent).
 
-    The original execute_code is captured via closure and called for all
+    The original execute() is captured via closure and called for all
     actual execution. This wrapper only adds pre/post processing layers.
 
     Args:
@@ -86,16 +86,16 @@ def apply_patches(executor_instance) -> None:
         return
 
     # Capture the original bound method
-    original_execute = executor_instance.execute_code
+    # The method is called 'execute', NOT 'execute_code'
+    original_execute = executor_instance.execute
 
     @functools.wraps(original_execute)
-    async def patched_execute_code(
+    async def patched_execute(
         code: str,
         session_id: str = "default",
-        *args,
-        **kwargs
+        timeout: int | None = None,
     ):
-        """Resilience-wrapped execute_code (v2.9.3 Changes #12-16)."""
+        """Resilience-wrapped execute (v2.9.3 Changes #12-16)."""
 
         # ── Change #13: Strip markdown code fences ──────────────────
         code = strip_code_fences(code)
@@ -117,8 +117,12 @@ def apply_patches(executor_instance) -> None:
                 f"session '{session_id}'"
             )
             try:
+                # Build kwargs for the original execute call
+                kwargs = {}
+                if timeout is not None:
+                    kwargs['timeout'] = timeout
                 prelude_result = await original_execute(
-                    KERNEL_PRELUDE, session_id, *args, **kwargs
+                    KERNEL_PRELUDE, session_id, **kwargs
                 )
                 if prelude_result.success:
                     logger.info("Kernel prelude: auto-imports succeeded")
@@ -134,7 +138,10 @@ def apply_patches(executor_instance) -> None:
                 _prelude_sessions.add(session_id)
 
         # ── Execute user code ─────────────────────────────────────
-        result = await original_execute(code, session_id, *args, **kwargs)
+        kwargs = {}
+        if timeout is not None:
+            kwargs['timeout'] = timeout
+        result = await original_execute(code, session_id, **kwargs)
 
         # ── Change #14 Layer A: NameError recovery ─────────────────
         if (
@@ -152,7 +159,7 @@ def apply_patches(executor_instance) -> None:
                 )
                 recovery_code = import_stmt + "\n" + code
                 result = await original_execute(
-                    recovery_code, session_id, *args, **kwargs
+                    recovery_code, session_id, **kwargs
                 )
                 if result.success:
                     logger.info("Smart import recovery: retry SUCCEEDED")
@@ -165,7 +172,7 @@ def apply_patches(executor_instance) -> None:
         return result
 
     # Apply the patch to the singleton instance
-    executor_instance.execute_code = patched_execute_code
+    executor_instance.execute = patched_execute
     executor_instance._resilience_patched = True
 
     logger.info(

@@ -22,7 +22,8 @@ import functools
 import logging
 import re
 
-from app.engine.code_resilience import (
+# Use RELATIVE imports to avoid circular import when __init__.py is loading
+from .code_resilience import (
     KERNEL_PRELUDE,
     strip_code_fences,
     auto_prepend_imports,
@@ -102,8 +103,8 @@ def apply_patches(executor_instance) -> None:
         # ── Change #16: Detect non-code input ──────────────────────
         non_code_msg = detect_non_code(code)
         if non_code_msg:
-            # Convert to ValueError so it flows through normal error handling
-            # and the model gets actionable guidance to self-correct
+            # Return a synthetic error result that gives the model
+            # actionable guidance to self-correct
             code = f"raise ValueError({repr(non_code_msg)})"
 
         # ── Change #14 Layer B: Auto-prepend missing imports ───────

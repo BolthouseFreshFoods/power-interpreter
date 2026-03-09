@@ -9,12 +9,14 @@ Changes applied:
   #14 — Smart import recovery (Layer A: retry, Layer B: static analysis)
   #16 — Non-code input detection (prose -> actionable error)
 
-Architecture:
-  - apply_patches() monkey-patches the executor singleton
-  - Called from app/engine/__init__.py at import time
-  - executor.py stays untouched — zero risk to the 80KB execution engine
-  - Idempotent: safe to call multiple times
-  - FAILSAFE: if wrapper crashes, falls back to original execute()
+v2.9.3a FIXES:
+  - Accept **kwargs to absorb extra caller args (e.g. context)
+  - Don't pass **kwargs to original execute (it doesn't accept them)
+  - Simplified prelude: only 'import X' patterns, no 'from X import Y'
+    to avoid _preprocess_code's destructive from-import rewriting
+  - Safety net: entire wrapper in try/except → falls through to
+    original execute if ANYTHING in the patch fails. Patch can
+    NEVER cause a 500 Internal Server Error.
 
 Author: MCA for Timothy Escamilla / Bolthouse Fresh Foods
 """
@@ -39,7 +41,14 @@ _prelude_sessions: set = set()
 
 
 def _detect_missing_import_from_message(error_message: str) -> str | None:
-    """Parse a NameError message string and return import statement if recoverable."""
+    """Parse a NameError message string and return import statement if recoverable.
+
+    Args:
+        error_message: The error message string (e.g. "name 'pd' is not defined")
+
+    Returns:
+        Import statement string, or None if not recoverable.
+    """
     if not error_message:
         return None
 
@@ -48,16 +57,25 @@ def _detect_missing_import_from_message(error_message: str) -> str | None:
         return None
 
     name = match.group(1)
-    return RECOVERABLE_IMPORTS.get(name)
+    import_stmt = RECOVERABLE_IMPORTS.get(name)
+
+    if import_stmt:
+        logger.info(
+            f"Smart import recovery: '{name}' not defined "
+            f"-> will inject '{import_stmt}'"
+        )
+
+    return import_stmt
 
 
 def apply_patches(executor_instance) -> None:
     """Apply v2.9.3 resilience patches to a SandboxExecutor instance.
 
-    FAILSAFE: The wrapper catches ALL exceptions internally.
-    If any resilience logic fails, it falls back to calling the
-    original execute() directly. The patches can NEVER break
-    code execution — they only enhance it.
+    Monkey-patches execute() with a wrapper that adds preprocessing
+    and recovery. Safe to call multiple times (idempotent).
+
+    Args:
+        executor_instance: The SandboxExecutor singleton from executor.py.
     """
     # Guard: don't double-patch
     if getattr(executor_instance, '_resilience_patched', False):
@@ -68,103 +86,59 @@ def apply_patches(executor_instance) -> None:
     original_execute = executor_instance.execute
 
     @functools.wraps(original_execute)
-    async def patched_execute(*args, **kwargs):
+    async def patched_execute(
+        code: str,
+        session_id: str = "default",
+        timeout: int | None = None,
+        **kwargs,  # Absorb extra args callers may pass (e.g. context)
+    ):
         """Resilience-wrapped execute (v2.9.3 Changes #12-16).
 
-        Accepts *args/**kwargs to be compatible with ANY calling
-        convention. Extracts code and session_id positionally or
-        by keyword, applies resilience layers, then delegates to
-        the original execute().
-
-        FAILSAFE: If anything in the wrapper fails, we call the
-        original execute() with the unmodified arguments.
+        SAFETY GUARANTEE: This wrapper can NEVER cause a 500 error.
+        If anything in the resilience logic fails, it falls through
+        to the original execute() unchanged.
         """
-        # ── Extract code and session_id from args/kwargs ─────────
-        # execute() signature: (code, session_id='default', timeout=None)
-        # Could be called positionally or with keywords.
+        # Keep a copy of original code for safety-net fallback
+        original_code = code
+
         try:
-            # Get code (first positional arg or keyword)
-            if args:
-                code = args[0]
-                remaining_args = args[1:]
-            elif 'code' in kwargs:
-                code = kwargs.pop('code')
-                remaining_args = ()
-            else:
-                # No code argument found — just pass through
-                return await original_execute(*args, **kwargs)
-
-            # Get session_id (second positional or keyword)
-            if remaining_args:
-                session_id = remaining_args[0]
-                remaining_args = remaining_args[1:]
-            elif 'session_id' in kwargs:
-                session_id = kwargs.get('session_id', 'default')
-            else:
-                session_id = 'default'
-
-        except Exception as e:
-            # Arg extraction failed — fall back to original
-            logger.warning(f"Resilience patch: arg extraction failed ({e}), falling back")
-            return await original_execute(*args, **kwargs)
-
-        # ── Apply resilience layers (all wrapped in try/except) ───
-        try:
-            # Change #13: Strip markdown code fences
+            # ── Change #13: Strip markdown code fences ──────────────
             code = strip_code_fences(code)
 
-            # Change #16: Detect non-code input
+            # ── Change #16: Detect non-code input ───────────────────
             non_code_msg = detect_non_code(code)
             if non_code_msg:
                 code = f"raise ValueError({repr(non_code_msg)})"
 
-            # Change #14 Layer B: Auto-prepend missing imports
+            # ── Change #14 Layer B: Auto-prepend missing imports ────
             code = auto_prepend_imports(code)
 
-        except Exception as e:
-            logger.warning(f"Resilience patch: preprocessing failed ({e}), using original code")
-            # Reset code to original if preprocessing broke it
-            if args:
-                code = args[0]
-            # Continue with execution — don't abort
-
-        # ── Change #12: Kernel prelude (first execution per session) ─
-        if session_id not in _prelude_sessions:
-            _prelude_sessions.add(session_id)  # Mark BEFORE executing
-            logger.info(
-                f"Kernel prelude: injecting auto-imports for "
-                f"session '{session_id}'"
-            )
-            try:
-                prelude_result = await original_execute(
-                    KERNEL_PRELUDE, session_id, **kwargs
-                )
-                if prelude_result.success:
-                    logger.info("Kernel prelude: auto-imports succeeded")
-                else:
-                    logger.warning(
-                        f"Kernel prelude: partial failure (non-fatal): "
-                        f"{prelude_result.error_message}"
+            # ── Change #12: Kernel prelude (once per session) ───────
+            if session_id not in _prelude_sessions:
+                # Mark BEFORE execution to prevent retry loops
+                _prelude_sessions.add(session_id)
+                try:
+                    prelude_result = await original_execute(
+                        KERNEL_PRELUDE, session_id
                     )
-            except Exception as e:
-                logger.warning(f"Kernel prelude: exception (non-fatal): {e}")
+                    if prelude_result.success:
+                        logger.info("Kernel prelude: auto-imports succeeded")
+                    else:
+                        logger.warning(
+                            f"Kernel prelude: partial failure (non-fatal): "
+                            f"{prelude_result.error_message}"
+                        )
+                except Exception as e:
+                    logger.warning(
+                        f"Kernel prelude: exception (non-fatal): {e}"
+                    )
 
-        # ── Execute user code ─────────────────────────────────────
-        # Rebuild args with the (possibly modified) code
-        if args:
-            new_args = (code,) + remaining_args
-        else:
-            kwargs['code'] = code
-            new_args = ()
+            # ── Execute user code ───────────────────────────────────
+            # Pass only (code, session_id, timeout) — the original
+            # execute() does NOT accept **kwargs
+            result = await original_execute(code, session_id, timeout)
 
-        try:
-            result = await original_execute(*new_args, **kwargs)
-        except Exception as e:
-            logger.error(f"Resilience patch: execute() raised {type(e).__name__}: {e}")
-            raise  # Re-raise — don't swallow execution errors
-
-        # ── Change #14 Layer A: NameError recovery ─────────────────
-        try:
+            # ── Change #14 Layer A: NameError recovery ──────────────
             if (
                 not result.success
                 and result.error_message
@@ -179,30 +153,39 @@ def apply_patches(executor_instance) -> None:
                         f"'{import_stmt}'"
                     )
                     recovery_code = import_stmt + "\n" + code
-                    if args:
-                        recovery_args = (recovery_code,) + remaining_args
-                    else:
-                        kwargs['code'] = recovery_code
-                        recovery_args = ()
-
-                    retry_result = await original_execute(
-                        *recovery_args, **kwargs
+                    result = await original_execute(
+                        recovery_code, session_id, timeout
                     )
-                    if retry_result.success:
-                        logger.info("Smart import recovery: retry SUCCEEDED")
-                        result = retry_result
+                    if result.success:
+                        logger.info(
+                            "Smart import recovery: retry SUCCEEDED"
+                        )
                     else:
                         logger.warning(
                             f"Smart import recovery: retry FAILED: "
-                            f"{retry_result.error_message}"
+                            f"{result.error_message}"
                         )
+
+            return result
+
         except Exception as e:
-            logger.warning(f"Smart import recovery: exception ({e}), returning original result")
-            # Return the original failed result, don't crash
+            # ── SAFETY NET ──────────────────────────────────────────
+            # If ANYTHING in the resilience logic crashes, fall through
+            # to the original execute. This guarantees the patch can
+            # NEVER cause a 500 Internal Server Error.
+            logger.error(
+                f"v2.9.3 resilience patch error (falling through "
+                f"to original execute): {e}"
+            )
+            try:
+                return await original_execute(
+                    original_code, session_id, timeout
+                )
+            except Exception:
+                # If even the fallback fails, re-raise for caller
+                raise
 
-        return result
-
-    # Apply the patch to the singleton instance
+    # Apply the patch
     executor_instance.execute = patched_execute
     executor_instance._resilience_patched = True
 

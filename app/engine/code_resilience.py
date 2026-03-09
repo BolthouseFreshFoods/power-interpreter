@@ -1,20 +1,19 @@
 """Code Resilience Helpers — Model-Agnostic Execution
 
-Power Interpreter v2.9.3
+Power Interpreter v2.9.3a
 Changes #12, #13, #14, #16
 
 Makes the sandbox resilient to common mistakes from smaller LLMs
 (Haiku, GPT-4o-mini, Gemini Flash, etc.) that our less technical
 team members often use.
 
-Change #12: KERNEL_PRELUDE — pre-import common modules at session start
-Change #13: strip_code_fences() — remove markdown code fences
-Change #14: detect_missing_import() + auto_prepend_imports() — smart recovery
-Change #16: detect_non_code() — catch natural language in code parameter
-
-IMPORTANT: KERNEL_PRELUDE only includes modules in executor.py's
-ALLOWED_IMPORTS whitelist. Modules like sys, os, platform are NOT
-included because the sandbox's _safe_import blocks them.
+IMPORTANT — KERNEL_PRELUDE rules:
+  1. Only 'import X' and 'import X as Y' patterns
+  2. NO 'from X import Y' — _preprocess_code rewrites these
+     destructively (see v2.8.4 datetime bug)
+  3. Only modules in executor.py's ALLOWED_IMPORTS whitelist
+  4. sys, os, platform are NOT included (sandbox blocks them)
+  5. Each import wrapped in its own try/except
 
 Author: MCA for Timothy Escamilla / Bolthouse Fresh Foods
 """
@@ -29,121 +28,166 @@ logger = logging.getLogger(__name__)
 # Change #12: Kernel Auto-Imports
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Executed ONCE per new session via resilience_patch.py.
-# Only includes modules in executor.py's ALLOWED_IMPORTS whitelist.
-# Each group wrapped in try/except so one failure doesn't block others.
+#
+# CRITICAL: Only uses 'import X' patterns. Never 'from X import Y'.
+# The sandbox's _preprocess_code rewrites 'from' imports in ways that
+# can corrupt the persistent namespace (see v2.8.4 datetime bug).
+#
+# Each import has its OWN try/except so one failure doesn't cascade.
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 KERNEL_PRELUDE = """\
-# === Power Interpreter Kernel Prelude (v2.9.3) ===
-# Auto-imported for every new session. Models don't need to import these.
-# Only sandbox-whitelisted modules included.
+# === Power Interpreter Kernel Prelude (v2.9.3a) ===
+# Auto-imported for every new session.
+# Only 'import X' patterns — no 'from X import Y' to avoid
+# _preprocess_code rewriting issues.
 
-# ── Math & Statistics ───────────────────────────────────────────────
+# ── Math & Statistics ────────────────────────────
 try:
     import math
+except:
+    pass
+try:
     import statistics
+except:
+    pass
+try:
     import random
+except:
+    pass
+try:
     import decimal
-    import fractions
-except Exception:
+except:
     pass
 
-# ── Text & Data Formats ─────────────────────────────────────────────
+# ── Text & Data Formats ─────────────────────────
 try:
     import string
+except:
+    pass
+try:
     import textwrap
+except:
+    pass
+try:
     import json
+except:
+    pass
+try:
     import csv
+except:
+    pass
+try:
     import re
-except Exception:
+except:
     pass
 
-# ── Collections & Functional ───────────────────────────────────────
+# ── Collections & Functional ────────────────────
 try:
     import collections
-    from collections import Counter, defaultdict, OrderedDict
+except:
+    pass
+try:
     import itertools
+except:
+    pass
+try:
     import functools
+except:
+    pass
+try:
     import operator
-except Exception:
+except:
     pass
 
-# ── Date & Time ────────────────────────────────────────────────────
+# ── Date & Time ─────────────────────────────────
 try:
     import datetime
-    from datetime import datetime as dt, timedelta, date, time as dt_time
+except:
+    pass
+try:
     import time
-except Exception:
+except:
     pass
 
-# ── I/O & Paths ────────────────────────────────────────────────────
+# ── I/O & Utilities ─────────────────────────────
 try:
     import io
-    import pathlib
-    from pathlib import Path
-    import copy
-except Exception:
+except:
     pass
-
-# ── Encoding & Hashing ─────────────────────────────────────────────
+try:
+    import pathlib
+except:
+    pass
+try:
+    import copy
+except:
+    pass
 try:
     import pprint
-    import typing
+except:
+    pass
+try:
     import struct
+except:
+    pass
+try:
     import base64
+except:
+    pass
+try:
     import hashlib
+except:
+    pass
+try:
     import uuid
+except:
+    pass
+try:
     import html
-except Exception:
+except:
+    pass
+try:
+    import typing
+except:
     pass
 
-# ── Data Science (try/except — may not be installed) ──────────────
+# ── Data Science ────────────────────────────────
 try:
     import pandas as pd
-except Exception:
+except:
     pass
-
 try:
     import numpy as np
-except Exception:
+except:
     pass
-
 try:
     import matplotlib
-    matplotlib.use('Agg')  # Non-interactive backend for server
+    matplotlib.use('Agg')
     import matplotlib.pyplot as plt
-except Exception:
+except:
     pass
-
 try:
     import seaborn as sns
-except Exception:
+except:
     pass
-
 try:
     import openpyxl
-except Exception:
+except:
     pass
-
 try:
     import xlrd
-except Exception:
+except:
     pass
-
 try:
     import scipy
-    import scipy.stats
-except Exception:
+except:
     pass
 """
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Change #13: Code Fence Stripping
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Smaller models frequently wrap code in markdown fences:
-#   ```python\nprint('hello')\n```
-# The backticks cause SyntaxError. This strips them transparently.
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def strip_code_fences(code: str) -> str:
@@ -164,13 +208,13 @@ def strip_code_fences(code: str) -> str:
     original = code
     code = code.strip()
 
-    # ── Opening fence ───────────────────────────────────────────────
+    # ── Opening fence ───────────────────────────────────────────
     opening_pattern = re.compile(r'^```(?:python|py|Python)?\s*\n', re.MULTILINE)
     match = opening_pattern.match(code)
     if match:
         code = code[match.end():]
 
-    # ── Closing fence ──────────────────────────────────────────────
+    # ── Closing fence ───────────────────────────────────────────
     if code.rstrip().endswith('```'):
         code = code.rstrip()[:-3].rstrip()
 
@@ -186,16 +230,10 @@ def strip_code_fences(code: str) -> str:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Change #14: Smart Import Recovery
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Two-layer defense:
-#   Layer A: detect_missing_import() — post-failure NameError recovery
-#   Layer B: auto_prepend_imports() — pre-execution static analysis
-#
-# Only includes modules in executor.py's ALLOWED_IMPORTS whitelist.
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 # Known names -> import statements (sandbox-allowed modules ONLY)
 RECOVERABLE_IMPORTS = {
-    # ── Standard library (in ALLOWED_IMPORTS) ────────────────────────
+    # ── Standard library (in ALLOWED_IMPORTS) ────────────────────
     "math": "import math",
     "statistics": "import statistics",
     "random": "import random",
@@ -205,26 +243,24 @@ RECOVERABLE_IMPORTS = {
     "csv": "import csv",
     "re": "import re",
     "collections": "import collections",
-    "Counter": "from collections import Counter",
-    "defaultdict": "from collections import defaultdict",
-    "OrderedDict": "from collections import OrderedDict",
+    "Counter": "import collections; Counter = collections.Counter",
+    "defaultdict": "import collections; defaultdict = collections.defaultdict",
+    "OrderedDict": "import collections; OrderedDict = collections.OrderedDict",
     "itertools": "import itertools",
     "functools": "import functools",
     "operator": "import operator",
     "decimal": "import decimal",
-    "Decimal": "from decimal import Decimal",
+    "Decimal": "import decimal; Decimal = decimal.Decimal",
     "fractions": "import fractions",
-    "Fraction": "from fractions import Fraction",
     "datetime": "import datetime",
-    "dt": "from datetime import datetime as dt",
-    "timedelta": "from datetime import timedelta",
-    "date": "from datetime import date",
+    "timedelta": "import datetime; timedelta = datetime.timedelta",
+    "date": "import datetime; date = datetime.date",
     "time": "import time",
     "io": "import io",
     "pathlib": "import pathlib",
-    "Path": "from pathlib import Path",
+    "Path": "import pathlib; Path = pathlib.Path",
     "copy": "import copy",
-    "deepcopy": "from copy import deepcopy",
+    "deepcopy": "import copy; deepcopy = copy.deepcopy",
     "pprint": "import pprint",
     "typing": "import typing",
     "struct": "import struct",
@@ -236,7 +272,7 @@ RECOVERABLE_IMPORTS = {
     "abc": "import abc",
     "dataclasses": "import dataclasses",
 
-    # ── Data science (common aliases) ───────────────────────────────
+    # ── Data science (common aliases) ────────────────────────────
     "pd": "import pandas as pd",
     "np": "import numpy as np",
     "plt": "import matplotlib; matplotlib.use('Agg'); import matplotlib.pyplot as plt",
@@ -244,7 +280,7 @@ RECOVERABLE_IMPORTS = {
     "px": "import plotly.express as px",
     "go": "import plotly.graph_objects as go",
 
-    # ── Data science (full names) ───────────────────────────────────
+    # ── Data science (full names) ────────────────────────────────
     "pandas": "import pandas",
     "numpy": "import numpy",
     "matplotlib": "import matplotlib",
@@ -258,17 +294,7 @@ RECOVERABLE_IMPORTS = {
 
 
 def detect_missing_import(error: Exception) -> str | None:
-    """If error is a NameError for a known module, return its import statement.
-
-    Used as post-failure recovery: if exec() raises NameError for 'pd',
-    this returns 'import pandas as pd' so the caller can inject it and retry.
-
-    Args:
-        error: The exception from code execution.
-
-    Returns:
-        Import statement string, or None if not recoverable.
-    """
+    """If error is a NameError for a known module, return its import statement."""
     if not isinstance(error, NameError):
         return None
 
@@ -296,14 +322,6 @@ def auto_prepend_imports(code: str) -> str:
 
     Scans code for patterns like 'pd.read_csv' or 'np.array' where the
     model forgot to include the import. Prepends the required imports.
-
-    This is Layer B (proactive). Layer A (detect_missing_import) is reactive.
-
-    Args:
-        code: The user's code string.
-
-    Returns:
-        Code with missing imports prepended, or original if none needed.
     """
     if not code:
         return code
@@ -345,17 +363,7 @@ def auto_prepend_imports(code: str) -> str:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def detect_non_code(code: str) -> str | None:
-    """Detect if input is natural language instead of Python code.
-
-    Smaller models sometimes put a description in the code parameter.
-    Returns an actionable error message so the model can self-correct.
-
-    Args:
-        code: The supposed Python code string.
-
-    Returns:
-        Error message string if input looks like prose, None if it looks like code.
-    """
+    """Detect if input is natural language instead of Python code."""
     if not code or len(code.strip()) < 10:
         return None
 

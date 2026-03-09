@@ -14,7 +14,7 @@ Features:
 - Microsoft OneDrive + SharePoint integration (v1.9.0)
 
 Author: Kaffer AI for Timothy Escamilla
-Version: 2.9.1
+Version: 2.9.2
 
 HISTORY:
   v1.7.2: fetch_from_url route fix, stable release
@@ -24,6 +24,8 @@ HISTORY:
   v2.8.6: Version unification across all files
   v2.9.0: Trimmed all 34 tool descriptions for token optimization (~57% reduction)
   v2.9.1: Smart error handling for empty execute_code args (model-agnostic)
+  v2.9.2: Response guardrails — truncate oversized MCP tool results (Change #10)
+"""
 """
 
 import logging
@@ -50,13 +52,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ── Response Budget Guard (Change #10) ──────────────────────────────────
+# Cap MCP tool responses to prevent a single call from consuming the
+# entire context window. 50,000 chars ≈ 12,500 tokens — leaves room
+# for the model to reason + respond.
+# The 321,665-char OneDrive response that ate ~80K tokens? Never again.
+MCP_RESPONSE_MAX_CHARS = 50_000
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifecycle management"""
     # --- STARTUP ---
     logger.info("="*60)
-    logger.info("Power Interpreter MCP v2.9.1 starting...")
+    logger.info("Power Interpreter MCP v2.9.2 starting...")
     logger.info("="*60)
 
     # Ensure directories exist
@@ -539,13 +547,31 @@ async def _handle_single_jsonrpc(data: dict):
                     },
                 }
 
-            logger.info(f"MCP direct: invoking {tool_name}...")
+                       logger.info(f"MCP direct: invoking {tool_name}...")
             result = await fn(**tool_args)
             result_str = str(result)
-            logger.info(f"MCP direct: {tool_name} returned {len(result_str)} chars")
+            original_len = len(result_str)
+            logger.info(f"MCP direct: {tool_name} returned {original_len:,} chars")
             logger.info(f"MCP direct: result preview: {result_str[:300]}")
 
-            if isinstance(result, str):
+            # ── Response Budget Guard (Change #10) ──────────────────
+            # Truncate oversized responses to protect the LLM context window.
+            # A single 321K-char OneDrive listing consumed ~80K tokens.
+            if original_len > MCP_RESPONSE_MAX_CHARS:
+                truncated_result = result_str[:MCP_RESPONSE_MAX_CHARS]
+                truncation_notice = (
+                    f"\n\n--- RESPONSE TRUNCATED ---\n"
+                    f"Original size: {original_len:,} chars ({original_len // 4:,} est. tokens)\n"
+                    f"Returned: {MCP_RESPONSE_MAX_CHARS:,} chars\n"
+                    f"Omitted: {original_len - MCP_RESPONSE_MAX_CHARS:,} chars\n"
+                    f"Tip: Use filters or pagination to reduce result size."
+                )
+                content = [{"type": "text", "text": truncated_result + truncation_notice}]
+                logger.warning(
+                    f"MCP direct: {tool_name} response TRUNCATED "
+                    f"{original_len:,} -> {MCP_RESPONSE_MAX_CHARS:,} chars"
+                )
+            elif isinstance(result, str):
                 content = [{"type": "text", "text": result}]
             elif isinstance(result, dict):
                 content = [{"type": "text", "text": json.dumps(result)}]

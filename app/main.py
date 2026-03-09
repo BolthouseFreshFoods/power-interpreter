@@ -26,7 +26,6 @@ HISTORY:
   v2.9.1: Smart error handling for empty execute_code args (model-agnostic)
   v2.9.2: Response guardrails — truncate oversized MCP tool results (Change #10)
 """
-"""
 
 import logging
 import asyncio

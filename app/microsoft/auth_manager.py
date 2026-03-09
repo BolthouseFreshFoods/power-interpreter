@@ -1,8 +1,7 @@
 """Microsoft OAuth 2.0 Device Code Flow + Token Management
-
 v1.9.4: Added get_default_user_id() so tools can auto-resolve user_id.
-v2.9.3a: Added clear_user_token() and list_authenticated_users_async()
-         for multi-user token management. No hardcoded emails.
+v2.9.3a: Added clear_user_token() and list_authenticated_users() for admin.
+         No hardcoded emails — default user resolved from most recent Postgres entry.
 """
 import os, time, json, logging, asyncio
 from typing import Optional, Dict, Any, List
@@ -60,105 +59,51 @@ class MSAuthManager:
                 logger.warning(f"MS Auth: Failed to load default user: {e}")
         return None
 
-    # \u2500\u2500 Token Management (v2.9.3a) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-
     async def clear_user_token(self, user_id: str) -> Dict[str, Any]:
-        """Clear stored authentication tokens for a specific user.
+        """Remove a user's tokens from memory and Postgres.
 
-        Removes from both in-memory cache and Postgres persistence.
-        Use this to purge stale or incorrect login entries.
-
-        Args:
-            user_id: The email/user_id to clear tokens for.
-
-        Returns:
-            Dict with status and details of the operation.
+        Use to purge stale entries (e.g., wrong email address).
+        After clearing, the user must re-authenticate with ms_auth_start.
         """
-        cleared_memory = False
-        cleared_db = False
-
-        # Clear from in-memory cache
-        if user_id in self._tokens:
-            self._tokens.pop(user_id)
-            cleared_memory = True
+        removed_memory = user_id in self._tokens
+        self._tokens.pop(user_id, None)
         if self._last_authenticated_user == user_id:
             self._last_authenticated_user = None
-
-        # Clear from Postgres
+        removed_db = False
         if self._db_ready:
             try:
                 from app.database import get_session_factory
                 from sqlalchemy import text
                 async with get_session_factory()() as s:
-                    result = await s.execute(
-                        text("DELETE FROM ms_tokens WHERE user_id = :uid"),
-                        {"uid": user_id}
-                    )
+                    result = await s.execute(text("DELETE FROM ms_tokens WHERE user_id = :uid"), {"uid": user_id})
                     await s.commit()
-                    cleared_db = result.rowcount > 0
-                logger.info(f"MS Auth: Cleared token for {user_id} (memory={cleared_memory}, db={cleared_db})")
+                    removed_db = result.rowcount > 0
             except Exception as e:
-                logger.warning(f"MS Auth: Failed to clear token from db: {e}")
-                return {
-                    "cleared": cleared_memory,
-                    "memory": cleared_memory,
-                    "database": False,
-                    "error": str(e),
-                }
+                logger.warning(f"MS Auth: Failed to clear token from DB: {e}")
+        logger.info(f"MS Auth: clear_user_token({user_id}): memory={removed_memory}, db={removed_db}")
+        return {"user_id": user_id, "removed_from_memory": removed_memory, "removed_from_database": removed_db}
 
-        return {
-            "cleared": cleared_memory or cleared_db,
-            "memory": cleared_memory,
-            "database": cleared_db,
-        }
-
-    async def list_authenticated_users_async(self) -> List[Dict[str, Any]]:
-        """List all users with stored tokens.
-
-        Queries both in-memory cache and Postgres for a complete picture.
-
-        Returns:
-            List of dicts with user_id, status, and last_updated.
-        """
+    async def list_authenticated_users(self) -> List[Dict[str, Any]]:
+        """List all users with tokens in memory and Postgres."""
         users = []
-        seen_ids = set()
-
-        # Query Postgres first (source of truth)
+        memory_uids = set()
+        for uid, data in self._tokens.items():
+            if data.get("status") == "authenticated":
+                users.append({"user_id": uid, "source": "memory", "is_default": uid == self._last_authenticated_user})
+                memory_uids.add(uid)
         if self._db_ready:
             try:
                 from app.database import get_session_factory
                 from sqlalchemy import text
                 async with get_session_factory()() as s:
-                    result = await s.execute(
-                        text("SELECT user_id, updated_at FROM ms_tokens ORDER BY updated_at DESC")
-                    )
+                    result = await s.execute(text("SELECT user_id, updated_at FROM ms_tokens ORDER BY updated_at DESC"))
                     for row in result.fetchall():
                         uid = row[0]
-                        seen_ids.add(uid)
-                        in_memory = self._tokens.get(uid, {})
-                        status = in_memory.get("status", "stored")
-                        users.append({
-                            "user_id": uid,
-                            "status": status,
-                            "last_updated": str(row[1]),
-                            "is_default": uid == self._last_authenticated_user,
-                        })
+                        if uid not in memory_uids:
+                            users.append({"user_id": uid, "source": "database", "last_updated": str(row[1]), "is_default": False})
             except Exception as e:
-                logger.warning(f"MS Auth: Failed to list users from db: {e}")
-
-        # Add any in-memory-only tokens (e.g. pending logins)
-        for uid, data in self._tokens.items():
-            if uid not in seen_ids:
-                users.append({
-                    "user_id": uid,
-                    "status": data.get("status", "unknown"),
-                    "last_updated": "in-memory only",
-                    "is_default": uid == self._last_authenticated_user,
-                })
-
+                logger.warning(f"MS Auth: Failed to list DB users: {e}")
         return users
-
-    # \u2500\u2500 Database Setup \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 
     async def ensure_db_table(self):
         try:
@@ -173,8 +118,6 @@ class MSAuthManager:
             logger.info("MS Auth: ms_tokens table ready")
         except Exception as e:
             logger.warning(f"MS Auth: Failed to create ms_tokens table: {e}")
-
-    # \u2500\u2500 Device Code Flow \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 
     async def start_device_login(self, user_id: str) -> Dict[str, Any]:
         if not self._enabled:
@@ -213,8 +156,6 @@ class MSAuthManager:
             else: self._tokens.pop(user_id, None); return {"status": "error", "message": body.get("error_description", error)}
         return {"status": "error", "message": "Timed out."}
 
-    # \u2500\u2500 Token Access & Refresh \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-
     async def get_access_token(self, user_id: str) -> Optional[str]:
         td = self._tokens.get(user_id)
         if not td or td.get("status") != "authenticated":
@@ -245,8 +186,6 @@ class MSAuthManager:
 
     async def is_authenticated_async(self, user_id): return await self.get_access_token(user_id) is not None
     def is_authenticated(self, user_id): return self._tokens.get(user_id, {}).get("status") == "authenticated"
-
-    # \u2500\u2500 Token Persistence (Postgres) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 
     async def _persist_token(self, user_id):
         if not self._db_ready: return

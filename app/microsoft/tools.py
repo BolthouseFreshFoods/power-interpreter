@@ -1,6 +1,6 @@
 """MCP Tool registrations for OneDrive & SharePoint.
 
-Version: 2.9.6 — consolidated tools for token optimization
+Version: 2.9.7 — save_to_sandbox for list/search tools
 
 HISTORY:
   v1.9.4: Made user_id optional, added resolve_share_link (22 tools).
@@ -12,14 +12,22 @@ HISTORY:
   v2.9.6: Consolidated 22 tools into 4 (ms_auth, onedrive,
           sharepoint, resolve_share_link). ~50% token reduction
           in LLM context. 36 total tools -> 18 total tools.
-          Descriptions trimmed for minimal token footprint.
+  v2.9.7: Added save_to_sandbox parameter to onedrive and sharepoint
+          list/search actions. Writes full JSON to sandbox filesystem,
+          returns lightweight summary to LLM. Eliminates manual
+          transcription bottleneck for large folder listings.
 """
 
 import json
 import logging
+import os
+import glob
 import httpx
 
 logger = logging.getLogger(__name__)
+
+# Sandbox base directory
+_SANDBOX_DIR = os.getenv("SANDBOX_DIR", "/app/sandbox_data")
 
 
 def register_microsoft_tools(mcp, graph_client, auth_manager):
@@ -83,6 +91,48 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
             "error": True, "error_type": "validation_error",
             "message": f"'{param}' is required for action '{action}'.",
         }, indent=2)
+
+    def _save_result_to_sandbox(result: dict, session_id: str, prefix: str) -> dict:
+        """Write full JSON result to sandbox filesystem, return summary.
+
+        Eliminates LLM transcription bottleneck for large listings.
+        The LLM gets a ~200 char summary; execute_code gets the full data.
+        """
+        sandbox_dir = os.path.join(_SANDBOX_DIR, session_id)
+        os.makedirs(sandbox_dir, exist_ok=True)
+
+        # Sequential page numbering based on existing files
+        pattern = os.path.join(sandbox_dir, f"{prefix}_*.json")
+        existing = sorted(glob.glob(pattern))
+        page_num = len(existing) + 1
+        filename = f"{prefix}_{page_num}.json"
+        filepath = os.path.join(sandbox_dir, filename)
+
+        # Write compact JSON (no indent = smaller file)
+        with open(filepath, 'w') as f:
+            json.dump(result, f)
+
+        # Extract items from result (handle different key names)
+        items = result.get("items", result.get("sites", result.get("lists", [])))
+        item_count = len(items) if isinstance(items, list) else 0
+        file_size = os.path.getsize(filepath)
+
+        logger.info(
+            f"save_to_sandbox: {filename} \u2014 {item_count} items, "
+            f"{file_size:,} bytes in {sandbox_dir}"
+        )
+
+        return {
+            "saved_to_sandbox": True,
+            "file": filename,
+            "path": filepath,
+            "page": page_num,
+            "items_count": item_count,
+            "file_size_bytes": file_size,
+            "has_more": result.get("has_more", False),
+            "next_page": result.get("next_page"),
+            "tip": f"Use execute_code: data = json.load(open('{filepath}'))"
+        }
 
     # \u2500\u2500 CONSOLIDATED AUTH TOOL \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 
@@ -158,6 +208,7 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
         parent_path: str = None,
         top: int = 50,
         page_token: str = None,
+        save_to_sandbox: bool = False,
         content_base64: str = None,
         content_type: str = "application/octet-stream",
         dest_folder_id: str = None,
@@ -178,13 +229,14 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
             parent_path: Parent folder (create_folder).
             top: Page size, default 50 (list_files/search).
             page_token: Cursor from previous next_page.
+            save_to_sandbox: Save full JSON to sandbox for execute_code (list_files/search). Returns summary only.
             content_base64: Base64 file data (upload).
             content_type: MIME type (upload).
             dest_folder_id: Target folder (move/copy).
             new_name: Rename (move/copy).
             share_type: view|edit (share).
             scope: anonymous|organization (share).
-            session_id: Sandbox session (download).
+            session_id: Sandbox session (download/save_to_sandbox).
             user_id: Microsoft email. Optional if authenticated.
         """
         try:
@@ -193,6 +245,9 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
             if action == "list_files":
                 result = await graph_client.onedrive_list_files(
                     uid, path or "/", top, page_token=page_token)
+                if save_to_sandbox:
+                    summary = _save_result_to_sandbox(result, session_id, "onedrive_list")
+                    return json.dumps(summary, indent=2)
 
             elif action == "get_file":
                 if not item_id: return _missing("item_id", action)
@@ -207,6 +262,9 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
                 if not query: return _missing("query", action)
                 result = await graph_client.onedrive_search(
                     uid, query, top, page_token=page_token)
+                if save_to_sandbox:
+                    summary = _save_result_to_sandbox(result, session_id, "onedrive_search")
+                    return json.dumps(summary, indent=2)
 
             elif action == "create_folder":
                 if not name: return _missing("name", action)
@@ -264,6 +322,7 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
         search: str = None,
         top: int = 50,
         page_token: str = None,
+        save_to_sandbox: bool = False,
         content_base64: str = None,
         content_type: str = "application/octet-stream",
         session_id: str = "default",
@@ -282,9 +341,10 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
             search: Filter text (list_sites).
             top: Page size, default 50.
             page_token: Cursor from previous next_page.
+            save_to_sandbox: Save full JSON to sandbox for execute_code. Returns summary only.
             content_base64: Base64 file data (upload).
             content_type: MIME type (upload).
-            session_id: Sandbox session (download).
+            session_id: Sandbox session (download/save_to_sandbox).
             user_id: Microsoft email. Optional if authenticated.
         """
         try:
@@ -293,6 +353,9 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
             if action == "list_sites":
                 result = await graph_client.sharepoint_list_sites(
                     uid, search, page_token=page_token)
+                if save_to_sandbox:
+                    summary = _save_result_to_sandbox(result, session_id, "sp_sites")
+                    return json.dumps(summary, indent=2)
 
             elif action == "get_site":
                 if not site_id: return _missing("site_id", action)
@@ -307,6 +370,9 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
                 result = await graph_client.sharepoint_list_files(
                     uid, site_id, drive_id, path or "/", top,
                     page_token=page_token)
+                if save_to_sandbox:
+                    summary = _save_result_to_sandbox(result, session_id, "sp_list")
+                    return json.dumps(summary, indent=2)
 
             elif action == "download":
                 if not site_id: return _missing("site_id", action)
@@ -328,11 +394,17 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
                 result = await graph_client.sharepoint_search(
                     uid, site_id, query, drive_id, top,
                     page_token=page_token)
+                if save_to_sandbox:
+                    summary = _save_result_to_sandbox(result, session_id, "sp_search")
+                    return json.dumps(summary, indent=2)
 
             elif action == "list_lists":
                 if not site_id: return _missing("site_id", action)
                 result = await graph_client.sharepoint_list_lists(
                     uid, site_id, page_token=page_token)
+                if save_to_sandbox:
+                    summary = _save_result_to_sandbox(result, session_id, "sp_lists")
+                    return json.dumps(summary, indent=2)
 
             elif action == "list_items":
                 if not site_id: return _missing("site_id", action)
@@ -340,6 +412,9 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
                 result = await graph_client.sharepoint_list_items(
                     uid, site_id, list_id, top,
                     page_token=page_token)
+                if save_to_sandbox:
+                    summary = _save_result_to_sandbox(result, session_id, "sp_items")
+                    return json.dumps(summary, indent=2)
 
             else:
                 return json.dumps({
@@ -379,5 +454,5 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
         except Exception as e:
             return _error_response(e, "resolve_share_link")
 
-    # v2.9.6: Consolidated 22 tools -> 4 tools for ~50% token reduction
-    logger.info("Microsoft tools registered (4 consolidated tools, v2.9.6)")
+    # v2.9.7: save_to_sandbox + consolidated tools
+    logger.info("Microsoft tools registered (4 consolidated tools, v2.9.7)")

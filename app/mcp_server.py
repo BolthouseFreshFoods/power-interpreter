@@ -3,20 +3,20 @@
 Defines the MCP tools that SimTheory.ai can call.
 This maps MCP tool calls to the FastAPI endpoints.
 
-MCP Tools (34):
-  12 core tools (execute, files, jobs, datasets, sessions)
-  22 Microsoft 365 tools (OneDrive + SharePoint)
+MCP Tools (18):
+    12 core tools (execute, files, jobs, datasets, sessions)
+    4 consolidated Microsoft tools (ms_auth, onedrive, sharepoint, resolve_share_link)
+    2 admin tools (ms_auth_clear, ms_auth_list_users)
 
-Version: 2.9.1 — version alignment + kernel persistence patches
+Version: 2.9.6 — consolidated tools for token optimization
 
 HISTORY:
   v2.8.6: Version unification across all files.
   v2.9.0: Trimmed all 34 tool descriptions to reduce token overhead.
            ~57% reduction in tool context tokens per message.
            No logic changes — only docstrings modified.
-  v2.9.1: Version alignment across all modules. Smart error handling
-           for empty execute_code args. Kernel persistence patches.
-           Fixed MS tool count log (21→22).
+  v2.9.1: Version alignment ....
+  v2.9.6: Consolidated 22 tools into 4. ~50% token reduction.
 """
 
 from mcp.server.fastmcp import FastMCP
@@ -658,7 +658,7 @@ try:
     from app.microsoft.bootstrap import init_microsoft_tools
     _ms_auth, _ms_graph = init_microsoft_tools(mcp)
     if _ms_auth:
-        logger.info("Microsoft OneDrive + SharePoint integration: ENABLED (22 additional tools)")
+        logger.info("Microsoft OneDrive + SharePoint integration: ENABLED (4 consolidated + 2 admin tools)")
     else:
         logger.info("Microsoft OneDrive + SharePoint integration: SKIPPED (no Azure credentials)")
 except Exception as e:

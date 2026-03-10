@@ -45,15 +45,17 @@ def init_microsoft_tools(mcp):
         from app.microsoft.auth_manager import MSAuthManager
         from app.microsoft.graph_client import GraphClient
         # v1.9.4: Import from tools.py (the canonical file)
-        # Previously imported from mcp_tools.py which was a stale duplicate
         from app.microsoft.tools import register_microsoft_tools
         # v2.9.3a: Auth admin tools (ms_auth_clear, ms_auth_list_users)
         from app.microsoft.auth_admin import register_auth_admin_tools
 
         auth_manager = MSAuthManager()
         graph_client = GraphClient(auth_manager)
+
+        # Register 22 OneDrive + SharePoint data tools
         register_microsoft_tools(mcp, graph_client, auth_manager)
-        # Register admin tools — only needs auth_manager, no graph_client
+
+        # Register auth admin tools (only needs auth_manager)
         admin_count = register_auth_admin_tools(mcp, auth_manager)
 
         logger.info(

@@ -1,12 +1,14 @@
 """MCP Tool registrations for OneDrive & SharePoint.
 
-Version: 2.9.1 — trimmed tool descriptions for token optimization
+Version: 2.9.4 — universal cursor pagination for all list/search tools
 
 HISTORY:
   v1.9.4: Made user_id optional, added resolve_share_link (22 tools).
   v2.8.6: Version unification across all files.
   v2.9.0: Trimmed all 22 tool descriptions to reduce token overhead.
   v2.9.1: Version string alignment across all modules.
+  v2.9.4: Added page_token parameter to all list/search tools.
+          Enables cursor pagination via @odata.nextLink.
 """
 
 import json
@@ -22,18 +24,18 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
         """Resolve user_id: use provided value or fall back to last authenticated user."""
         if user_id:
             return user_id
-        
+
         default = await auth_manager.get_default_user_id_async()
         if default:
             logger.info(f"Auto-resolved user_id to: {default}")
             return default
-        
+
         raise ValueError(
             "No user_id provided and no authenticated user found. "
             "Please authenticate first with ms_auth_start(user_id='your@email.com')"
         )
 
-    # ── AUTH TOOLS ──────────────────────────────────────────────────
+    # ── AUTH TOOLS ──────────────────────────────────────────────
 
     @mcp.tool()
     async def ms_auth_status(user_id: str = None) -> str:
@@ -73,7 +75,7 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
         """Start Microsoft device login. Returns a code and URL. Call ms_auth_poll after user enters the code.
 
         Args:
-            user_id: Microsoft email (e.g. tescamilla@bolthousefresh.com).
+            user_id: Microsoft email (e.g. timothy.escamilla@bolthousefresh.com).
         """
         try:
             result = await auth_manager.start_device_login(user_id)
@@ -113,7 +115,7 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
                 "message": f"Polling failed: {str(e)}",
             }, indent=2)
 
-    # ── SHARING URL RESOLVER ───────────────────────────────────────
+    # ── SHARING URL RESOLVER ─────────────────────────────────────
 
     @mcp.tool()
     async def resolve_share_link(
@@ -151,44 +153,44 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
                 "sharing_url": sharing_url,
             }, indent=2)
 
-    # ── ONEDRIVE TOOLS ──────────────────────────────────────────────
+    # ── ONEDRIVE TOOLS ──────────────────────────────────────────
 
     @mcp.tool()
     async def onedrive_list_files(
-        user_id: str = None,
         path: str = "/",
         top: int = 50,
+        page_token: str = None,
+        user_id: str = None,
     ) -> str:
-        """List files and folders in OneDrive.
+        """List files in a OneDrive folder. Returns has_more and next_page for pagination.
 
         Args:
+            path: Folder path (default root).
+            top: Max items per page (default 50, max 200).
+            page_token: Pagination cursor from previous response's next_page field.
             user_id: Microsoft email. Optional if already authenticated.
-            path: Folder path (/ for root).
-            top: Max items to return (default 50).
         """
         try:
             uid = await _resolve_user(user_id)
-            result = await graph_client.onedrive_list(uid, path, top)
+            result = await graph_client.onedrive_list_files(uid, path, top, page_token=page_token)
             return json.dumps(result, indent=2)
         except ValueError as e:
             return json.dumps({"error": True, "message": str(e)}, indent=2)
 
     @mcp.tool()
-    async def onedrive_search(
-        query: str,
+    async def onedrive_get_file(
+        item_id: str,
         user_id: str = None,
-        top: int = 25,
     ) -> str:
-        """Search OneDrive by name or content.
+        """Get metadata for a specific OneDrive file or folder.
 
         Args:
-            query: Search query string.
+            item_id: File/folder item ID.
             user_id: Microsoft email. Optional if already authenticated.
-            top: Max results (default 25).
         """
         try:
             uid = await _resolve_user(user_id)
-            result = await graph_client.onedrive_search(uid, query, top)
+            result = await graph_client.onedrive_get_file(uid, item_id)
             return json.dumps(result, indent=2)
         except ValueError as e:
             return json.dumps({"error": True, "message": str(e)}, indent=2)
@@ -199,20 +201,60 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
         user_id: str = None,
         session_id: str = "default",
     ) -> str:
-        """Download a file from OneDrive to the sandbox for use with execute_code.
+        """Download a file from OneDrive to the sandbox for analysis.
 
         Args:
-            item_id: The file's OneDrive item ID.
+            item_id: File item ID.
             user_id: Microsoft email. Optional if already authenticated.
             session_id: Sandbox session ID.
         """
         try:
             uid = await _resolve_user(user_id)
             result = await graph_client.onedrive_download(
-                uid, item_id,
-                save_to_sandbox=True,
-                session_id=session_id,
+                uid, item_id, save_to_sandbox=True, session_id=session_id
             )
+            return json.dumps(result, indent=2)
+        except ValueError as e:
+            return json.dumps({"error": True, "message": str(e)}, indent=2)
+
+    @mcp.tool()
+    async def onedrive_search(
+        query: str,
+        top: int = 25,
+        page_token: str = None,
+        user_id: str = None,
+    ) -> str:
+        """Search OneDrive files by name or content. Returns has_more and next_page for pagination.
+
+        Args:
+            query: Search query.
+            top: Max results per page (default 25).
+            page_token: Pagination cursor from previous response's next_page field.
+            user_id: Microsoft email. Optional if already authenticated.
+        """
+        try:
+            uid = await _resolve_user(user_id)
+            result = await graph_client.onedrive_search(uid, query, top, page_token=page_token)
+            return json.dumps(result, indent=2)
+        except ValueError as e:
+            return json.dumps({"error": True, "message": str(e)}, indent=2)
+
+    @mcp.tool()
+    async def onedrive_create_folder(
+        name: str,
+        parent_path: str = None,
+        user_id: str = None,
+    ) -> str:
+        """Create a new folder in OneDrive.
+
+        Args:
+            name: Folder name.
+            parent_path: Parent folder path (default root).
+            user_id: Microsoft email. Optional if already authenticated.
+        """
+        try:
+            uid = await _resolve_user(user_id)
+            result = await graph_client.onedrive_create_folder(uid, name, parent_path)
             return json.dumps(result, indent=2)
         except ValueError as e:
             return json.dumps({"error": True, "message": str(e)}, indent=2)
@@ -221,16 +263,16 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
     async def onedrive_upload_file(
         path: str,
         content_base64: str,
-        user_id: str = None,
         content_type: str = "application/octet-stream",
+        user_id: str = None,
     ) -> str:
         """Upload a file to OneDrive (max 4MB).
 
         Args:
-            path: Destination path (e.g. /Documents/report.xlsx).
+            path: Destination path (e.g. /Reports/report.xlsx).
             content_base64: File content as base64.
-            user_id: Microsoft email. Optional if already authenticated.
             content_type: MIME type.
+            user_id: Microsoft email. Optional if already authenticated.
         """
         try:
             uid = await _resolve_user(user_id)
@@ -240,34 +282,14 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
             return json.dumps({"error": True, "message": str(e)}, indent=2)
 
     @mcp.tool()
-    async def onedrive_create_folder(
-        folder_name: str,
-        parent_path: str = "/",
-        user_id: str = None,
-    ) -> str:
-        """Create a folder in OneDrive.
-
-        Args:
-            folder_name: Name of the new folder.
-            parent_path: Parent folder path (/ for root).
-            user_id: Microsoft email. Optional if already authenticated.
-        """
-        try:
-            uid = await _resolve_user(user_id)
-            result = await graph_client.onedrive_create_folder(uid, parent_path, folder_name)
-            return json.dumps(result, indent=2)
-        except ValueError as e:
-            return json.dumps({"error": True, "message": str(e)}, indent=2)
-
-    @mcp.tool()
     async def onedrive_delete_item(
         item_id: str,
         user_id: str = None,
     ) -> str:
-        """Delete a file or folder from OneDrive.
+        """Delete a OneDrive file or folder.
 
         Args:
-            item_id: The item's OneDrive ID.
+            item_id: Item ID to delete.
             user_id: Microsoft email. Optional if already authenticated.
         """
         try:
@@ -284,10 +306,10 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
         new_name: str = None,
         user_id: str = None,
     ) -> str:
-        """Move a file or folder in OneDrive.
+        """Move a OneDrive item to a different folder.
 
         Args:
-            item_id: Item to move.
+            item_id: Item ID to move.
             dest_folder_id: Destination folder ID.
             new_name: Optional new name.
             user_id: Microsoft email. Optional if already authenticated.
@@ -306,10 +328,10 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
         new_name: str = None,
         user_id: str = None,
     ) -> str:
-        """Copy a file or folder in OneDrive.
+        """Copy a OneDrive item to another folder.
 
         Args:
-            item_id: Item to copy.
+            item_id: Item ID to copy.
             dest_folder_id: Destination folder ID.
             new_name: Optional new name for the copy.
             user_id: Microsoft email. Optional if already authenticated.
@@ -331,9 +353,9 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
         """Create a sharing link for a OneDrive item.
 
         Args:
-            item_id: Item to share.
-            share_type: 'view' or 'edit' (default 'view').
-            scope: 'anonymous', 'organization', or 'users' (default 'organization').
+            item_id: Item ID to share.
+            share_type: Link type (view/edit).
+            scope: Sharing scope (anonymous/organization).
             user_id: Microsoft email. Optional if already authenticated.
         """
         try:
@@ -343,22 +365,24 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
         except ValueError as e:
             return json.dumps({"error": True, "message": str(e)}, indent=2)
 
-    # ── SHAREPOINT TOOLS ────────────────────────────────────────────
+    # ── SHAREPOINT TOOLS ────────────────────────────────────────
 
     @mcp.tool()
     async def sharepoint_list_sites(
         search: str = None,
+        page_token: str = None,
         user_id: str = None,
     ) -> str:
-        """List or search accessible SharePoint sites.
+        """List accessible SharePoint sites. Returns has_more and next_page for pagination.
 
         Args:
             search: Optional search query to filter sites.
+            page_token: Pagination cursor from previous response's next_page field.
             user_id: Microsoft email. Optional if already authenticated.
         """
         try:
             uid = await _resolve_user(user_id)
-            result = await graph_client.sharepoint_list_sites(uid, search)
+            result = await graph_client.sharepoint_list_sites(uid, search, page_token=page_token)
             return json.dumps(result, indent=2)
         except ValueError as e:
             return json.dumps({"error": True, "message": str(e)}, indent=2)
@@ -368,7 +392,7 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
         site_id: str,
         user_id: str = None,
     ) -> str:
-        """Get details of a specific SharePoint site.
+        """Get details about a specific SharePoint site.
 
         Args:
             site_id: SharePoint site ID.
@@ -405,20 +429,22 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
         drive_id: str = None,
         path: str = "/",
         top: int = 50,
+        page_token: str = None,
         user_id: str = None,
     ) -> str:
-        """List files in a SharePoint document library.
+        """List files in a SharePoint document library. Returns has_more and next_page for pagination.
 
         Args:
             site_id: SharePoint site ID.
             drive_id: Optional drive/library ID.
             path: Folder path within the library.
-            top: Max items (default 50).
+            top: Max items per page (default 50).
+            page_token: Pagination cursor from previous response's next_page field.
             user_id: Microsoft email. Optional if already authenticated.
         """
         try:
             uid = await _resolve_user(user_id)
-            result = await graph_client.sharepoint_list_files(uid, site_id, drive_id, path, top)
+            result = await graph_client.sharepoint_list_files(uid, site_id, drive_id, path, top, page_token=page_token)
             return json.dumps(result, indent=2)
         except ValueError as e:
             return json.dumps({"error": True, "message": str(e)}, indent=2)
@@ -485,20 +511,22 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
         query: str,
         drive_id: str = None,
         top: int = 25,
+        page_token: str = None,
         user_id: str = None,
     ) -> str:
-        """Search for files in a SharePoint site.
+        """Search for files in a SharePoint site. Returns has_more and next_page for pagination.
 
         Args:
             site_id: SharePoint site ID.
             query: Search query.
             drive_id: Optional drive ID to scope search.
-            top: Max results (default 25).
+            top: Max results per page (default 25).
+            page_token: Pagination cursor from previous response's next_page field.
             user_id: Microsoft email. Optional if already authenticated.
         """
         try:
             uid = await _resolve_user(user_id)
-            result = await graph_client.sharepoint_search(uid, site_id, query, drive_id, top)
+            result = await graph_client.sharepoint_search(uid, site_id, query, drive_id, top, page_token=page_token)
             return json.dumps(result, indent=2)
         except ValueError as e:
             return json.dumps({"error": True, "message": str(e)}, indent=2)
@@ -506,17 +534,19 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
     @mcp.tool()
     async def sharepoint_list_lists(
         site_id: str,
+        page_token: str = None,
         user_id: str = None,
     ) -> str:
-        """List SharePoint lists in a site.
+        """List SharePoint lists in a site. Returns has_more and next_page for pagination.
 
         Args:
             site_id: SharePoint site ID.
+            page_token: Pagination cursor from previous response's next_page field.
             user_id: Microsoft email. Optional if already authenticated.
         """
         try:
             uid = await _resolve_user(user_id)
-            result = await graph_client.sharepoint_list_lists(uid, site_id)
+            result = await graph_client.sharepoint_list_lists(uid, site_id, page_token=page_token)
             return json.dumps(result, indent=2)
         except ValueError as e:
             return json.dumps({"error": True, "message": str(e)}, indent=2)
@@ -526,22 +556,24 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
         site_id: str,
         list_id: str,
         top: int = 50,
+        page_token: str = None,
         user_id: str = None,
     ) -> str:
-        """List items in a SharePoint list.
+        """List items in a SharePoint list. Returns has_more and next_page for pagination.
 
         Args:
             site_id: SharePoint site ID.
             list_id: SharePoint list ID.
-            top: Max items (default 50).
+            top: Max items per page (default 50).
+            page_token: Pagination cursor from previous response's next_page field.
             user_id: Microsoft email. Optional if already authenticated.
         """
         try:
             uid = await _resolve_user(user_id)
-            result = await graph_client.sharepoint_list_items(uid, site_id, list_id, top)
+            result = await graph_client.sharepoint_list_items(uid, site_id, list_id, top, page_token=page_token)
             return json.dumps(result, indent=2)
         except ValueError as e:
             return json.dumps({"error": True, "message": str(e)}, indent=2)
 
-    # v2.9.1: Version alignment across all modules
-    logger.info("Microsoft OneDrive + SharePoint tools registered (22 tools, v2.9.1)")
+    # v2.9.4: Universal cursor pagination for all list/search tools
+    logger.info("Microsoft OneDrive + SharePoint tools registered (22 tools, v2.9.4)")

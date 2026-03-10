@@ -1,6 +1,6 @@
 """MCP Tool registrations for OneDrive & SharePoint.
 
-Version: 2.9.4 — universal cursor pagination for all list/search tools
+Version: 2.9.5 — robust exception handling for all tools
 
 HISTORY:
   v1.9.4: Made user_id optional, added resolve_share_link (22 tools).
@@ -9,10 +9,16 @@ HISTORY:
   v2.9.1: Version string alignment across all modules.
   v2.9.4: Added page_token parameter to all list/search tools.
           Enables cursor pagination via @odata.nextLink.
+  v2.9.5: Broadened exception handling in all tools.
+          Now catches PermissionError (expired auth) and
+          httpx.HTTPStatusError (Graph API errors) in addition
+          to ValueError. Returns clean JSON errors instead of
+          uncaught stack traces.
 """
 
 import json
 import logging
+import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +41,57 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
             "Please authenticate first with ms_auth_start(user_id='your@email.com')"
         )
 
-    # ── AUTH TOOLS ──────────────────────────────────────────────
+    def _error_response(e: Exception, tool_name: str) -> str:
+        """Build a clean JSON error response for any exception type.
+
+        v2.9.5: Central error handler so tools never throw uncaught
+        exceptions to the MCP framework. Returns actionable guidance
+        to the LLM based on exception type.
+        """
+        if isinstance(e, PermissionError):
+            logger.warning(f"{tool_name}: auth failed — {e}")
+            return json.dumps({
+                "error": True,
+                "error_type": "auth_expired",
+                "message": str(e),
+                "action": "Token expired or invalid. Use ms_auth_start(user_id='your@email.com') to re-authenticate.",
+            }, indent=2)
+        elif isinstance(e, httpx.HTTPStatusError):
+            status = e.response.status_code
+            body = e.response.text[:300] if e.response.text else ""
+            logger.warning(f"{tool_name}: Graph API HTTP {status} — {body}")
+            return json.dumps({
+                "error": True,
+                "error_type": "graph_api_error",
+                "status_code": status,
+                "message": f"Microsoft Graph API returned HTTP {status}",
+                "detail": body,
+                "action": (
+                    "Token expired. Use ms_auth_start to re-authenticate."
+                    if status == 401 else
+                    "Access denied. Check permissions for this resource."
+                    if status == 403 else
+                    "Rate limited. Wait a moment and try again."
+                    if status == 429 else
+                    f"Graph API error {status}. Check the detail field for more info."
+                ),
+            }, indent=2)
+        elif isinstance(e, ValueError):
+            return json.dumps({
+                "error": True,
+                "error_type": "validation_error",
+                "message": str(e),
+            }, indent=2)
+        else:
+            logger.error(f"{tool_name}: unexpected error — {e}", exc_info=True)
+            return json.dumps({
+                "error": True,
+                "error_type": "unexpected_error",
+                "message": str(e),
+                "action": "An unexpected error occurred. Check logs for details.",
+            }, indent=2)
+
+    # ── AUTH TOOLS ──────────────────────────────────────────────────
 
     @mcp.tool()
     async def ms_auth_status(user_id: str = None) -> str:
@@ -115,7 +171,7 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
                 "message": f"Polling failed: {str(e)}",
             }, indent=2)
 
-    # ── SHARING URL RESOLVER ─────────────────────────────────────
+    # ── SHARING URL RESOLVER ───────────────────────────────────────
 
     @mcp.tool()
     async def resolve_share_link(
@@ -140,20 +196,10 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
                 session_id=session_id,
             )
             return json.dumps(result, indent=2)
-        except ValueError as e:
-            return json.dumps({
-                "error": True,
-                "message": str(e),
-            }, indent=2)
         except Exception as e:
-            logger.error(f"resolve_share_link error: {e}", exc_info=True)
-            return json.dumps({
-                "error": True,
-                "message": f"Failed to resolve sharing link: {str(e)}",
-                "sharing_url": sharing_url,
-            }, indent=2)
+            return _error_response(e, "resolve_share_link")
 
-    # ── ONEDRIVE TOOLS ──────────────────────────────────────────
+    # ── ONEDRIVE TOOLS ──────────────────────────────────────────────
 
     @mcp.tool()
     async def onedrive_list_files(
@@ -174,8 +220,8 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
             uid = await _resolve_user(user_id)
             result = await graph_client.onedrive_list_files(uid, path, top, page_token=page_token)
             return json.dumps(result, indent=2)
-        except ValueError as e:
-            return json.dumps({"error": True, "message": str(e)}, indent=2)
+        except Exception as e:
+            return _error_response(e, "onedrive_list_files")
 
     @mcp.tool()
     async def onedrive_get_file(
@@ -192,8 +238,8 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
             uid = await _resolve_user(user_id)
             result = await graph_client.onedrive_get_file(uid, item_id)
             return json.dumps(result, indent=2)
-        except ValueError as e:
-            return json.dumps({"error": True, "message": str(e)}, indent=2)
+        except Exception as e:
+            return _error_response(e, "onedrive_get_file")
 
     @mcp.tool()
     async def onedrive_download_file(
@@ -214,8 +260,8 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
                 uid, item_id, save_to_sandbox=True, session_id=session_id
             )
             return json.dumps(result, indent=2)
-        except ValueError as e:
-            return json.dumps({"error": True, "message": str(e)}, indent=2)
+        except Exception as e:
+            return _error_response(e, "onedrive_download_file")
 
     @mcp.tool()
     async def onedrive_search(
@@ -236,8 +282,8 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
             uid = await _resolve_user(user_id)
             result = await graph_client.onedrive_search(uid, query, top, page_token=page_token)
             return json.dumps(result, indent=2)
-        except ValueError as e:
-            return json.dumps({"error": True, "message": str(e)}, indent=2)
+        except Exception as e:
+            return _error_response(e, "onedrive_search")
 
     @mcp.tool()
     async def onedrive_create_folder(
@@ -256,8 +302,8 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
             uid = await _resolve_user(user_id)
             result = await graph_client.onedrive_create_folder(uid, name, parent_path)
             return json.dumps(result, indent=2)
-        except ValueError as e:
-            return json.dumps({"error": True, "message": str(e)}, indent=2)
+        except Exception as e:
+            return _error_response(e, "onedrive_create_folder")
 
     @mcp.tool()
     async def onedrive_upload_file(
@@ -278,8 +324,8 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
             uid = await _resolve_user(user_id)
             result = await graph_client.onedrive_upload(uid, path, content_base64, content_type)
             return json.dumps(result, indent=2)
-        except ValueError as e:
-            return json.dumps({"error": True, "message": str(e)}, indent=2)
+        except Exception as e:
+            return _error_response(e, "onedrive_upload_file")
 
     @mcp.tool()
     async def onedrive_delete_item(
@@ -296,8 +342,8 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
             uid = await _resolve_user(user_id)
             result = await graph_client.onedrive_delete(uid, item_id)
             return json.dumps(result, indent=2)
-        except ValueError as e:
-            return json.dumps({"error": True, "message": str(e)}, indent=2)
+        except Exception as e:
+            return _error_response(e, "onedrive_delete_item")
 
     @mcp.tool()
     async def onedrive_move_item(
@@ -318,8 +364,8 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
             uid = await _resolve_user(user_id)
             result = await graph_client.onedrive_move(uid, item_id, dest_folder_id, new_name)
             return json.dumps(result, indent=2)
-        except ValueError as e:
-            return json.dumps({"error": True, "message": str(e)}, indent=2)
+        except Exception as e:
+            return _error_response(e, "onedrive_move_item")
 
     @mcp.tool()
     async def onedrive_copy_item(
@@ -340,8 +386,8 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
             uid = await _resolve_user(user_id)
             result = await graph_client.onedrive_copy(uid, item_id, dest_folder_id, new_name)
             return json.dumps(result, indent=2)
-        except ValueError as e:
-            return json.dumps({"error": True, "message": str(e)}, indent=2)
+        except Exception as e:
+            return _error_response(e, "onedrive_copy_item")
 
     @mcp.tool()
     async def onedrive_share_item(
@@ -362,10 +408,10 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
             uid = await _resolve_user(user_id)
             result = await graph_client.onedrive_share(uid, item_id, share_type, scope)
             return json.dumps(result, indent=2)
-        except ValueError as e:
-            return json.dumps({"error": True, "message": str(e)}, indent=2)
+        except Exception as e:
+            return _error_response(e, "onedrive_share_item")
 
-    # ── SHAREPOINT TOOLS ────────────────────────────────────────
+    # ── SHAREPOINT TOOLS ────────────────────────────────────────────
 
     @mcp.tool()
     async def sharepoint_list_sites(
@@ -384,8 +430,8 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
             uid = await _resolve_user(user_id)
             result = await graph_client.sharepoint_list_sites(uid, search, page_token=page_token)
             return json.dumps(result, indent=2)
-        except ValueError as e:
-            return json.dumps({"error": True, "message": str(e)}, indent=2)
+        except Exception as e:
+            return _error_response(e, "sharepoint_list_sites")
 
     @mcp.tool()
     async def sharepoint_get_site(
@@ -402,8 +448,8 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
             uid = await _resolve_user(user_id)
             result = await graph_client.sharepoint_get_site(uid, site_id)
             return json.dumps(result, indent=2)
-        except ValueError as e:
-            return json.dumps({"error": True, "message": str(e)}, indent=2)
+        except Exception as e:
+            return _error_response(e, "sharepoint_get_site")
 
     @mcp.tool()
     async def sharepoint_list_drives(
@@ -420,8 +466,8 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
             uid = await _resolve_user(user_id)
             result = await graph_client.sharepoint_list_drives(uid, site_id)
             return json.dumps(result, indent=2)
-        except ValueError as e:
-            return json.dumps({"error": True, "message": str(e)}, indent=2)
+        except Exception as e:
+            return _error_response(e, "sharepoint_list_drives")
 
     @mcp.tool()
     async def sharepoint_list_files(
@@ -446,8 +492,8 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
             uid = await _resolve_user(user_id)
             result = await graph_client.sharepoint_list_files(uid, site_id, drive_id, path, top, page_token=page_token)
             return json.dumps(result, indent=2)
-        except ValueError as e:
-            return json.dumps({"error": True, "message": str(e)}, indent=2)
+        except Exception as e:
+            return _error_response(e, "sharepoint_list_files")
 
     @mcp.tool()
     async def sharepoint_download_file(
@@ -474,8 +520,8 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
                 session_id=session_id,
             )
             return json.dumps(result, indent=2)
-        except ValueError as e:
-            return json.dumps({"error": True, "message": str(e)}, indent=2)
+        except Exception as e:
+            return _error_response(e, "sharepoint_download_file")
 
     @mcp.tool()
     async def sharepoint_upload_file(
@@ -502,8 +548,8 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
                 uid, site_id, path, content_base64, drive_id, content_type
             )
             return json.dumps(result, indent=2)
-        except ValueError as e:
-            return json.dumps({"error": True, "message": str(e)}, indent=2)
+        except Exception as e:
+            return _error_response(e, "sharepoint_upload_file")
 
     @mcp.tool()
     async def sharepoint_search(
@@ -528,8 +574,8 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
             uid = await _resolve_user(user_id)
             result = await graph_client.sharepoint_search(uid, site_id, query, drive_id, top, page_token=page_token)
             return json.dumps(result, indent=2)
-        except ValueError as e:
-            return json.dumps({"error": True, "message": str(e)}, indent=2)
+        except Exception as e:
+            return _error_response(e, "sharepoint_search")
 
     @mcp.tool()
     async def sharepoint_list_lists(
@@ -548,8 +594,8 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
             uid = await _resolve_user(user_id)
             result = await graph_client.sharepoint_list_lists(uid, site_id, page_token=page_token)
             return json.dumps(result, indent=2)
-        except ValueError as e:
-            return json.dumps({"error": True, "message": str(e)}, indent=2)
+        except Exception as e:
+            return _error_response(e, "sharepoint_list_lists")
 
     @mcp.tool()
     async def sharepoint_list_items(
@@ -572,8 +618,8 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
             uid = await _resolve_user(user_id)
             result = await graph_client.sharepoint_list_items(uid, site_id, list_id, top, page_token=page_token)
             return json.dumps(result, indent=2)
-        except ValueError as e:
-            return json.dumps({"error": True, "message": str(e)}, indent=2)
+        except Exception as e:
+            return _error_response(e, "sharepoint_list_items")
 
-    # v2.9.4: Universal cursor pagination for all list/search tools
-    logger.info("Microsoft OneDrive + SharePoint tools registered (22 tools, v2.9.4)")
+    # v2.9.5: Robust exception handling for all tools
+    logger.info("Microsoft OneDrive + SharePoint tools registered (22 tools, v2.9.5)")

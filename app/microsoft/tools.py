@@ -1,6 +1,6 @@
 """MCP Tool registrations for OneDrive & SharePoint.
 
-Version: 2.9.7 — save_to_sandbox for list/search tools
+Version: 2.9.8 — batch_download + clearer download responses
 
 HISTORY:
   v1.9.4: Made user_id optional, added resolve_share_link (22 tools).
@@ -14,10 +14,13 @@ HISTORY:
           in LLM context. 36 total tools -> 18 total tools.
   v2.9.7: Added save_to_sandbox parameter to onedrive and sharepoint
           list/search actions. Writes full JSON to sandbox filesystem,
-          returns lightweight summary to LLM. Eliminates manual
-          transcription bottleneck for large folder listings.
+          returns lightweight summary to LLM.
+  v2.9.8: batch_download action for onedrive (up to 25 files per call).
+          Clearer download responses with _note confirming file is on disk.
+          Prevents LLMs from re-downloading via urllib (401 errors).
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -28,6 +31,12 @@ logger = logging.getLogger(__name__)
 
 # Sandbox base directory
 _SANDBOX_DIR = os.getenv("SANDBOX_DIR", "/app/sandbox_data")
+
+# Max files per batch_download call (rate-limit safety)
+_MAX_BATCH_SIZE = 25
+
+# Concurrent download limit (avoid Graph API throttling)
+_DOWNLOAD_CONCURRENCY = 5
 
 
 def register_microsoft_tools(mcp, graph_client, auth_manager):
@@ -203,6 +212,7 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
         action: str,
         path: str = None,
         item_id: str = None,
+        item_ids: str = None,
         query: str = None,
         name: str = None,
         parent_path: str = None,
@@ -221,9 +231,10 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
         """OneDrive file operations. Paginated results include has_more/next_page.
 
         Args:
-            action: list_files | get_file | download | search | create_folder | upload | delete | move | copy | share
+            action: list_files | get_file | download | batch_download | search | create_folder | upload | delete | move | copy | share
             path: Folder path (list_files) or dest path (upload).
             item_id: Item ID (get_file/download/delete/move/copy/share).
+            item_ids: JSON array of item IDs for batch_download. Max 25 per call.
             query: Search text (search).
             name: Folder name (create_folder).
             parent_path: Parent folder (create_folder).
@@ -236,8 +247,12 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
             new_name: Rename (move/copy).
             share_type: view|edit (share).
             scope: anonymous|organization (share).
-            session_id: Sandbox session (download/save_to_sandbox).
+            session_id: Sandbox session (download/batch_download/save_to_sandbox).
             user_id: Microsoft email. Optional if authenticated.
+
+        batch_download: Downloads up to 25 files in parallel (5 concurrent).
+            Files are saved directly to sandbox. Returns summary with paths.
+            Use execute_code to process files after download.
         """
         try:
             uid = await _resolve_user(user_id)
@@ -257,6 +272,84 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
                 if not item_id: return _missing("item_id", action)
                 result = await graph_client.onedrive_download(
                     uid, item_id, save_to_sandbox=True, session_id=session_id)
+                # v2.9.8: Make it unmistakable the file is already on disk
+                sp = result.get("sandbox_path", "")
+                if sp:
+                    result["_note"] = (
+                        f"FILE ALREADY SAVED to sandbox at: {sp} \u2014 "
+                        f"Use execute_code: open('{sp}', 'rb') or pdfplumber.open('{sp}'). "
+                        f"Do NOT re-download via URL (will fail with 401)."
+                    )
+
+            elif action == "batch_download":
+                # v2.9.8: Download up to 25 files in one tool call
+                if not item_ids:
+                    return _missing("item_ids", action)
+                try:
+                    ids = json.loads(item_ids) if isinstance(item_ids, str) else item_ids
+                except (json.JSONDecodeError, TypeError):
+                    return json.dumps({
+                        "error": True, "error_type": "validation_error",
+                        "message": "item_ids must be a JSON array of ID strings, e.g. '[\"id1\", \"id2\"]'",
+                    }, indent=2)
+
+                if not isinstance(ids, list) or len(ids) == 0:
+                    return json.dumps({
+                        "error": True, "error_type": "validation_error",
+                        "message": "item_ids must be a non-empty JSON array.",
+                    }, indent=2)
+
+                if len(ids) > _MAX_BATCH_SIZE:
+                    return json.dumps({
+                        "error": True, "error_type": "validation_error",
+                        "message": f"Max {_MAX_BATCH_SIZE} files per batch. Got {len(ids)}. Split into multiple calls.",
+                    }, indent=2)
+
+                semaphore = asyncio.Semaphore(_DOWNLOAD_CONCURRENCY)
+
+                async def _download_one(iid: str) -> dict:
+                    async with semaphore:
+                        try:
+                            r = await graph_client.onedrive_download(
+                                uid, iid, save_to_sandbox=True, session_id=session_id)
+                            return {
+                                "item_id": iid,
+                                "status": "ok",
+                                "filename": r.get("filename", ""),
+                                "sandbox_path": r.get("sandbox_path", ""),
+                                "size": r.get("size", r.get("file_size", 0)),
+                            }
+                        except Exception as ex:
+                            logger.warning(f"batch_download: {iid} failed \u2014 {ex}")
+                            return {
+                                "item_id": iid,
+                                "status": "failed",
+                                "error": str(ex)[:200],
+                            }
+
+                tasks = [_download_one(iid) for iid in ids]
+                results = await asyncio.gather(*tasks)
+
+                succeeded = [r for r in results if r["status"] == "ok"]
+                failed = [r for r in results if r["status"] == "failed"]
+
+                logger.info(
+                    f"batch_download: {len(succeeded)}/{len(ids)} succeeded, "
+                    f"{len(failed)} failed, session={session_id}"
+                )
+
+                return json.dumps({
+                    "batch_download": True,
+                    "total": len(ids),
+                    "succeeded": len(succeeded),
+                    "failed": len(failed),
+                    "files": list(results),
+                    "_note": (
+                        f"{len(succeeded)} files saved to sandbox. "
+                        f"Process with execute_code: pdfplumber.open(sandbox_path) or open(sandbox_path, 'rb'). "
+                        f"Do NOT re-download via URLs."
+                    ),
+                }, indent=2)
 
             elif action == "search":
                 if not query: return _missing("query", action)
@@ -301,7 +394,7 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
             else:
                 return json.dumps({
                     "error": True,
-                    "message": f"Unknown action '{action}'. Valid: list_files, get_file, download, search, create_folder, upload, delete, move, copy, share",
+                    "message": f"Unknown action '{action}'. Valid: list_files, get_file, download, batch_download, search, create_folder, upload, delete, move, copy, share",
                 }, indent=2)
 
             return json.dumps(result, indent=2)
@@ -380,6 +473,14 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
                 result = await graph_client.sharepoint_download(
                     uid, site_id, item_id, drive_id,
                     save_to_sandbox=True, session_id=session_id)
+                # v2.9.8: Make it unmistakable the file is already on disk
+                sp = result.get("sandbox_path", "")
+                if sp:
+                    result["_note"] = (
+                        f"FILE ALREADY SAVED to sandbox at: {sp} \u2014 "
+                        f"Use execute_code: open('{sp}', 'rb') or pdfplumber.open('{sp}'). "
+                        f"Do NOT re-download via URL (will fail with 401)."
+                    )
 
             elif action == "upload":
                 if not site_id: return _missing("site_id", action)
@@ -454,5 +555,5 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
         except Exception as e:
             return _error_response(e, "resolve_share_link")
 
-    # v2.9.7: save_to_sandbox + consolidated tools
-    logger.info("Microsoft tools registered (4 consolidated tools, v2.9.7)")
+    # v2.9.8: batch_download + clear download responses
+    logger.info("Microsoft tools registered (4 consolidated tools, v2.9.8)")

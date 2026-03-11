@@ -16,19 +16,23 @@ Features:
 - Manual reset capability
 - has_session() check to avoid unnecessary globals rebuilds
 
-Version: 2.1.0 - Add has_session() for executor optimization
-                 Skip _build_safe_globals when kernel already exists
+    Version: 2.1.0 - Add has_session() for executor optimization
+                     Skip _build_safe_globals when kernel already exists
+    Version: 2.2.0 - Add proactive kernel recycling (KERNEL_RECYCLE_THRESHOLD)
+                     Prevents namespace pollution in long sessions (685+ PDF runs)
 """
 
 import time
 import logging
 import threading
+import importlib 
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
 
+KERNEL_RECYCLE_THRESHOLD = 200
 
 @dataclass
 class KernelSession:
@@ -119,11 +123,27 @@ class KernelManager:
         already exists — significant performance optimization since
         building globals imports pandas, numpy, etc.
         
+        Also triggers proactive kernel recycling when execution_count
+        exceeds threshold to prevent namespace pollution from long sessions
+        (e.g., 685 PDF extractions causing stale sys.modules refs).
+        
         Thread-safe. Also cleans up expired sessions.
         """
         with self._lock:
             self._cleanup_expired()
-            return session_id in self._sessions
+            if session_id in self._sessions:
+                session = self._sessions[session_id]
+                if session.execution_count >= KERNEL_RECYCLE_THRESHOLD:
+                    logger.info(
+                        f"Kernel RECYCLE: session={session_id}, "
+                        f"exec_count={session.execution_count} >= "
+                        f"{KERNEL_RECYCLE_THRESHOLD}, clearing stale namespace"
+                    )
+                    importlib.invalidate_caches()
+                    del self._sessions[session_id]
+                    return False
+                return True
+            return False
 
     def get_or_create(
         self,

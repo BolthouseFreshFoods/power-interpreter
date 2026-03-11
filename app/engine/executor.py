@@ -124,6 +124,7 @@ Version: 2.9.0
 """
 
 import asyncio
+import importlib
 import io
 import os
 import sys
@@ -1738,7 +1739,9 @@ class SandboxExecutor:
                     try:
                         os.chdir(session_dir)
                         compiled = compile(processed_code, '<sandbox>', 'exec')
+                        importlib.invalidate_caches() 
                         exec(compiled, sandbox_globals)
+                      
                     finally:
                         os.chdir(original_cwd)
 

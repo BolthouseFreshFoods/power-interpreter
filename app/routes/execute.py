@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 from typing import Optional, Dict
 
 from app.engine.executor import executor
-from app.config import settings
+from app.database import ensure_session_exists
 
 router = APIRouter()
 
@@ -53,6 +53,8 @@ async def execute_code(request: ExecuteRequest):
     
     if not request.code.strip():
         raise HTTPException(status_code=400, detail="No code provided")
+
+    await ensure_session_exists(request.session_id)
     
     result = await executor.execute(
         code=request.code,
@@ -72,6 +74,8 @@ async def execute_quick(code: str):
     """
     if not code.strip():
         raise HTTPException(status_code=400, detail="No code provided")
+        
+    await ensure_session_exists("quick")
     
     result = await executor.execute(
         code=code,

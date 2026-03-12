@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 from typing import Optional, Dict, List
 
 from app.engine.job_manager import job_manager
+from app.database import ensure_session_exists
 
 router = APIRouter()
 
@@ -50,7 +51,8 @@ async def submit_job(request: JobSubmitRequest):
     """
     if not request.code.strip():
         raise HTTPException(status_code=400, detail="No code provided")
-    
+
+    await ensure_session_exists(request.session_id or "default")
     job_id = await job_manager.submit_job(
         code=request.code,
         session_id=request.session_id,

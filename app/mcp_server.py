@@ -308,6 +308,8 @@ async def execute_code(
         code: Python code to execute.
         session_id: Session ID for state persistence.
         timeout: Max seconds (default 55).
+
+            Note: Namespace resets between calls. Common modules (os, re, json, glob, shutil, datetime) are pre-injected. Do NOT use sys, subprocess, ast, requests, or pip install.
     """
     url = f"{API_BASE}/api/execute"
     logger.info(f"execute_code: POST {url} session={session_id}")

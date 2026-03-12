@@ -641,6 +641,9 @@ async def create_session(
                 headers=_headers(),
                 json={"name": name, "description": description}
             )
+            # Register session for user tracking (v2.10.0)
+            from app.engine.user_tracker import UserTracker
+            UserTracker().register_session(name)
             return resp.text
     except Exception as e:
         logger.error(f"create_session: error: {e}", exc_info=True)

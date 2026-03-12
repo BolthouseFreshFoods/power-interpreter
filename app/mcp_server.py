@@ -302,7 +302,7 @@ async def execute_code(
     session_id: str = "default",
     timeout: int = 55
 ) -> list:
-    """Execute Python in a persistent sandbox. Variables, imports, and files persist across calls. Charts auto-captured as inline images.
+    """Execute Python in a persistent sandbox. Variables, imports, and files persist across calls. Charts auto-captured as inline images. Auto-stores new files in Postgres with download URLs (format: /dl/{uuid}/{filename}). IMPORTANT: Always share download URLs EXACTLY as returned — never reconstruct from filename alone.
 
     Args:
         code: Python code to execute.
@@ -441,7 +441,7 @@ async def fetch_file(
 
 @mcp.tool()
 async def list_files(session_id: Optional[str] = "default") -> str:
-    """List files in the sandbox with size and type info.
+    """List files in the sandbox with size and type info. Download URLs use format /dl/{uuid}/{filename} — always share exact URLs, never rebuild from filename.
 
     Args:
         session_id: Session to list files for.

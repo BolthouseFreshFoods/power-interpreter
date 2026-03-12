@@ -1853,7 +1853,7 @@ class SandboxExecutor:
 
                 non_image_downloads = [d for d in download_info if not d.get('is_image', False)]
                 if non_image_downloads:
-                    url_lines = ["\n\nGenerated files ready for download:"]
+                    url_lines = ["\n\nGenerated files ready for download (⚠️ share these EXACT URLs, never reconstruct from filename):"]
                     for info in non_image_downloads:
                         url_lines.append(
                             f"\n[{info['filename']} ({info['size']}) - Click to Download]({info['url']})"

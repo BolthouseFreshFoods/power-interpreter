@@ -75,8 +75,28 @@ async def init_database():
     logger.info("Database tables created successfully")
 
 
-async def check_database():
-    """Health check - verify database connection"""
+async def ensure_session_exists(session_id: str):
+    """Auto-create session row if missing. Prevents FK violation on Job insert (v2.10.0)."""
+    try:
+        factory = get_session_factory()
+        async with factory() as db:
+            result = await db.execute(
+                text("SELECT 1 FROM sessions WHERE name = :name"),
+                {"name": session_id}
+            )
+            if not result.scalar():
+                await db.execute(
+                    text("INSERT INTO sessions (name, description) VALUES (:name, :desc)"),
+                    {"name": session_id, "desc": "Auto-created"}
+                )
+                await db.commit()
+                logger.info(f"Auto-created session: {session_id}")
+    except Exception as e:
+                logger.debug(f"ensure_session_exists({session_id}): {e}")
+
+
+    async def check_database():
+        """Health check - verify database connection"""
     try:
         engine = get_engine()
         async with engine.connect() as conn:

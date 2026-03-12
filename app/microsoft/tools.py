@@ -146,12 +146,13 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
     # \u2500\u2500 CONSOLIDATED AUTH TOOL \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 
     @mcp.tool()
-    async def ms_auth(action: str, user_id: str = None) -> str:
+    async def ms_auth(action: str, user_id: str = None, session_id: str = "default") -> str:
         """Microsoft 365 authentication.
 
         Args:
             action: status | start | poll
-            user_id: Email (e.g. timothy.escamilla@bolthousefresh.com). Required for start.
+            user_id: Microsoft 365 email address. Required for start.
+            session_id: Session to associate with this identity (default: "default").
 
         Actions:
             status: Check auth state.
@@ -194,6 +195,10 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
                         "message": "No pending login. Use ms_auth(action='start') first.",
                     }, indent=2)
                 result = await auth_manager.poll_device_login(uid)
+                # Enrich session with authenticated identity (v2.10.0)
+                if result.get("status") == "authenticated":
+                    from app.engine.user_tracker import UserTracker
+                    UserTracker().enrich_from_auth(session_id, uid)
                 return json.dumps(result, indent=2)
 
             else:

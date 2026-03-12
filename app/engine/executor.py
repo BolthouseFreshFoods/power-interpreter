@@ -17,6 +17,7 @@ Executes Python code in a controlled environment with:
 - DOCX SUPPORT (v2.8.5) - python-docx + transitive deps in allowlist
 - TIMEOUT FLOOR (v2.8.6) - minimum 100s execution time, AI cannot override
 - TOKEN OPTIMIZATION (v2.9.0) - trimmed MCP tool descriptions (~57% reduction)
+- NAMESPACE PREAMBLE (v2.10.0) - common modules pre-injected before every exec
 
 CRITICAL BUG FIX (v2.6):
   'import matplotlib.pyplot as plt' was broken because:
@@ -1738,6 +1739,10 @@ class SandboxExecutor:
                     original_cwd = os.getcwd()
                     try:
                         os.chdir(session_dir)
+                        # Pre-inject common modules to prevent NameError (v2.10.0)
+                        for _mod_name in ('os', 're', 'json', 'glob', 'shutil', 'datetime'):
+                            if _mod_name not in sandbox_globals:
+                                sandbox_globals[_mod_name] = __import__(_mod_name)
                         compiled = compile(processed_code, '<sandbox>', 'exec')
                         importlib.invalidate_caches() 
                         exec(compiled, sandbox_globals)

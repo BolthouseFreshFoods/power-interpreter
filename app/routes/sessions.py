@@ -104,3 +104,34 @@ async def get_session(session_id: str):
             "updated_at": session.updated_at.isoformat(),
             "metadata": session.metadata_
         }
+
+
+@router.delete("/sessions/{session_id}")
+async def delete_session(session_id: str):
+    """Soft-delete a session (sets is_active=False).
+    
+    Session sandbox files are preserved for recovery.
+    The session will no longer appear in list_sessions.
+    """
+    factory = get_session_factory()
+    async with factory() as db_session:
+        result = await db_session.execute(
+            select(Session).where(Session.id == uuid.UUID(session_id))
+        )
+        session = result.scalar_one_or_none()
+        
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        if not session.is_active:
+            raise HTTPException(status_code=409, detail="Session already deactivated")
+        
+        session.is_active = False
+        await db_session.commit()
+        
+        return {
+            "session_id": str(session.id),
+            "name": session.name,
+            "deleted": True,
+            "message": f"Session '{session.name}' deactivated. Sandbox files preserved."
+        }

@@ -553,23 +553,17 @@ async def _handle_single_jsonrpc(data: dict):
             logger.info(f"MCP direct: {tool_name} returned {original_len:,} chars")
             logger.info(f"MCP direct: result preview: {result_str[:300]}")
 
-            # ── Response Budget Guard (Change #10) ──────────────────
-            # Truncate oversized responses to protect the LLM context window.
-            # A single 321K-char OneDrive listing consumed ~80K tokens.
-            if original_len > MCP_RESPONSE_MAX_CHARS:
-                truncated_result = result_str[:MCP_RESPONSE_MAX_CHARS]
-                truncation_notice = (
-                    f"\n\n--- RESPONSE TRUNCATED ---\n"
-                    f"Original size: {original_len:,} chars ({original_len // 4:,} est. tokens)\n"
-                    f"Returned: {MCP_RESPONSE_MAX_CHARS:,} chars\n"
-                    f"Omitted: {original_len - MCP_RESPONSE_MAX_CHARS:,} chars\n"
-                    f"Tip: Use filters or pagination to reduce result size."
-                )
-                content = [{"type": "text", "text": truncated_result + truncation_notice}]
-                logger.warning(
-                    f"MCP direct: {tool_name} response TRUNCATED "
-                    f"{original_len:,} -> {MCP_RESPONSE_MAX_CHARS:,} chars"
-                )
+        # — Response Budget Guard (Change #10) ————————————————
+        # Smart boundary-aware truncation (v2.9.9)
+        # Preserves complete JSON objects, URLs, and line boundaries.
+        if original_len > MCP_RESPONSE_MAX_CHARS:
+            from app.response_guard import smart_truncate
+            truncated_result = smart_truncate(result_str)
+            content = [{"type": "text", "text": truncated_result}]
+            logger.warning(
+                f"MCP direct: {tool_name} response TRUNCATED "
+                f"{original_len:,} -> {len(truncated_result):,} chars"
+            )
             elif isinstance(result, str):
                 content = [{"type": "text", "text": result}]
             elif isinstance(result, dict):

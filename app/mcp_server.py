@@ -650,6 +650,26 @@ async def create_session(
     except Exception as e:
         logger.error(f"create_session: error: {e}", exc_info=True)
         return f"Error calling create_session API: {e}"
+        
+
+@mcp.tool()
+async def delete_session(
+    session_id: str
+) -> str:
+    """Deactivate a session. Removes from listings. Sandbox files preserved for recovery.
+
+    Args:
+        session_id: UUID of the session to deactivate.
+    """
+    url = f"{API_BASE}/api/sessions/{session_id}"
+    logger.info(f"delete_session: DELETE {url}")
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.delete(url, headers=_headers())
+            return resp.text
+    except Exception as e:
+        logger.error(f"delete_session: error: {e}", exc_info=True)
+        return f"Error calling delete_session API: {e}"
 
 
 # ============================================================

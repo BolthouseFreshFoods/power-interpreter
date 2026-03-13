@@ -553,17 +553,17 @@ async def _handle_single_jsonrpc(data: dict):
             logger.info(f"MCP direct: {tool_name} returned {original_len:,} chars")
             logger.info(f"MCP direct: result preview: {result_str[:300]}")
 
-        # — Response Budget Guard (Change #10) ————————————————
-        # Smart boundary-aware truncation (v2.9.9)
-        # Preserves complete JSON objects, URLs, and line boundaries.
-        if original_len > MCP_RESPONSE_MAX_CHARS:
-            from app.response_guard import smart_truncate
-            truncated_result = smart_truncate(result_str)
-            content = [{"type": "text", "text": truncated_result}]
-            logger.warning(
-                f"MCP direct: {tool_name} response TRUNCATED "
-                f"{original_len:,} -> {len(truncated_result):,} chars"
-            )
+            # — Response Budget Guard (Change #10) ————————————————
+            # Smart boundary-aware truncation (v2.9.9)
+            # Preserves complete JSON objects, URLs, and line boundaries.
+            if original_len > MCP_RESPONSE_MAX_CHARS:
+                from app.response_guard import smart_truncate
+                truncated_result = smart_truncate(result_str)
+                content = [{"type": "text", "text": truncated_result}]
+                logger.warning(
+                    f"MCP direct: {tool_name} response TRUNCATED "
+                    f"{original_len:,} -> {len(truncated_result):,} chars"
+                )
             elif isinstance(result, str):
                 content = [{"type": "text", "text": result}]
             elif isinstance(result, dict):

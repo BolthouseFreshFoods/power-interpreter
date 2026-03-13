@@ -7,6 +7,7 @@ Gracefully handles missing database (app still starts for health checks).
 """
 
 import logging
+import uuid
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
 from sqlalchemy import text
@@ -86,17 +87,17 @@ async def ensure_session_exists(session_id: str):
             )
             if not result.scalar():
                 await db.execute(
-                    text("INSERT INTO sessions (name, description) VALUES (:name, :desc)"),
-                    {"name": session_id, "desc": "Auto-created"}
+                    text("INSERT INTO sessions (id, name, description) VALUES (:id, :name, :desc)"),
+                    {"id": str(uuid.uuid4()), "name": session_id, "desc": "Auto-created"}
                 )
                 await db.commit()
                 logger.info(f"Auto-created session: {session_id}")
     except Exception as e:
-                logger.debug(f"ensure_session_exists({session_id}): {e}")
+        logger.debug(f"ensure_session_exists({session_id}): {e}")
 
 
-    async def check_database():
-        """Health check - verify database connection"""
+async def check_database():
+    """Health check - verify database connection"""
     try:
         engine = get_engine()
         async with engine.connect() as conn:

@@ -310,6 +310,7 @@ async def execute_code(
         timeout: Max seconds (default 55).
 
             Note: Namespace resets between calls. Common modules (os, re, json, glob, shutil, datetime) are pre-injected. Do NOT use sys, subprocess, ast, requests, or pip install.
+    When files are created, provide download links using the FULL public URL: https://power-interpreter-production-6396.up.railway.app/dl/{file_id} — never use relative paths.
     """
     url = f"{API_BASE}/api/execute"
     logger.info(f"execute_code: POST {url} session={session_id}")

@@ -310,6 +310,7 @@ async def execute_code(
         timeout: Max seconds (default 55).
 
             Note: Namespace resets between calls. Common modules (os, re, json, glob, shutil, datetime) are pre-injected. Do NOT use sys, subprocess, ast, requests, or pip install.
+    When files are created, provide download links using the FULL public URL: https://power-interpreter-production-6396.up.railway.app/dl/{file_id} — never use relative paths.
     """
     url = f"{API_BASE}/api/execute"
     logger.info(f"execute_code: POST {url} session={session_id}")
@@ -443,8 +444,8 @@ async def fetch_file(
 
 @mcp.tool()
 async def list_files(session_id: Optional[str] = "default") -> str:
-    """List files in the sandbox with size and type info. Download URLs use format /dl/{uuid}/{filename} — always share exact URLs, never rebuild from filename.
-
+    "List files in a sandbox session. Returns file_id, name, size, modified time. IMPORTANT: Download URLs must use the FULL public URL format: https://power-interpreter-production-6396.up.railway.app/dl/{file_id} — never use relative paths like /dl/..."
+    
     Args:
         session_id: Session to list files for.
     """

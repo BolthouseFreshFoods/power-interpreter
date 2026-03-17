@@ -444,8 +444,8 @@ async def fetch_file(
 
 @mcp.tool()
 async def list_files(session_id: Optional[str] = "default") -> str:
-    "List files in a sandbox session. Returns file_id, name, size, modified time. IMPORTANT: Download URLs must use the FULL public URL format: https://power-interpreter-production-6396.up.railway.app/dl/{file_id} — never use relative paths like /dl/..."
-    
+    """List files in a sandbox session. Returns file_id, name, size, modified time. IMPORTANT: Download URLs must use the FULL public URL format: https://power-interpreter-production-6396.up.railway.app/dl/{file_id} — never use relative paths like /dl/...
+
     Args:
         session_id: Session to list files for.
     """

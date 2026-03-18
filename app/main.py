@@ -14,7 +14,7 @@ Features:
 - Microsoft OneDrive + SharePoint integration (v1.9.0)
 
 Author: Kaffer AI for Timothy Escamilla
-Version: 2.9.2
+Version: 3.0.0
 
 HISTORY:
   v1.7.2: fetch_from_url route fix, stable release
@@ -25,6 +25,7 @@ HISTORY:
   v2.9.0: Trimmed all 34 tool descriptions for token optimization (~57% reduction)
   v2.9.1: Smart error handling for empty execute_code args (model-agnostic)
   v2.9.2: Response guardrails — truncate oversized MCP tool results (Change #10)
+  v3.0.0: Context pressure guard — per-tool caps, pressure warnings, improved recovery
 """
 
 import logging
@@ -42,6 +43,11 @@ from app.auth import verify_api_key
 from app.routes import execute, jobs, files, data, sessions, health
 from app.routes.files import public_router as download_router
 from app.mcp_server import mcp
+from app.context_guard import (
+    get_effective_cap,
+    maybe_add_pressure_warning,
+    get_empty_args_recovery_message,
+)
 
 # Configure logging
 logging.basicConfig(
@@ -51,7 +57,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ── Response Budget Guard (Change #10) ──────────────────────────────────
+# ── Response Budget Guard (Change #10) ──────────────────────────────────────────
 # Cap MCP tool responses to prevent a single call from consuming the
 # entire context window. 50,000 chars ≈ 12,500 tokens — leaves room
 # for the model to reason + respond.
@@ -63,7 +69,7 @@ async def lifespan(app: FastAPI):
     """Application lifecycle management"""
     # --- STARTUP ---
     logger.info("="*60)
-    logger.info("Power Interpreter MCP v2.9.2 starting...")
+    logger.info("Power Interpreter MCP v3.0.0 starting...")
     logger.info("="*60)
 
     # Ensure directories exist
@@ -193,7 +199,7 @@ app = FastAPI(
         "Charts served at /charts/{session_id}/{filename}. "
         "Microsoft OneDrive + SharePoint integration."
     ),
-    version="2.9.1",
+    version="3.0.0",
     lifespan=lifespan,
     docs_url="/docs",
     redoc_url="/redoc",
@@ -292,7 +298,7 @@ async def serve_chart(session_id: str, filename: str):
                 headers={
                     "Content-Disposition": f'inline; filename="{filename}"',
                     "Cache-Control": "public, max-age=3600",
-                    "X-Power-Interpreter": "chart-serve-v2.9.1",
+                    "X-Power-Interpreter": "chart-serve-v3.0.0",
                 }
             )
 
@@ -428,31 +434,33 @@ async def handle_mcp_jsonrpc(request: Request):
             "id": None,
         }, status_code=400)
 
+    # Handle batch or single JSON-RPC message
     if isinstance(data, list):
+        logger.info(f"MCP direct: batch request, {len(data)} messages")
         responses = []
         for item in data:
-            r = await _handle_single_jsonrpc(item)
-            if r is not None:
-                responses.append(r)
-        if responses:
-            return JSONResponse(content=responses)
-        return Response(status_code=204)
-
-    result = await _handle_single_jsonrpc(data)
-    if result is None:
-        return Response(status_code=204)
-    return JSONResponse(content=result)
+            resp = await _handle_single_jsonrpc(item)
+            if resp is not None:
+                responses.append(resp)
+        if not responses:
+            return Response(status_code=204)
+        return JSONResponse(content=responses)
+    else:
+        result = await _handle_single_jsonrpc(data)
+        if result is None:
+            return Response(status_code=204)
+        return JSONResponse(content=result)
 
 
 async def _handle_single_jsonrpc(data: dict):
-    """Route a single JSON-RPC message."""
+    """Process a single JSON-RPC message."""
     method = data.get("method", "")
     msg_id = data.get("id")
     params = data.get("params", {})
 
     logger.info(f"MCP direct: method={method}  id={msg_id}")
 
-    # Notifications
+    # Notifications (no response needed)
     if msg_id is None or method.startswith("notifications/"):
         logger.info(f"MCP direct: notification '{method}' ack")
         return None
@@ -470,7 +478,7 @@ async def _handle_single_jsonrpc(data: dict):
                 },
                 "serverInfo": {
                     "name": "Power Interpreter",
-                    "version": "2.9.1",
+                    "version": "3.0.0",
                 },
             },
         }
@@ -520,20 +528,10 @@ async def _handle_single_jsonrpc(data: dict):
                     f"Arguments empty: {len(tool_args) == 0}"
                 )
 
-                # ── Smart error for execute_code with empty args (v2.9.1) ──
-                # When an LLM sends execute_code with no arguments, this is
-                # typically caused by output token truncation on large code
-                # payloads. The actionable guidance helps the model self-correct.
-                if tool_name == "execute_code" and len(tool_args) == 0:
-                    error_text = (
-                        "ERROR: No code was provided — the 'code' argument was empty. "
-                        "This typically happens when the code block is too large for a single tool call. "
-                        "Please try one of these approaches:\n"
-                        "1. Break your code into smaller sequential steps\n"
-                        "2. Write a shorter code snippet that saves to a .py file, then execute that file\n"
-                        "3. Simplify your approach — fewer lines per execution call\n"
-                        "4. If this keeps happening, start a fresh conversation to reset context"
-                    )
+                # ── Fix 4: Improved empty-args recovery (v3.0.0) ────────
+                recovery_msg = get_empty_args_recovery_message(tool_name, tool_args)
+                if recovery_msg:
+                    error_text = recovery_msg
                 else:
                     error_text = f"Error: {validation_error}"
 
@@ -553,19 +551,23 @@ async def _handle_single_jsonrpc(data: dict):
             logger.info(f"MCP direct: {tool_name} returned {original_len:,} chars")
             logger.info(f"MCP direct: result preview: {result_str[:300]}")
 
-            # — Response Budget Guard (Change #10) ————————————————
-            # Smart boundary-aware truncation (v2.9.9)
-            # Preserves complete JSON objects, URLs, and line boundaries.
-            if original_len > MCP_RESPONSE_MAX_CHARS:
+            # ── Response Budget Guard + Context Pressure Guard (v3.0.0) ────
+            # Fix 1: Per-tool response cap (execute_code=25K, default=50K)
+            effective_cap = get_effective_cap(tool_name, MCP_RESPONSE_MAX_CHARS)
+            if original_len > effective_cap:
                 from app.response_guard import smart_truncate
-                truncated_result = smart_truncate(result_str)
+                # Pre-slice to per-tool cap, then let smart_truncate clean boundaries
+                truncated_result = smart_truncate(result_str[:effective_cap])
                 content = [{"type": "text", "text": truncated_result}]
                 logger.warning(
                     f"MCP direct: {tool_name} response TRUNCATED "
-                    f"{original_len:,} -> {len(truncated_result):,} chars"
+                    f"{original_len:,} -> {len(truncated_result):,} chars "
+                    f"(cap: {effective_cap:,})"
                 )
             elif isinstance(result, str):
-                content = [{"type": "text", "text": result}]
+                # Fix 3: Context pressure warning for large-but-under-cap responses
+                warned_result = maybe_add_pressure_warning(tool_name, result)
+                content = [{"type": "text", "text": warned_result}]
             elif isinstance(result, dict):
                 content = [{"type": "text", "text": json.dumps(result)}]
             elif isinstance(result, list):

@@ -2,6 +2,8 @@
 
 Sync execution for quick snippets (<30s).
 For longer operations, use the Jobs API.
+
+Version: 3.0.0 — Added stdout truncation at source (Fix 2)
 """
 
 from fastapi import APIRouter, HTTPException
@@ -10,6 +12,7 @@ from typing import Optional, Dict
 
 from app.engine.executor import executor
 from app.database import ensure_session_exists
+from app.context_guard import truncate_stdout
 
 router = APIRouter()
 
@@ -63,6 +66,15 @@ async def execute_code(request: ExecuteRequest):
         context=request.context
     )
     
+    # ── Fix 2: Truncate stdout at the source (v3.0.0) ──────────────────
+    # When execute_code extracts text from multiple PDFs, stdout can hit
+    # 45K+ chars. This slips under the global 50K response cap but leaves
+    # no room for the model's next tool call, causing empty-args failures.
+    # Truncating here prevents the chain reaction from starting.
+    # Ref: Railway logs 2026-03-17T23:18–23:21Z (Calcium Chloride incident)
+    if hasattr(result, 'stdout') and result.stdout:
+        result.stdout = truncate_stdout(result.stdout)
+    
     return result.to_dict()
 
 
@@ -83,9 +95,12 @@ async def execute_quick(code: str):
         timeout=10
     )
     
+    # Fix 2: Truncate stdout at the source
+    if hasattr(result, 'stdout') and result.stdout:
+        result.stdout = truncate_stdout(result.stdout)
+    
     return {
         'success': result.success,
         'output': result.stdout.strip() if result.success else result.error_message,
         'result': result.result,
-        'time_ms': result.execution_time_ms
     }

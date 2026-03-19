@@ -2,6 +2,8 @@
 v1.9.4: Added get_default_user_id() so tools can auto-resolve user_id.
 v2.9.3a: Added clear_user_token() and list_authenticated_users() for admin.
          No hardcoded emails — default user resolved from most recent Postgres entry.
+v2.10.1: Multi-user safety — get_default_user_id() warns on cross-user risk.
+         get_default_user_id_async() same multi-user detection.
 """
 import os, time, json, logging, asyncio
 from typing import Optional, Dict, Any, List
@@ -26,19 +28,66 @@ class MSAuthManager:
     @property
     def enabled(self): return self._enabled
 
+    # ── FIX 1: Multi-user safe default resolution (v2.10.1) ─────────────
     def get_default_user_id(self) -> Optional[str]:
-        if self._last_authenticated_user:
-            if self._tokens.get(self._last_authenticated_user, {}).get("status") == "authenticated":
-                return self._last_authenticated_user
-        for uid, data in self._tokens.items():
-            if data.get("status") == "authenticated":
-                self._last_authenticated_user = uid
-                return uid
-        return None
+        """Resolve default user — WARN if multiple users are active.
 
+        v2.10.1: When multiple users are authenticated concurrently,
+        _last_authenticated_user is a global singleton that could
+        return the WRONG user's token. This now logs a warning when
+        that risk exists so it's visible in Railway logs.
+
+        Long-term fix: make user_email required on all Microsoft tools
+        so this fallback is never needed.
+        """
+        authenticated = [
+            uid for uid, data in self._tokens.items()
+            if data.get("status") == "authenticated"
+        ]
+        if len(authenticated) == 0:
+            return None
+        if len(authenticated) == 1:
+            self._last_authenticated_user = authenticated[0]
+            return authenticated[0]
+        # MULTIPLE users active — log cross-user risk
+        logger.warning(
+            f"MS Auth: MULTI-USER WARNING — {len(authenticated)} authenticated "
+            f"users: {authenticated}. Returning last authenticated: "
+            f"{self._last_authenticated_user}. "
+            f"Pass user_email explicitly to avoid cross-user data access."
+        )
+        if self._last_authenticated_user in authenticated:
+            return self._last_authenticated_user
+        self._last_authenticated_user = authenticated[0]
+        return authenticated[0]
+
+    # ── FIX 2: Async multi-user safe default resolution (v2.10.1) ───────
     async def get_default_user_id_async(self) -> Optional[str]:
-        default = self.get_default_user_id()
-        if default: return default
+        """Async default user resolve with DB fallback — multi-user safe.
+
+        v2.10.1: Same multi-user warning as sync version. Postgres
+        fallback only fires when zero users are in memory — safe
+        because it loads exactly one user.
+        """
+        authenticated = [
+            uid for uid, data in self._tokens.items()
+            if data.get("status") == "authenticated"
+        ]
+        if len(authenticated) == 1:
+            self._last_authenticated_user = authenticated[0]
+            return authenticated[0]
+        if len(authenticated) > 1:
+            logger.warning(
+                f"MS Auth: MULTI-USER WARNING (async) — {len(authenticated)} "
+                f"authenticated users: {authenticated}. Returning last: "
+                f"{self._last_authenticated_user}. "
+                f"Pass user_email explicitly to avoid cross-user data access."
+            )
+            if self._last_authenticated_user in authenticated:
+                return self._last_authenticated_user
+            self._last_authenticated_user = authenticated[0]
+            return authenticated[0]
+        # No in-memory users — try Postgres (single-user safe)
         if self._db_ready:
             try:
                 from app.database import get_session_factory
@@ -53,7 +102,7 @@ class MSAuthManager:
                         if td:
                             self._tokens[uid] = td
                             self._last_authenticated_user = uid
-                            logger.info(f"MS Auth: Auto-resolved default user: {uid}")
+                            logger.info(f"MS Auth: Auto-resolved default user from DB: {uid}")
                             return uid
             except Exception as e:
                 logger.warning(f"MS Auth: Failed to load default user: {e}")
@@ -110,26 +159,35 @@ class MSAuthManager:
             from app.database import get_session_factory
             from sqlalchemy import text
             factory = get_session_factory()
-            if not factory: return
             async with factory() as session:
-                await session.execute(text("CREATE TABLE IF NOT EXISTS ms_tokens (user_id TEXT PRIMARY KEY, token_data JSONB NOT NULL, updated_at TIMESTAMPTZ DEFAULT NOW())"))
+                await session.execute(text("""
+                    CREATE TABLE IF NOT EXISTS ms_tokens (
+                        user_id TEXT PRIMARY KEY,
+                        token_data JSONB NOT NULL,
+                        updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+                    )
+                """))
                 await session.commit()
             self._db_ready = True
-            logger.info("MS Auth: ms_tokens table ready")
+            logger.info("MS Auth: Token table ready (Postgres)")
         except Exception as e:
-            logger.warning(f"MS Auth: Failed to create ms_tokens table: {e}")
+            logger.warning(f"MS Auth: Could not create token table: {e}")
+            self._db_ready = False
 
     async def start_device_login(self, user_id: str) -> Dict[str, Any]:
+        """Start Device Code Flow for user authentication."""
         if not self._enabled:
-            return {"status": "error", "message": "Microsoft auth not configured."}
+            return {"status": "error", "message": "Microsoft integration not configured. Set AZURE_TENANT_ID and AZURE_CLIENT_ID."}
+        data = {"client_id": self.client_id, "scope": " ".join(GRAPH_SCOPES)}
         try:
-            resp = await self._http.post(f"{self.authority}/oauth2/v2.0/devicecode", data={"client_id": self.client_id, "scope": " ".join(GRAPH_SCOPES)})
-            resp.raise_for_status()
+            resp = await self._http.post(f"{self.authority}/oauth2/v2.0/devicecode", data=data)
+            if resp.status_code != 200:
+                return {"status": "error", "message": f"Device code request failed: HTTP {resp.status_code}"}
+            r = resp.json()
+            self._tokens[user_id] = {"status": "pending", "device_code": r["device_code"], "interval": r.get("interval", 5), "expires_at": time.time() + r.get("expires_in", 900)}
+            return {"status": "pending", "user_code": r["user_code"], "verification_uri": r["verification_uri"], "message": f"Visit **{r['verification_uri']}** and enter code **{r['user_code']}**", "expires_in_seconds": r["expires_in"]}
         except Exception as e:
-            return {"status": "error", "message": f"Failed: {e}"}
-        r = resp.json()
-        self._tokens[user_id] = {"status": "pending", "device_code": r["device_code"], "user_code": r["user_code"], "verification_uri": r["verification_uri"], "expires_at": time.time() + r["expires_in"], "interval": r.get("interval", 5)}
-        return {"status": "pending", "user_code": r["user_code"], "verification_uri": r["verification_uri"], "message": f"Visit **{r['verification_uri']}** and enter code **{r['user_code']}**", "expires_in_seconds": r["expires_in"]}
+            return {"status": "error", "message": f"Device code request error: {e}"}
 
     async def poll_device_login(self, user_id: str) -> Dict[str, Any]:
         pending = self._tokens.get(user_id)

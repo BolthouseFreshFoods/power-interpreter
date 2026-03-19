@@ -62,6 +62,9 @@ logger = logging.getLogger(__name__)
 # ── Response Budget Guard (Change #10) ──────────────────────────────────────────
 MCP_RESPONSE_MAX_CHARS = 50_000
 
+# ── Skills Layer ────────────────────────────────────────────────────────────────
+_skill_tools: dict = {}
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifecycle management"""
@@ -97,7 +100,24 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning(f"Microsoft token table setup failed: {e}")
             logger.warning("Microsoft auth will work but tokens won't persist across deploys")
-
+   
+        # ── Skills Layer Integration ──────────────────────────────────
+        try:
+            from app.skills_integration import initialize_skills
+            _skills_result = await initialize_skills(mcp)
+            if _skills_result:
+                global _skill_tools
+                _skill_tools = _skills_result
+                logger.info(
+                    f"Skills layer: {len(_skill_tools)} skill tools registered"
+                )
+            else:
+                logger.info("Skills layer: no skills registered")
+        except ImportError:
+            logger.info("Skills layer: module not found, skipping")
+        except Exception as e:
+            logger.warning(f"Skills layer initialization failed: {e}")       
+ 
     cleanup_task = None
     if db_ok:
         cleanup_task = asyncio.create_task(_periodic_cleanup())
@@ -357,13 +377,25 @@ def _build_tool_schema(tool) -> dict:
     return schema
 
 
-def _get_tool_registry() -> dict:
-    """Get all registered MCP tools as {name: tool_object}."""
-    tools = {}
-    if hasattr(mcp, '_tool_manager') and hasattr(mcp._tool_manager, '_tools'):
-        for name, tool in mcp._tool_manager._tools.items():
-            tools[name] = tool
-    return tools
+def _get_tool_registry():
+    """Get the tool registry from the MCP server, including skills."""
+    base = {}
+    try:
+        if hasattr(mcp, '_tool_manager') and hasattr(mcp._tool_manager, '_tools'):
+            base = mcp._tool_manager._tools
+        elif hasattr(mcp, 'tools'):
+            base = mcp.tools
+        else:
+            logger.warning("Could not find tool registry on MCP server")
+    except Exception as e:
+        logger.error(f"Error accessing tool registry: {e}")
+
+    # Merge skill tools if the skills layer is active
+    if _skill_tools:
+        merged = dict(base)
+        merged.update(_skill_tools)
+        return merged
+    return base
 
 
 def _get_tools_list() -> list:

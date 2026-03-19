@@ -14,7 +14,7 @@ Features:
 - Microsoft OneDrive + SharePoint integration (v1.9.0)
 
 Author: Kaffer AI for Timothy Escamilla
-Version: 3.0.0
+Version: 3.0.1
 
 HISTORY:
   v1.7.2: fetch_from_url route fix, stable release
@@ -26,6 +26,7 @@ HISTORY:
   v2.9.1: Smart error handling for empty execute_code args (model-agnostic)
   v2.9.2: Response guardrails — truncate oversized MCP tool results (Change #10)
   v3.0.0: Context pressure guard — per-tool caps, pressure warnings, improved recovery
+  v3.0.1: Pre-execution syntax guard — catch truncated code before sandbox (Fix 5)
 """
 
 import logging
@@ -48,6 +49,7 @@ from app.context_guard import (
     maybe_add_pressure_warning,
     get_empty_args_recovery_message,
 )
+from app.syntax_guard import check_syntax
 
 # Configure logging
 logging.basicConfig(
@@ -58,10 +60,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ── Response Budget Guard (Change #10) ──────────────────────────────────────────
-# Cap MCP tool responses to prevent a single call from consuming the
-# entire context window. 50,000 chars ≈ 12,500 tokens — leaves room
-# for the model to reason + respond.
-# The 321,665-char OneDrive response that ate ~80K tokens? Never again.
 MCP_RESPONSE_MAX_CHARS = 50_000
 
 @asynccontextmanager
@@ -69,13 +67,11 @@ async def lifespan(app: FastAPI):
     """Application lifecycle management"""
     # --- STARTUP ---
     logger.info("="*60)
-    logger.info("Power Interpreter MCP v3.0.0 starting...")
+    logger.info("Power Interpreter MCP v3.0.1 starting...")
     logger.info("="*60)
 
-    # Ensure directories exist
     settings.ensure_directories()
 
-    # Initialize database (graceful - don't crash if DB not ready)
     db_ok = False
     if settings.DATABASE_URL:
         try:
@@ -90,7 +86,6 @@ async def lifespan(app: FastAPI):
         logger.warning("No DATABASE_URL configured. Running without database.")
         logger.warning("Set DATABASE_URL to enable: jobs, sessions, datasets, file tracking")
 
-    # ── Initialize Microsoft token persistence ──────────
     if db_ok:
         try:
             from app.mcp_server import _ms_auth
@@ -103,12 +98,10 @@ async def lifespan(app: FastAPI):
             logger.warning(f"Microsoft token table setup failed: {e}")
             logger.warning("Microsoft auth will work but tokens won't persist across deploys")
 
-    # Start periodic cleanup (jobs + expired sandbox files)
     cleanup_task = None
     if db_ok:
         cleanup_task = asyncio.create_task(_periodic_cleanup())
 
-    # Log public URL for download links
     public_url = settings.public_base_url
 
     logger.info("Power Interpreter ready!")
@@ -145,15 +138,13 @@ async def _periodic_cleanup():
     """Periodically clean up old jobs, temp files, and expired sandbox files"""
     while True:
         try:
-            await asyncio.sleep(3600)  # Every hour
+            await asyncio.sleep(3600)
 
-            # Clean up old jobs
             from app.engine.job_manager import job_manager
             count = await job_manager.cleanup_old_jobs()
             if count:
                 logger.info(f"Periodic cleanup: removed {count} old jobs")
 
-            # Clean up expired sandbox files
             try:
                 await _cleanup_expired_sandbox_files()
             except Exception as e:
@@ -199,7 +190,7 @@ app = FastAPI(
         "Charts served at /charts/{session_id}/{filename}. "
         "Microsoft OneDrive + SharePoint integration."
     ),
-    version="3.0.0",
+    version="3.0.1",
     lifespan=lifespan,
     docs_url="/docs",
     redoc_url="/redoc",
@@ -255,7 +246,6 @@ async def serve_chart(session_id: str, filename: str):
                     }
                 )
 
-            # Determine Content-Type
             content_type = getattr(file_record, 'content_type', None) or 'application/octet-stream'
             fname_lower = filename.lower()
             if fname_lower.endswith('.png'):
@@ -269,7 +259,6 @@ async def serve_chart(session_id: str, filename: str):
             elif fname_lower.endswith('.pdf'):
                 content_type = 'application/pdf'
 
-            # Get the binary data
             file_data = getattr(file_record, 'file_data', None)
             if file_data is None:
                 file_data = getattr(file_record, 'data', None)
@@ -298,7 +287,7 @@ async def serve_chart(session_id: str, filename: str):
                 headers={
                     "Content-Disposition": f'inline; filename="{filename}"',
                     "Cache-Control": "public, max-age=3600",
-                    "X-Power-Interpreter": "chart-serve-v3.0.0",
+                    "X-Power-Interpreter": "chart-serve-v3.0.1",
                 }
             )
 
@@ -434,7 +423,6 @@ async def handle_mcp_jsonrpc(request: Request):
             "id": None,
         }, status_code=400)
 
-    # Handle batch or single JSON-RPC message
     if isinstance(data, list):
         logger.info(f"MCP direct: batch request, {len(data)} messages")
         responses = []
@@ -460,12 +448,10 @@ async def _handle_single_jsonrpc(data: dict):
 
     logger.info(f"MCP direct: method={method}  id={msg_id}")
 
-    # Notifications (no response needed)
     if msg_id is None or method.startswith("notifications/"):
         logger.info(f"MCP direct: notification '{method}' ack")
         return None
 
-    # initialize
     if method == "initialize":
         logger.info("MCP direct: -> initialize response")
         return {
@@ -478,16 +464,14 @@ async def _handle_single_jsonrpc(data: dict):
                 },
                 "serverInfo": {
                     "name": "Power Interpreter",
-                    "version": "3.0.0",
+                    "version": "3.0.1",
                 },
             },
         }
 
-    # ping
     if method == "ping":
         return {"jsonrpc": "2.0", "id": msg_id, "result": {}}
 
-    # tools/list
     if method == "tools/list":
         tools = _get_tools_list()
         logger.info(f"MCP direct: -> {len(tools)} tools")
@@ -499,7 +483,6 @@ async def _handle_single_jsonrpc(data: dict):
             "result": {"tools": tools},
         }
 
-    # tools/call
     if method == "tools/call":
         tool_name = params.get("name", "")
         tool_args = params.get("arguments", {})
@@ -520,7 +503,6 @@ async def _handle_single_jsonrpc(data: dict):
 
             validation_error = _validate_tool_args(fn, tool_args, tool_name)
             if validation_error:
-                # ── Enhanced forensic logging (v2.9.1) ──────────────────
                 logger.warning(
                     f"MCP direct: {tool_name} argument validation failed: {validation_error} | "
                     f"Full params size: {len(json.dumps(params))} bytes | "
@@ -528,7 +510,6 @@ async def _handle_single_jsonrpc(data: dict):
                     f"Arguments empty: {len(tool_args) == 0}"
                 )
 
-                # ── Fix 4: Improved empty-args recovery (v3.0.0) ────────
                 recovery_msg = get_empty_args_recovery_message(tool_name, tool_args)
                 if recovery_msg:
                     error_text = recovery_msg
@@ -544,6 +525,28 @@ async def _handle_single_jsonrpc(data: dict):
                     },
                 }
 
+            # ── Fix 5: Pre-execution syntax guard (v3.0.1) ────────────
+            # Catch truncated code BEFORE it reaches the sandbox.
+            # Saves 200-500ms per failed execution and gives the model
+            # actionable guidance to retry with shorter code.
+            # Ref: Railway logs 2026-03-18T23:53Z (spc3_hydrocooler)
+            if tool_name == "execute_code" and "code" in tool_args:
+                syntax_issue = check_syntax(tool_args["code"])
+                if syntax_issue:
+                    logger.warning(
+                        f"MCP direct: {tool_name} syntax guard caught truncated code "
+                        f"(session={tool_args.get('session_id', 'unknown')}, "
+                        f"code_len={len(tool_args['code'])})"
+                    )
+                    return {
+                        "jsonrpc": "2.0",
+                        "id": msg_id,
+                        "result": {
+                            "content": [{"type": "text", "text": syntax_issue}],
+                            "isError": True,
+                        },
+                    }
+
             logger.info(f"MCP direct: invoking {tool_name}...")
             result = await fn(**tool_args)
             result_str = str(result)
@@ -551,12 +554,9 @@ async def _handle_single_jsonrpc(data: dict):
             logger.info(f"MCP direct: {tool_name} returned {original_len:,} chars")
             logger.info(f"MCP direct: result preview: {result_str[:300]}")
 
-            # ── Response Budget Guard + Context Pressure Guard (v3.0.0) ────
-            # Fix 1: Per-tool response cap (execute_code=25K, default=50K)
             effective_cap = get_effective_cap(tool_name, MCP_RESPONSE_MAX_CHARS)
             if original_len > effective_cap:
                 from app.response_guard import smart_truncate
-                # Pre-slice to per-tool cap, then let smart_truncate clean boundaries
                 truncated_result = smart_truncate(result_str[:effective_cap])
                 content = [{"type": "text", "text": truncated_result}]
                 logger.warning(
@@ -565,7 +565,6 @@ async def _handle_single_jsonrpc(data: dict):
                     f"(cap: {effective_cap:,})"
                 )
             elif isinstance(result, str):
-                # Fix 3: Context pressure warning for large-but-under-cap responses
                 warned_result = maybe_add_pressure_warning(tool_name, result)
                 content = [{"type": "text", "text": warned_result}]
             elif isinstance(result, dict):
@@ -592,7 +591,6 @@ async def _handle_single_jsonrpc(data: dict):
                 },
             }
 
-    # Unknown method
     logger.warning(f"MCP direct: unknown method '{method}'")
     return {
         "jsonrpc": "2.0",
@@ -605,17 +603,14 @@ async def _handle_single_jsonrpc(data: dict):
 # ROUTE MOUNTING
 # =============================================================================
 
-# Public routes (no auth)
 app.include_router(health.router, tags=["Health"])
 
-# Public download (no auth)
 app.include_router(
     download_router,
     prefix="/dl",
     tags=["Downloads"],
 )
 
-# Protected routes (API key required)
 app.include_router(
     execute.router,
     prefix="/api",
@@ -647,5 +642,4 @@ app.include_router(
     dependencies=[Depends(verify_api_key)],
 )
 
-# MCP SSE transport (for standard MCP clients)
 app.mount("/mcp", mcp.sse_app())

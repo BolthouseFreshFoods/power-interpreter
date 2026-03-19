@@ -132,7 +132,7 @@ class ConsolidateFilesSkill(Skill):
                 "type": "string",
                 "description": (
                     "Microsoft 365 email for OneDrive access "
-                    "(e.g., kevin.chin@bolthousefresh.com)"
+                    "(e.g., user@bolthousefresh.com)"
                 ),
             },
             "folder_path": {

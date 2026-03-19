@@ -1,88 +1,175 @@
 """Skills Integration — wires skills into the MCP server.
 
-This module provides the bridge between the SkillEngine and
-the existing MCP tool registration in main.py.
+Updated to work directly with FastMCP's internal tool registry,
+matching the patterns in app/main.py's _get_tool_registry() and
+_build_tool_list().
 
-Usage in main.py:
+Integration requires 3 small changes to app/main.py:
+  1. Add `_skill_tools: dict = {}` after imports
+  2. Call `initialize_skills(mcp)` in lifespan()
+  3. Merge _skill_tools in _get_tool_registry()
 
-    from app.skills_integration import register_skill_tools
-
-    # After existing tool handlers are defined:
-    skill_engine = await register_skill_tools(
-        tool_handlers={
-            "ms_auth": handle_ms_auth,
-            "onedrive": handle_onedrive,
-            "execute_code": handle_execute_code,
-            "list_files": handle_list_files,
-        },
-        register_fn=register_tool,  # Your MCP tool registration function
-    )
+See SKILLS_GUIDE.md for full integration instructions.
 """
 
 import logging
-from typing import Any, Callable, Dict
+from typing import Any, Callable, Dict, Optional
 
 from .skills import create_skill_engine, SkillEngine
 
 logger = logging.getLogger(__name__)
 
 
-async def register_skill_tools(
-    tool_handlers: Dict[str, Callable],
-    register_fn: Callable,
-) -> SkillEngine:
-    """Register all skills as MCP tools.
+class SkillToolWrapper:
+    """Wraps a skill as a tool-like object for the MCP registry.
+
+    Mimics the interface expected by _get_tool_registry(),
+    _build_tool_list(), and _handle_mcp_direct() in main.py:
+      - .fn:          async callable(**kwargs) -> str
+      - .description:  str
+      - .parameters:   dict  (JSON Schema)
+      - .inputSchema:  dict  (alias used by some FastMCP versions)
+      - .name:         str
+    """
+
+    def __init__(
+        self,
+        name: str,
+        description: str,
+        input_schema: dict,
+        handler: Callable,
+    ):
+        self.name = name
+        self.description = description
+        self.parameters = input_schema
+        self.inputSchema = input_schema  # alias
+        self.fn = handler
+
+
+async def initialize_skills(mcp_server) -> Dict[str, SkillToolWrapper]:
+    """Initialize the skills engine and return tool wrappers.
+
+    This is called once during app startup in lifespan().
+    It creates the SkillEngine, wires existing MCP tool handlers
+    into it, and returns SkillToolWrapper objects that can be
+    merged into _get_tool_registry() results.
 
     Args:
-        tool_handlers: Dict mapping tool name -> async handler.
-            Required keys: ms_auth, onedrive, execute_code, list_files.
-            Additional handlers can be passed for future skills.
-        register_fn: Function to register a new MCP tool.
-            Signature: register_fn(name, description, input_schema, handler)
+        mcp_server: The FastMCP instance from app.mcp_server
 
     Returns:
-        The initialized SkillEngine instance.
+        Dict mapping skill_name -> SkillToolWrapper.
+        Store this in the module-level _skill_tools dict.
     """
-    # Validate required handlers
-    required = {"ms_auth", "onedrive", "execute_code", "list_files"}
-    missing = required - set(tool_handlers.keys())
-    if missing:
+    # Create engine with all registered skills
+    engine = create_skill_engine()
+
+    # Extract existing tool handlers from MCP registry
+    registry = _get_mcp_registry(mcp_server)
+    if not registry:
+        logger.warning("[Skills] Empty MCP registry — skills disabled")
+        return {}
+
+    # Wire required tool handlers
+    required_tools = ["ms_auth", "onedrive", "execute_code", "list_files"]
+    wired = 0
+    for tool_name in required_tools:
+        tool = registry.get(tool_name)
+        if tool:
+            fn = tool.fn if hasattr(tool, "fn") else tool
+            engine.register_tool_handler(tool_name, fn)
+            wired += 1
+            logger.debug(f"[Skills] Wired tool handler: {tool_name}")
+        else:
+            logger.warning(
+                f"[Skills] Required tool handler not found: {tool_name}"
+            )
+
+    # Wire optional handlers (future skills may use these)
+    optional_tools = [
+        "fetch_file", "sharepoint", "resolve_share_link",
+        "submit_job", "get_job_status", "get_job_result",
+    ]
+    for tool_name in optional_tools:
+        tool = registry.get(tool_name)
+        if tool:
+            fn = tool.fn if hasattr(tool, "fn") else tool
+            engine.register_tool_handler(tool_name, fn)
+
+    if wired < len(required_tools):
         logger.warning(
-            f"[SkillIntegration] Missing tool handlers: {missing}. "
-            f"Some skills may fail."
+            f"[Skills] Only {wired}/{len(required_tools)} required "
+            f"handlers wired — some skills may fail at runtime"
         )
 
-    # Create engine and wire up tool handlers
-    engine = create_skill_engine()
-    for name, handler in tool_handlers.items():
-        engine.register_tool_handler(name, handler)
+    # Build SkillToolWrapper for each skill
+    skill_tools: Dict[str, SkillToolWrapper] = {}
 
-    # Register each skill as an MCP tool
     for skill_info in engine.list_skills():
         skill_name = skill_info["name"]
 
-        # Create a closure that captures the skill name
-        def make_handler(sn: str):
-            async def handler(arguments: dict) -> str:
-                session = arguments.get("session_name", "default")
-                result = await engine.run(sn, arguments, session)
-                return result.summary()
-            return handler
+        # Create async handler closure
+        handler = _make_skill_handler(engine, skill_name)
 
-        handler = make_handler(skill_name)
-
-        register_fn(
+        wrapper = SkillToolWrapper(
             name=skill_name,
             description=skill_info["description"],
             input_schema=skill_info["input_schema"],
             handler=handler,
         )
-        logger.info(
-            f"[SkillIntegration] Registered MCP tool: {skill_name}"
-        )
+        skill_tools[skill_name] = wrapper
+        logger.info(f"[Skills] Registered skill tool: {skill_name}")
 
     logger.info(
-        f"[SkillIntegration] {len(engine._skills)} skills "
-        f"registered as MCP tools"
+        f"[Skills] Engine ready: {len(skill_tools)} skills, "
+        f"{wired} tool handlers wired"
     )
-    return engine
+    return skill_tools
+
+
+def _make_skill_handler(
+    engine: SkillEngine, skill_name: str
+) -> Callable:
+    """Create an async handler closure for a skill.
+
+    The returned function matches the signature expected by
+    _handle_mcp_direct():  async fn(**kwargs) -> str
+
+    We use **kwargs so the function accepts any arguments the
+    model passes, matching how other MCP tools are invoked
+    in the direct handler.
+    """
+
+    async def handler(**kwargs) -> str:
+        session = kwargs.get("session_name", "default")
+        result = await engine.run(skill_name, kwargs, session)
+        return result.summary()
+
+    # Metadata for introspection / logging
+    handler.__name__ = skill_name
+    handler.__doc__ = f"Skill: {skill_name}"
+    return handler
+
+
+def _get_mcp_registry(mcp_server) -> dict:
+    """Extract the tool registry from a FastMCP server instance.
+
+    Mirrors the same lookup logic used in main.py's
+    _get_tool_registry() to ensure consistency.
+    """
+    try:
+        if (
+            hasattr(mcp_server, "_tool_manager")
+            and hasattr(mcp_server._tool_manager, "_tools")
+        ):
+            return mcp_server._tool_manager._tools
+        elif hasattr(mcp_server, "tools"):
+            return mcp_server.tools
+        else:
+            logger.warning(
+                "[Skills] Could not find tool registry on MCP server"
+            )
+            return {}
+    except Exception as e:
+        logger.error(f"[Skills] Error accessing MCP registry: {e}")
+        return {}

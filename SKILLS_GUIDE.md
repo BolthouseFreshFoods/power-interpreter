@@ -62,7 +62,7 @@ Downloads files from OneDrive and consolidates into one Excel workbook.
 **Parameters:**
 | Param | Type | Required | Description |
 |-------|------|----------|-------------|
-| `user_email` | string | Yes | Microsoft 365 email |
+| `user_email` | string | Yes | Microsoft 365 email (e.g., user@bolthousefresh.com) |
 | `folder_path` | string | Yes | OneDrive folder path |
 | `file_names` | string[] | No | Specific files (default: all) |
 | `output_filename` | string | No | Output name (default: Consolidated_Output.xlsx) |
@@ -76,6 +76,97 @@ Downloads files from OneDrive and consolidates into one Excel workbook.
 - Max print statements: 10 per call
 - Output path: forced to `/app/sandbox_data/{session}/`
 - Delivery: one retry max, then stops
+
+## Integration with app/main.py
+
+The skills layer requires **3 small changes** to `app/main.py`.
+These are designed to be non-breaking — if the skills module
+is missing, the app runs exactly as before.
+
+---
+
+### Change 1: Add module-level variable
+
+**Location:** After the imports block, near `MCP_RESPONSE_MAX_CHARS`
+
+```python
+# ── Skills Layer ──
+_skill_tools: dict = {}
+```
+
+---
+
+### Change 2: Initialize in lifespan()
+
+**Location:** Inside `lifespan()`, after the Microsoft token
+persistence block (`await _ms_auth.ensure_db_table()`)
+
+```python
+    # ── Skills Layer Integration ──
+    try:
+        from app.skills_integration import initialize_skills
+        _skills_result = await initialize_skills(mcp)
+        if _skills_result:
+            global _skill_tools
+            _skill_tools = _skills_result
+            logger.info(
+                f"Skills layer: {len(_skill_tools)} skill tools registered"
+            )
+        else:
+            logger.info("Skills layer: no skills registered")
+    except ImportError:
+        logger.info("Skills layer: module not found, skipping")
+    except Exception as e:
+        logger.warning(f"Skills layer initialization failed: {e}")
+```
+
+---
+
+### Change 3: Merge skills into tool registry
+
+**Location:** Replace the existing `_get_tool_registry()` function
+
+```python
+def _get_tool_registry():
+    """Get the tool registry from the MCP server, including skills."""
+    base = {}
+    try:
+        if hasattr(mcp, '_tool_manager') and hasattr(mcp._tool_manager, '_tools'):
+            base = mcp._tool_manager._tools
+        elif hasattr(mcp, 'tools'):
+            base = mcp.tools
+        else:
+            logger.warning("Could not find tool registry on MCP server")
+    except Exception as e:
+        logger.error(f"Error accessing tool registry: {e}")
+
+    # Merge skill tools if the skills layer is active
+    if _skill_tools:
+        merged = dict(base)
+        merged.update(_skill_tools)
+        return merged
+    return base
+```
+
+---
+
+### Why This Works
+
+The `SkillToolWrapper` class (in `skills_integration.py`) provides
+the same interface as FastMCP's internal tool objects:
+- `.fn` — the async handler called by `_handle_mcp_direct()`
+- `.description` — shown in `tools/list` response
+- `.parameters` / `.inputSchema` — the JSON Schema
+- `.name` — the tool name
+
+Because `_handle_mcp_direct()` uses `_get_tool_registry()` for
+both `tools/list` and `tools/call`, merging skill wrappers into
+that registry means skills automatically appear as MCP tools —
+no changes needed to the request handling logic.
+
+The design is **fail-safe**: if the skills module is missing or
+crashes during init, `_skill_tools` stays empty and the app
+runs exactly as v3.0.1.
 
 ## Adding a New Skill
 
@@ -92,7 +183,7 @@ class YourSkill(Skill):
     name = "skill_your_name"
     description = "What it does"
     input_schema = { ... }
-    
+
     async def execute(self, params, ctx: SkillContext) -> SkillResult:
         # Step 1
         result = await ctx.call_tool("onedrive", {...})
@@ -102,22 +193,16 @@ class YourSkill(Skill):
         return SkillResult(...)
 ```
 
-## Integration
-
-See `app/skills_integration.py` for wiring into `main.py`.
+Then register in `app/skills/registry.py`:
 
 ```python
-from app.skills_integration import register_skill_tools
+from .definitions.your_skill import YourSkill
 
-skill_engine = await register_skill_tools(
-    tool_handlers={
-        "ms_auth": handle_ms_auth,
-        "onedrive": handle_onedrive,
-        "execute_code": handle_execute_code,
-        "list_files": handle_list_files,
-    },
-    register_fn=register_tool,
-)
+def create_skill_engine() -> SkillEngine:
+    engine = SkillEngine()
+    engine.register_skill(ConsolidateFilesSkill())
+    engine.register_skill(YourSkill())  # <-- add here
+    return engine
 ```
 
-After integration, the model sees `skill_consolidate_files` as a single MCP tool. One call, deterministic execution, guardrailed pipeline.
+The skill automatically becomes a new MCP tool on next deploy.

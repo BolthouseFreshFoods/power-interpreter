@@ -18,12 +18,13 @@ Executes Python code in a controlled environment with:
 - TIMEOUT FLOOR (v2.8.6) - minimum 100s execution time, AI cannot override
 - TOKEN OPTIMIZATION (v2.9.0) - trimmed MCP tool descriptions (~57% reduction)
 - NAMESPACE PREAMBLE (v2.10.0) - common modules pre-injected before every exec
+- OCR SUPPORT (v2.11.0) - PIL, pytesseract, pdf2image, pypdfium2 in allowlist
 
 CRITICAL BUG FIX (v2.6):
   'import matplotlib.pyplot as plt' was broken because:
   1. _lazy_import('matplotlib') correctly set plt = matplotlib.pyplot
   2. Then alias logic OVERWROTE it: plt = matplotlib (base module!)
-  3. So plt.subplots() → matplotlib.subplots() → AttributeError
+  3. So plt.subplots() -> matplotlib.subplots() -> AttributeError
   
   Fix: When _lazy_import returns True, skip alias override if the
   alias already exists in sandbox_globals (lazy_import set it correctly).
@@ -118,10 +119,22 @@ v2.8.6 - Timeout floor enforcement
 
 v2.9.0 - Token optimization
   Trimmed all 34 MCP tool descriptions for ~57% reduction in tool
-  context tokens per message. No logic changes in executor — only
+  context tokens per message. No logic changes in executor -- only
   docstrings in mcp_server.py and tools.py were modified.
 
-Version: 2.9.0
+v2.11.0 - OCR & PDF-to-Image support
+  Pillow was already in requirements.txt but had NO elif block in
+  _lazy_import. So 'from PIL import Image' was rewritten to:
+    # [sandbox] BLOCKED: from PIL import Image (not in allowed list)
+  This is exactly what Cassidi experienced. importlib.util.find_spec
+  returns True (installed) but the sandbox preprocessor blocks it.
+
+  Fix (3-layer):
+  1. Dockerfile: apt-get install tesseract-ocr poppler-utils
+  2. requirements.txt: pytesseract, pdf2image, pypdfium2
+  3. executor.py: PIL, pytesseract, pdf2image, pypdfium2 in _lazy_import
+
+Version: 2.11.0
 """
 
 import asyncio
@@ -180,7 +193,7 @@ STORABLE_EXTENSIONS = {
 IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.svg'}
 
 # Patterns to strip from user code (we handle these internally)
-MATPLOTLIB_USE_PATTERN = re_module.compile(
+MATLOTLIB_USE_PATTERN = re_module.compile(
     r'^\s*matplotlib\s*\.\s*use\s*\(\s*[\'"][^\'"]*[\'"]\s*\)\s*$',
     re_module.MULTILINE
 )
@@ -667,7 +680,7 @@ class SandboxExecutor:
         # ============================================================
         # v2.8.1: ABSOLUTE PATH INTERCEPTION
         # Redirect /tmp/, /var/tmp/, /temp/ to sandbox
-        # (but NOT /home/ubuntu/uploads/ or /app/sandbox_data/ — handled above)
+        # (but NOT /home/ubuntu/uploads/ or /app/sandbox_data/ -- handled above)
         # ============================================================
         if os.path.isabs(path_str):
             for prefix in REDIRECT_PATH_PREFIXES:
@@ -681,7 +694,7 @@ class SandboxExecutor:
                         )
                         return basename
             
-            # Also catch Windows-style paths: C:\Users\..., D:\temp\...
+            # Also catch Windows-style paths: C:\\Users\\..., D:\\temp\\...
             if len(path_str) >= 3 and path_str[1] == ':' and path_str[2] in ('\\', '/'):
                 basename = os.path.basename(path_str.replace('\\', '/'))
                 if basename:
@@ -962,7 +975,7 @@ class SandboxExecutor:
             original = match.group(0).strip()
             return f"# [sandbox] {original} -> already set (Agg backend)"
         
-        return MATPLOTLIB_USE_PATTERN.sub(_replace_use, code)
+        return MATLOTLIB_USE_PATTERN.sub(_replace_use, code)
 
     def _lazy_import(self, name: str, sandbox_globals: Dict):
         """Lazily import allowed libraries into sandbox.
@@ -1075,7 +1088,7 @@ class SandboxExecutor:
                 sandbox_globals['pdfplumber'] = pdfplumber
                 return True
             # ============================================================
-            # v2.7.0: reportlab — professional PDF generation
+            # v2.7.0: reportlab -- professional PDF generation
             # ============================================================
             elif name == 'reportlab':
                 import reportlab
@@ -1136,19 +1149,11 @@ class SandboxExecutor:
                 sandbox_globals['time'] = time_module
                 return True
             # ============================================================
-            # v2.8.4: datetime — inject MODULE with convenience aliases
-            # Previously, datetime was only in _build_safe_globals but NOT
-            # in _lazy_import. When _preprocess_code saw 'from datetime
-            # import datetime', it rewrote it as 'datetime = datetime.datetime'
-            # which OVERWROTE the module with the class. Now _lazy_import
-            # returns True, so the preprocessor comments out the import
-            # instead of rewriting it destructively.
+            # v2.8.4: datetime -- inject MODULE with convenience aliases
             # ============================================================
             elif name == 'datetime':
                 import datetime as _dt_mod
                 sandbox_globals['datetime'] = _dt_mod
-                # Pre-inject commonly used datetime subclasses for convenience
-                # so 'from datetime import timedelta' etc. just works
                 sandbox_globals['timedelta'] = _dt_mod.timedelta
                 sandbox_globals['timezone'] = _dt_mod.timezone
                 sandbox_globals['date'] = _dt_mod.date
@@ -1194,7 +1199,7 @@ class SandboxExecutor:
                     logger.warning("requests not installed")
                     return False
             # ============================================================
-            # v2.8.2: shutil — needed for copying files from upload paths
+            # v2.8.2: shutil -- needed for copying files from upload paths
             # ============================================================
             elif name == 'shutil':
                 import shutil
@@ -1206,15 +1211,11 @@ class SandboxExecutor:
                 return True
             # ============================================================
             # v2.8.5: python-docx and transitive dependencies
-            # python-docx requires zipfile, lxml, xml internally.
-            # Without these in the allowlist, 'from docx import Document'
-            # fails with NameError: 'zipfile' is not defined.
             # ============================================================
             elif name == 'docx':
                 try:
                     import docx
                     sandbox_globals['docx'] = docx
-                    # Pre-import Document for convenience
                     try:
                         from docx import Document as _Document
                         sandbox_globals['Document'] = _Document
@@ -1223,7 +1224,7 @@ class SandboxExecutor:
                     logger.info("Loaded python-docx (Document)")
                     return True
                 except ImportError:
-                    logger.warning("python-docx not installed — run: pip install python-docx")
+                    logger.warning("python-docx not installed")
                     return False
             elif name == 'zipfile':
                 import zipfile
@@ -1289,9 +1290,7 @@ class SandboxExecutor:
                 sandbox_globals['weakref'] = weakref
                 return True
             # ============================================================
-            # v2.8.5: io and copy — already in _build_safe_globals but
-            # need _lazy_import entries so explicit 'import io' or
-            # 'import copy' in user code doesn't get BLOCKED.
+            # v2.8.5: io and copy -- explicit import support
             # ============================================================
             elif name == 'io':
                 import io as io_module
@@ -1301,6 +1300,65 @@ class SandboxExecutor:
                 import copy as copy_module
                 sandbox_globals['copy'] = copy_module
                 return True
+            # ============================================================
+            # v2.11.0: OCR & PDF-to-Image libraries
+            #
+            # Pillow was already in requirements.txt but had NO elif block
+            # here, so 'from PIL import Image' was rewritten by the
+            # preprocessor to:
+            #   # [sandbox] BLOCKED: from PIL import Image (not in allowed list)
+            #
+            # This is exactly what Cassidi experienced: importlib confirms
+            # the library is installed, but the sandbox blocks the import.
+            #
+            # pytesseract requires tesseract-ocr system binary (Dockerfile).
+            # pdf2image requires poppler-utils system binary (Dockerfile).
+            # ============================================================
+            elif name == 'PIL' or name == 'Pillow':
+                try:
+                    import PIL
+                    from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageOps
+                    sandbox_globals['PIL'] = PIL
+                    sandbox_globals['Image'] = Image
+                    sandbox_globals['ImageDraw'] = ImageDraw
+                    sandbox_globals['ImageFont'] = ImageFont
+                    sandbox_globals['ImageFilter'] = ImageFilter
+                    sandbox_globals['ImageOps'] = ImageOps
+                    logger.info("Loaded PIL/Pillow (Image, ImageDraw, ImageFont, ImageFilter, ImageOps)")
+                    return True
+                except ImportError:
+                    logger.warning("Pillow not installed")
+                    return False
+            elif name == 'pytesseract':
+                try:
+                    import pytesseract
+                    sandbox_globals['pytesseract'] = pytesseract
+                    logger.info("Loaded pytesseract (OCR)")
+                    return True
+                except ImportError:
+                    logger.warning("pytesseract not installed")
+                    return False
+            elif name == 'pdf2image':
+                try:
+                    import pdf2image
+                    from pdf2image import convert_from_path, convert_from_bytes
+                    sandbox_globals['pdf2image'] = pdf2image
+                    sandbox_globals['convert_from_path'] = convert_from_path
+                    sandbox_globals['convert_from_bytes'] = convert_from_bytes
+                    logger.info("Loaded pdf2image (PDF to image conversion)")
+                    return True
+                except ImportError:
+                    logger.warning("pdf2image not installed")
+                    return False
+            elif name == 'pypdfium2':
+                try:
+                    import pypdfium2
+                    sandbox_globals['pypdfium2'] = pypdfium2
+                    logger.info("Loaded pypdfium2 (PDF rendering)")
+                    return True
+                except ImportError:
+                    logger.warning("pypdfium2 not installed")
+                    return False
         except ImportError as e:
             logger.warning(f"Failed to import {name}: {e}")
             return False
@@ -1368,16 +1426,8 @@ class SandboxExecutor:
 
                                     # ============================================================
                                     # v2.8.4: GUARD against overwriting module with its own class
-                                    # 'from datetime import datetime' would generate:
-                                    #   datetime = datetime.datetime
-                                    # which DESTROYS the module reference. Instead, check if the
-                                    # alias already exists in sandbox_globals (set by _lazy_import
-                                    # or _build_safe_globals) and skip if so.
                                     # ============================================================
                                     if alias in sandbox_globals and alias == base_module:
-                                        # The user wants 'datetime' to be the class, but we
-                                        # can't destroy the module. The class is available as
-                                        # datetime.datetime, so this is safe to skip.
                                         logger.debug(
                                             f"Skipping '{alias} = {module_path}.{original}' "
                                             f"to preserve module reference in sandbox_globals"
@@ -1434,11 +1484,6 @@ class SandboxExecutor:
 
                 # ============================================================
                 # Case 2: 'import X' or 'import X as Y' or 'import X.Y as Z'
-                #
-                # CRITICAL FIX (v2.6): For 'import X.Y as Z':
-                #   _lazy_import('X') already sets the correct aliases
-                #   (e.g., plt for matplotlib.pyplot, go for plotly.graph_objects)
-                #   Do NOT override Z with X if Z already exists in globals.
                 # ============================================================
                 else:
                     module = stripped.split()[1].split('.')[0].split(',')[0]
@@ -1448,9 +1493,7 @@ class SandboxExecutor:
                         if ' as ' in stripped:
                             alias = stripped.split(' as ')[-1].strip()
                             # CRITICAL FIX: Only set alias if it's NOT already
-                            # in sandbox_globals. _lazy_import may have already
-                            # set it to the correct submodule (e.g., plt = pyplot,
-                            # go = graph_objects). Don't overwrite with base module!
+                            # in sandbox_globals.
                             if alias not in sandbox_globals:
                                 # Try to resolve the full dotted path
                                 full_module = stripped.split()[1].split(' as ')[0].strip() if ' as ' in stripped.split()[1] else stripped.split()[1]
@@ -1636,15 +1679,11 @@ class SandboxExecutor:
         v2.8.5: python-docx and transitive deps permitted through allowlist.
         v2.8.6: Minimum timeout floor of 100s enforced server-side.
         v2.9.0: Token optimization (tool descriptions only, no executor changes).
+        v2.11.0: OCR libraries (PIL, pytesseract, pdf2image, pypdfium2) in allowlist.
         """
         result = ExecutionResult()
         # ============================================================
         # v2.8.6: Enforce minimum timeout floor
-        # AI models sometimes pass low timeouts (e.g. timeout=55) that
-        # are insufficient for complex document generation. The server
-        # enforces a floor of MIN_EXECUTION_TIMEOUT seconds regardless
-        # of what the caller requests. Values above the floor and the
-        # config default (300s) are both respected as-is.
         # ============================================================
         timeout = max(timeout or settings.MAX_EXECUTION_TIME, MIN_EXECUTION_TIMEOUT)
 
@@ -1682,8 +1721,6 @@ class SandboxExecutor:
 
         # ============================================================
         # v2.8.0 + v2.8.1 + v2.8.2 + v2.8.3: Install path normalization hooks
-        # These must be installed on EVERY execution (not just first)
-        # because they need the current session_dir context.
         # ============================================================
         sandbox_globals['_normalize_path'] = self._make_path_normalizer(session_dir)
         self._install_pandas_path_hooks(sandbox_globals, session_dir)
@@ -1701,9 +1738,6 @@ class SandboxExecutor:
         logger.info(f"Processed code preview: {processed_code[:300]}")
 
         # CHART CAPTURE setup
-        # NOTE: This is intentionally AFTER _preprocess_code because preprocessing
-        # may lazy-load matplotlib into sandbox_globals. The check below will
-        # correctly detect plt/matplotlib that was just loaded by preprocessing.
         chart_capture = ChartCapture(session_dir)
         if 'plt' in sandbox_globals or 'matplotlib' in sandbox_globals:
             self._install_chart_hooks(sandbox_globals, chart_capture)
@@ -1858,7 +1892,7 @@ class SandboxExecutor:
 
                 non_image_downloads = [d for d in download_info if not d.get('is_image', False)]
                 if non_image_downloads:
-                    url_lines = ["\n\nGenerated files ready for download (⚠️ share these EXACT URLs, never reconstruct from filename):"]
+                    url_lines = ["\n\nGenerated files ready for download:"]
                     for info in non_image_downloads:
                         url_lines.append(
                             f"\n[{info['filename']} ({info['size']}) - Click to Download]({info['url']})"

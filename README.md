@@ -1,334 +1,292 @@
 # Power Interpreter MCP
 
-**A production Model Context Protocol (MCP) server that gives AI assistants the ability to execute Python code, access Microsoft OneDrive/SharePoint files, and perform data analysis — all within a secure, sandboxed environment.**
+**General-purpose sandboxed Python execution engine for AI agents.**
+Designed for [SimTheory.ai](https://simtheory.ai) MCP integration.
 
-> Built by **GROW by Bolthouse Fresh** · Architected by MCA
+> Version: **3.0.1** · Executor: **v2.11.0** · Skills Engine: **v1.0.0**
+> Deploy target: [Railway](https://railway.app)
 
 ---
 
-## Overview
+## What It Does
 
-Power Interpreter bridges AI assistants (via Simtheory.ai or any MCP-compatible client) to a full Python execution environment with live Microsoft 365 file access. Users authenticate independently through device code flow, ensuring each person's session is scoped to their own permissions.
+Power Interpreter gives AI agents a full Python runtime — sandboxed, persistent, and wired into Microsoft 365. Agents can execute code, process files, query datasets, generate charts, run OCR on scanned documents, and orchestrate multi-step workflows through the MCP (Model Context Protocol) interface.
 
-| | |
-|---|---|
-| **Version** | 2.9.1 |
-| **Tools Registered** | 22 |
-| **Runtime** | Python 3.x on Railway |
-| **Transport** | MCP SSE + JSON-RPC direct |
-| **Authentication** | Per-user device code flow (Microsoft Graph API) |
-| **Database** | PostgreSQL (token persistence, session data) |
+### Key Capabilities
+
+- **Sandboxed Python execution** with persistent session state (kernel architecture)
+- **40+ pre-installed libraries** — pandas, numpy, scipy, scikit-learn, matplotlib, plotly, openpyxl, reportlab, Pillow, and more
+- **OCR & PDF-to-Image** — pytesseract, pdf2image, pypdfium2 for handwritten/scanned document processing
+- **Async job queue** for long-running operations (no timeouts)
+- **Large dataset support** — 1.5M+ rows via PostgreSQL + DuckDB
+- **Auto file storage** — generated files stored in Postgres with public download URLs
+- **Chart auto-capture** — matplotlib/plotly figures saved and served automatically
+- **Microsoft OneDrive + SharePoint integration** — per-user delegated auth
+- **Skills Layer** — multi-step workflow orchestration via registered skills
 
 ---
 
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│  Simtheory.ai / MCP Client                                   │
-│  (POST /mcp/sse — JSON-RPC direct)                           │
-└──────────────┬───────────────────────────────────────────────┘
-               │
-               ▼
-┌──────────────────────────────────────────────────────────────┐
-│  Power Interpreter MCP Server (FastAPI + Uvicorn)             │
-│                                                               │
-│  ┌─────────────┐  ┌──────────────┐  ┌─────────────────┐      │
-│  │ mcp_server   │  │ tools        │  │ bootstrap       │      │
-│  │ (22 tools)   │  │ (OneDrive/SP)│  │ (kernel init)   │      │
-│  └──────┬──────┘  └──────┬───────┘  └────────┬────────┘      │
-│         │                │                    │               │
-│         ▼                ▼                    ▼               │
-│  ┌────────────────────────────────────────────────────────┐   │
-│  │  Response Budget Guard (Change #10)                    │   │
-│  │  Max 50K tokens per tool response │ Pagination         │   │
-│  └────────────────────────┬───────────────────────────────┘   │
-│                           │                                   │
-│                           ▼                                   │
-│  ┌────────────────────────────────────────────────────────┐   │
-│  │  SandboxJobQueue (Change #9)                           │   │
-│  │  Async request queue with backpressure                 │   │
-│  │  Max concurrent: 4  │  Queue: 20  │  Timeout: 30s     │   │
-│  └────────────────────────┬───────────────────────────────┘   │
-│                           │                                   │
-│                           ▼                                   │
-│  ┌────────────────────────────────────────────────────────┐   │
-│  │  KernelHealthMonitor (Change #9)                       │   │
-│  │  Heartbeat probe │ Auto-restart on failure             │   │
-│  └────────────────────────┬───────────────────────────────┘   │
-│                           │                                   │
-│                           ▼                                   │
-│  ┌────────────────────────────────────────────────────────┐   │
-│  │  File Handler (Change #11)                             │   │
-│  │  Chunked transfer │ Excel↔CSV │ Size guardrails        │   │
-│  └────────────────────────┬───────────────────────────────┘   │
-│                           │                                   │
-│                           ▼                                   │
-│  ┌────────────────────────────────────────────────────────┐   │
-│  │  Python Sandbox Kernel (/usr/local/bin/python3)        │   │
-│  │  Max Memory: 16 GB  │  Max Jobs: 4  │  Timeout: 30m   │   │
-│  └────────────────────────────────────────────────────────┘   │
-└──────────────────────────────────────────────────────────────┘
-               │                    │
-               ▼                    ▼
-     ┌──────────────┐     ┌──────────────────┐
-     │  PostgreSQL   │     │  Microsoft Graph  │
-     │  (tokens,     │     │  API (per-user    │
-     │   sessions)   │     │   device code)    │
-     └──────────────┘     └──────────────────┘
+┌─────────────────────────────────────────────────────┐
+│                   SimTheory.ai                       │
+│              (MCP Client / AI Agent)                 │
+└──────────────┬──────────────────────┬───────────────┘
+               │ GET /mcp/sse         │ POST /mcp/sse
+               │ (standard SSE)       │ (JSON-RPC direct)
+               ▼                      ▼
+┌─────────────────────────────────────────────────────┐
+│              Power Interpreter MCP                   │
+│                  (FastAPI + FastMCP)                  │
+├─────────────────────────────────────────────────────┤
+│  19 MCP Tools                                        │
+│  ├── 12 Core (execute, files, jobs, sessions, data) │
+│  ├──  4 Microsoft (ms_auth, onedrive, sharepoint,   │
+│  │       resolve_share_link) — user_id REQUIRED      │
+│  ├──  2 Admin (ms_auth_clear, ms_auth_list_users)   │
+│  └──  1 Skill (skill_consolidate_files)             │
+├─────────────────────────────────────────────────────┤
+│  Guards                                              │
+│  ├── Syntax Guard (pre-execution validation)        │
+│  ├── Context Pressure Guard (per-tool response caps)│
+│  └── Response Guard (smart truncation)              │
+├─────────────────────────────────────────────────────┤
+│  Engine                                              │
+│  ├── SandboxExecutor (v2.11.0)                      │
+│  ├── KernelManager (persistent sessions)            │
+│  ├── JobManager (async queue)                       │
+│  ├── SkillEngine (workflow orchestration)           │
+│  └── UserTracker (per-session identity)             │
+├─────────────────────────────────────────────────────┤
+│  Storage                                             │
+│  ├── PostgreSQL (sessions, files, tokens, datasets) │
+│  └── /app/sandbox_data (ephemeral file system)      │
+└─────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Authentication Model
+## MCP Tools (19 total)
 
-Power Interpreter uses a **per-user, independent authentication model**. This is a deliberate design choice:
+### Core Tools (12)
 
-- Each user authenticates via **device code flow** against Microsoft Entra ID
-- Graph API calls are made **using that user's token**, not an application-level token
-- File access is scoped to **what that specific user has permission to see**
-- A `403 Forbidden` means the file isn't shared with that user — not a system error
+| Tool | Description |
+|------|-------------|
+| `execute_code` | Run Python code in sandboxed session with persistent state |
+| `create_session` | Create a new execution session |
+| `delete_session` | Soft-delete a session (set is_active = False) |
+| `list_files` | List files in a session's sandbox directory |
+| `upload_file` | Upload a file to the sandbox |
+| `fetch_file` | Download a file from the sandbox |
+| `fetch_from_url` | Fetch a file from a URL into the sandbox |
+| `submit_job` | Submit a long-running job to the async queue |
+| `get_job_status` | Check status of an async job |
+| `create_dataset` | Create a large dataset in PostgreSQL |
+| `query_dataset` | Query a dataset with SQL |
+| `list_datasets` | List available datasets |
 
-**Why not `Files.Read.All`?**  
-Granting blanket tenant-wide file access to the application would allow any authenticated user to access any file through the MCP. The per-user model respects individual sharing permissions and avoids the security implications of global tenant access.
+### Microsoft Tools (4) — `user_id` REQUIRED
+
+| Tool | Description |
+|------|-------------|
+| `ms_auth` | Authenticate with Microsoft 365 (device code flow) |
+| `onedrive` | List, download, upload files to OneDrive |
+| `sharepoint` | Access SharePoint sites and document libraries |
+| `resolve_share_link` | Resolve a OneDrive/SharePoint sharing link |
+
+> **Multi-user safety:** All Microsoft tools require `user_id` (Microsoft 365 email). Requests without `user_id` are rejected with a validation error.
+
+### Admin Tools (2)
+
+| Tool | Description |
+|------|-------------|
+| `ms_auth_clear` | Clear cached tokens for a user |
+| `ms_auth_list_users` | List all authenticated users |
+
+### Skill Tools (1)
+
+| Tool | Description |
+|------|-------------|
+| `skill_consolidate_files` | Consolidate OneDrive folder contents into an Excel workbook. Multi-step workflow: list files → create session → execute consolidation → return download URL. |
 
 ---
 
-## Tools (22)
+## Skills Layer
 
-Power Interpreter registers 22 tools across three categories:
-
-### Code Execution
-| Tool | Description |
-|------|-------------|
-| `execute_code` | Execute Python code in the sandboxed kernel |
-| `install_package` | Install pip packages into the sandbox |
-| `list_files` | List files in the sandbox working directory |
-| `upload_file` | Upload a file into the sandbox |
-| `download_file` | Download a file from the sandbox |
-
-### Microsoft OneDrive / SharePoint
-| Tool | Description |
-|------|-------------|
-| `resolve_share_link` | Download a file from a OneDrive/SharePoint sharing link |
-| `list_onedrive_files` | List files in a user's OneDrive |
-| `search_onedrive` | Search OneDrive by filename or content |
-
-### Authentication & Session
-| Tool | Description |
-|------|-------------|
-| `ms_auth_poll` | Initiate or check device code authentication |
-| `ms_auth_status` | Check current authentication status |
-
-*Plus additional utility and management tools.*
-
----
-
-## Pre-loaded Packages
-
-The sandbox kernel comes pre-loaded with a comprehensive data science and document processing stack:
-
-| Category | Packages |
-|----------|----------|
-| **Data Analysis** | pandas, numpy, scipy, scikit-learn, statsmodels |
-| **Visualization** | matplotlib, seaborn |
-| **Excel/Spreadsheet** | openpyxl, xlsxwriter |
-| **PDF Processing** | pdfplumber, pypdf |
-| **Document Creation** | python-docx, python-pptx |
-| **Web/HTTP** | requests, httpx, beautifulsoup4, lxml |
-| **Image Processing** | Pillow |
-| **Utilities** | tqdm, tabulate, jinja2, regex, chardet, python-dateutil, pytz |
-
----
-
-## Project Structure
+Skills are server-side multi-step workflows that orchestrate existing MCP tools with built-in validation, error handling, and retry logic.
 
 ```
-power-interpreter/
-├── main.py              # FastAPI app, Uvicorn server, startup configuration
-├── mcp_server.py        # MCP protocol handler, tool dispatch, SSE transport
-├── tools.py             # Tool implementations (OneDrive, SharePoint, execution)
-├── bootstrap.py         # Kernel initialization, package pre-loading
-├── sandbox_startup.py   # Sandbox environment setup
-├── requirements.txt     # Python dependencies
-├── pyproject.toml       # Project metadata
-├── Dockerfile           # Production container (Railway)
-├── .env.example         # Environment variable template
-├── migrations/          # Database migrations (PostgreSQL)
-└── docs/
-    └── CHANGE-REQUESTS.md  # Staged improvements (11 items)
+app/
+├── skills_integration.py    # Bridge: main.py → SkillEngine
+└── skills/
+    ├── __init__.py
+    ├── engine.py            # SkillEngine (registration + execution)
+    ├── wrapper.py           # SkillToolWrapper (MCP tool bridge)
+    └── consolidate_files.py # First production skill
+```
+
+### How Skills Work
+
+1. **Registration** — Skill definitions are registered with the `SkillEngine` during startup
+2. **Wrapping** — Each skill is wrapped as a `SkillToolWrapper` that implements the MCP tool interface (`.fn`, `.description`, `.parameters`)
+3. **Merging** — Skill tools are merged into the MCP tool registry via `_get_tool_registry()` in `main.py`
+4. **Execution** — When invoked via `tools/call`, the wrapper delegates to `SkillEngine.execute()`, which calls the skill's `execute` function with access to `engine.call_tool()` for invoking other MCP tools
+
+---
+
+## OCR & PDF-to-Image Support (v2.11.0)
+
+Power Interpreter can process handwritten, image-based scanned PDFs natively.
+
+### 3-Layer Implementation
+
+| Layer | File | What |
+|-------|------|------|
+| System | `Dockerfile` | `tesseract-ocr`, `tesseract-ocr-eng`, `poppler-utils` |
+| Python | `requirements.txt` | `pytesseract>=0.3.10`, `pdf2image>=1.17.0`, `pypdfium2>=4.0.0` |
+| Sandbox | `executor.py` | `PIL`, `pytesseract`, `pdf2image`, `pypdfium2` in `_lazy_import` allowlist |
+
+### Example Usage
+
+```python
+from pdf2image import convert_from_path
+import pytesseract
+from PIL import Image
+
+# Convert PDF pages to images
+images = convert_from_path("/app/sandbox_data/scanned_document.pdf")
+
+# OCR each page
+for i, img in enumerate(images):
+    text = pytesseract.image_to_string(img)
+    print(f"--- Page {i+1} ---")
+    print(text)
 ```
 
 ---
 
-## Deployment
+## Sandbox Allowlist
 
-### Railway (Production)
+The executor uses a whitelist-based import system. Only libraries with an `elif` block in `_lazy_import()` are permitted. Current allowlist:
 
-The server is deployed on Railway with auto-deploy on push to `main`.
+| Category | Libraries |
+|----------|-----------|
+| **Data** | pandas, numpy, scipy, scikit-learn, xgboost, lightgbm, statsmodels, pingouin |
+| **Visualization** | matplotlib, seaborn, plotly |
+| **Excel/Docs** | openpyxl, xlsxwriter, python-docx, reportlab |
+| **PDF** | pdfplumber, PyPDF2, pypdfium2 |
+| **OCR/Image** | Pillow (PIL), pytesseract, pdf2image |
+| **Standard Library** | os, re, json, csv, math, statistics, datetime, collections, itertools, functools, io, copy, hashlib, base64, pathlib, random, time, calendar, string, struct, textwrap, pprint, dataclasses, typing, glob, shutil, zipfile, warnings, abc, enum, weakref, importlib, pkgutil |
+| **XML/HTML** | lxml, xml, beautifulsoup4 |
+| **Other** | tabulate, requests, sympy, decimal, fractions, urllib |
 
-| Setting | Value |
-|---------|-------|
-| **URL** | `https://power-interpreter-production-6396.up.railway.app` |
-| **Port** | `8080` (via `PORT` env var) |
-| **Builder** | Nixpacks |
-| **Health Check** | `GET /health` |
-| **Database** | Railway-managed PostgreSQL |
+---
 
-### Endpoints
-
-| Endpoint | Method | Purpose |
-|----------|--------|---------|
-| `/health` | GET | Health check (Railway + monitoring) |
-| `/mcp/sse` | GET | MCP SSE transport (standard clients) |
-| `/mcp/sse` | POST | MCP JSON-RPC direct (Simtheory.ai) |
-| `/api/execute` | POST | Internal kernel execution (localhost only) |
-| `/dl/{file_id}` | GET | Public file download (no auth) |
-| `/charts/{session_id}/{filename}` | GET | Public chart access (no auth) |
+## Configuration
 
 ### Environment Variables
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `PORT` | Yes | Server port (Railway sets this automatically) |
 | `DATABASE_URL` | Yes | PostgreSQL connection string |
-| `API_KEY` | Yes | MCP server API key |
-| `AZURE_CLIENT_ID` | Yes | Microsoft Entra app registration client ID |
-| `AZURE_TENANT_ID` | Yes | Microsoft Entra tenant ID |
-| `SIMTHEORY_AUTH_TOKEN` | No | Simtheory.ai MCP registration token |
-| `SANDBOX_MAX_CONCURRENT` | No | Max simultaneous sandbox jobs (default: 4) |
-| `SANDBOX_QUEUE_SIZE` | No | Max jobs waiting in queue (default: 20) |
-| `SANDBOX_QUEUE_TIMEOUT` | No | Seconds to wait for a slot (default: 30) |
-| `KERNEL_HEALTH_INTERVAL` | No | Seconds between health checks (default: 10) |
-| `KERNEL_HEALTH_TIMEOUT` | No | Seconds before probe fails (default: 5) |
-| `MAX_TOOL_RESPONSE_TOKENS` | No | Max tokens per tool response (default: 50000) |
-| `FILE_LIST_PAGE_SIZE` | No | Default files per page (default: 50) |
-| `FILE_CHUNK_SIZE` | No | Chunk size for file transfers (default: 5 MB) |
-| `MAX_UPLOAD_SIZE` | No | Max individual file size (default: 50 MB) |
-| `MAX_SANDBOX_STORAGE` | No | Max storage per session (default: 2 GB) |
-| `EXCEL_AUTO_CONVERT_THRESHOLD` | No | Row count triggering CSV conversion (default: 1048576) |
+| `API_KEY` | Yes | API key for authenticated routes |
+| `RAILWAY_PUBLIC_DOMAIN` | Auto | Set by Railway for public URL generation |
+| `PORT` | Auto | Set by Railway (default: 8080) |
+| `MS_CLIENT_ID` | For MS tools | Azure AD application client ID |
+| `MS_CLIENT_SECRET` | For MS tools | Azure AD application client secret |
+| `MS_TENANT_ID` | For MS tools | Azure AD tenant ID |
+| `LOG_LEVEL` | No | Logging level (default: INFO) |
 
----
-
-## Sandbox Limits
+### Operational Limits
 
 | Limit | Value |
 |-------|-------|
-| Max file size | 50 MB (configurable) |
+| Max file size | 50 MB |
 | File TTL | 72 hours |
-| Max execution time | 300 seconds |
-| Max memory | 16,384 MB (16 GB) |
-| Max concurrent jobs | 4 (configurable) |
-| Job queue depth | 20 (configurable) |
-| Queue timeout | 30 seconds (configurable) |
-| Job timeout | 1,800 seconds (30 minutes) |
-| Max storage per session | 2 GB (configurable) |
-| File chunk size | 5 MB (configurable) |
-| Excel auto-convert threshold | 1,048,576 rows |
-| Sandbox directory | `/app/sandbox_data` |
+| Max execution time | 300s (floor: 100s) |
+| Max memory | 16,384 MB |
+| Max concurrent jobs | 4 |
+| Job timeout | 1,800s |
+| MCP response cap | 50,000 chars |
 
 ---
 
-## Data Handling (Staged — Change #11)
+## Endpoints
 
-Power Interpreter is designed to handle production-scale data files intelligently:
-
-### Chunked File Transfer
-- Large files are uploaded and downloaded in **configurable chunks** (default 5 MB)
-- Transfers support **resume on failure** — no need to restart from scratch
-- Memory-efficient streaming — never loads full file into RAM
-
-### Smart Format Conversion (Excel ↔ CSV)
-
-| Condition | Action | Output |
-|-----------|--------|--------|
-| Rows ≤ 1,048,576 | Keep as requested | `.xlsx` |
-| Rows > 1,048,576 | Auto-convert + notify user | `.csv` |
-| File > 25 MB | Warn about Excel performance | `.xlsx` with warning |
-| File > 50 MB | Reject or chunk transfer | Error / chunked `.csv` |
-| Multi-sheet workbook | Keep as Excel | `.xlsx` |
-
-### File Size Guardrails
-- Individual file size enforced at transfer layer (not just config)
-- Per-session storage tracked and limited (default 2 GB)
-- Clear, actionable error messages when limits are exceeded
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `GET` | `/health` | Public | Health check |
+| `GET` | `/mcp/sse` | Public | MCP SSE transport (standard clients) |
+| `POST` | `/mcp/sse` | Public | MCP JSON-RPC direct (SimTheory) |
+| `GET` | `/dl/{file_id}/{filename}` | Public | File download |
+| `GET` | `/charts/{session_id}/{filename}` | Public | Chart image serving |
+| `*` | `/api/*` | API Key | REST API routes |
+| `GET` | `/docs` | Public | OpenAPI documentation |
 
 ---
 
-## Resilience Model (Staged — Change #9)
+## Deployment
 
-Power Interpreter is designed to handle concurrent multi-user load gracefully:
+Power Interpreter is deployed on Railway, linked to this repository.
 
-```
-Request arrives
-      │
-      ▼
-┌─────────────────┐
-│ SandboxJobQueue  │  Slot available?
-└────────┬────────┘
-    ┌────┴────┐
-    │ YES     │ NO → Wait up to 30s → Timeout? → 503 + retry_after
-    ▼         │
-┌─────────────┴───┐
-│ KernelHealth     │  Kernel alive?
-└────────┬────────┘
-    ┌────┴────┐
-    │ YES     │ NO → Auto-restart → Proceed
-    ▼         ▼
-┌─────────────────┐
-│ Execute tool     │
-└────────┬────────┘
-         ▼
-    Return result
+```bash
+# Railway auto-deploys on push to main
+git push origin main
 ```
 
-- **No more 500s** from slot exhaustion — requests queue and wait
-- **Self-healing kernel** — crashed kernels restart automatically
-- **Structured 503** — LLM receives actionable retry guidance instead of opaque errors
+### Docker Build
+
+```dockerfile
+FROM python:3.12-slim
+# Includes: gcc, libpq-dev, curl, tesseract-ocr, poppler-utils
+```
+
+### Startup Sequence
+
+1. Database initialization (PostgreSQL)
+2. Microsoft token table setup
+3. Skills layer initialization
+4. Periodic cleanup task (hourly)
+5. Uvicorn on `0.0.0.0:$PORT`
+
+### Deploy Verification
+
+Watch for these lines in Railway logs:
+
+```
+Skills layer: 1 skill tools registered          main.py:111
+Power Interpreter ready!                         main.py:127
+Application startup complete.
+GET /health 200 OK
+```
 
 ---
 
-## Simtheory.ai Integration
+## Version History
 
-Power Interpreter is registered as an MCP tool in the GROW by Bolthouse Fresh workspace on Simtheory.ai.
-
-**Connection Configuration:**
-- **SSE URL:** `https://power-interpreter-production-6396.up.railway.app/mcp/sse`
-- **Transport:** JSON-RPC direct (POST to `/mcp/sse`)
-- **Auth Token:** Set via workspace admin at `grow.bolthousefresh.com/chat/workspace/admin`
-
----
-
-## Staged Improvements
-
-See [`docs/CHANGE-REQUESTS.md`](docs/CHANGE-REQUESTS.md) for 11 staged performance, observability, stability, and data handling improvements identified from production log analysis:
-
-| # | Change | Type | Priority |
-|---|--------|------|----------|
-| 1 | stderr → stdout logging fix | Bug Fix | High |
-| 2 | Single-call file download | Performance | High |
-| 3 | Trim response payload | Performance | High |
-| 4 | httpx connection pooling | Performance | Medium |
-| 5 | Cache tools/list manifest | Performance | Low |
-| 6 | Consolidate SSE response | Performance | Medium |
-| 7 | Batch file processing | Feature | Critical |
-| 8 | Structured request logging | Observability | High |
-| 9 | Sandbox resilience & request queuing | Stability | Critical |
-| 10 | Response size guardrails & pagination | Stability | Critical |
-| 11 | Chunked file transfer & smart format conversion | Data Handling | Critical |
-
-### Shipping Strategy
-
-| Release | Items | Focus |
-|---------|-------|-------|
-| **Release 1** | 1, 2, 3, 5, 8 | Quick wins — logging, download speed, observability |
-| **Release 2** | 9, 10 | Stability — eliminates 500s and context overflow |
-| **Release 3** | 11 | Data handling — chunked transfers, format conversion |
-| **Release 4** | 4, 6 | Infrastructure — transport and HTTP client optimization |
-| **Release 5** | 7 | Feature — batch processing (30-40x speedup) |
+| Version | Date | Changes |
+|---------|------|---------|
+| v3.0.1 | 2026-03-18 | Pre-execution syntax guard, context pressure guard |
+| v3.0.0 | 2026-03-17 | Context pressure guard, per-tool response caps |
+| v2.11.0 | 2026-03-20 | OCR support (PIL, pytesseract, pdf2image, pypdfium2) |
+| v2.10.0 | 2026-03-19 | Namespace preamble, skills layer integration |
+| v2.9.2 | 2026-03-16 | Response guardrails, smart truncation |
+| v2.9.1 | 2026-03-15 | Empty args recovery for model-agnostic error handling |
+| v2.9.0 | 2026-03-14 | Token optimization (~57% tool description reduction) |
+| v2.8.6 | 2026-03-13 | Timeout floor enforcement (100s minimum) |
+| v2.8.5 | 2026-03-12 | python-docx + transitive dependency support |
+| v2.8.4 | 2026-03-11 | datetime module injection fix |
+| v2.8.3 | 2026-03-10 | Sandbox path recognition (/app/sandbox_data) |
+| v2.8.2 | 2026-03-09 | Read-only upload access |
+| v2.8.1 | 2026-03-08 | /tmp/ path interception |
+| v2.8.0 | 2026-03-07 | Defensive path normalization |
+| v1.9.0 | 2026-02-20 | Microsoft OneDrive + SharePoint integration |
 
 ---
 
-## License
+## Author
 
-Private — Bolthouse Fresh Foods. All rights reserved.
+Built by **MCA (Model Context Architect)** for **Timothy Escamilla**, Bolthouse Fresh Foods.
+
+Powered by [SimTheory.ai](https://simtheory.ai) · Deployed on [Railway](https://railway.app)

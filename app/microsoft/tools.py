@@ -1,6 +1,6 @@
 """MCP Tool registrations for OneDrive & SharePoint.
 
-Version: 2.10.1 — user_id REQUIRED on all data-access tools (multi-user safety)
+Version: 2.10.2 — fix onedrive_list method name + download path param
 
 HISTORY:
   v1.9.4: Made user_id optional, added resolve_share_link (22 tools).
@@ -23,6 +23,12 @@ HISTORY:
            risk when multiple users are authenticated concurrently.
            _resolve_user() is now a strict validator, not a guesser.
            ms_auth still allows optional user_id for 'status' action.
+  v2.10.2: FIX — onedrive list action called graph_client.onedrive_list()
+           but the actual method is onedrive_list_files(). The v2.9.6
+           consolidation used the wrong method name.
+           FIX — onedrive download action passed path= to
+           graph_client.onedrive_download() which doesn't accept it.
+           Removed stray path parameter.
 """
 
 import asyncio
@@ -239,6 +245,8 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
 
     # ── ONEDRIVE ─────────────────────────────────────────────────────
     # v2.10.1: user_id is now REQUIRED (no default)
+    # v2.10.2: FIX — onedrive_list -> onedrive_list_files
+    #          FIX — removed stray path= from onedrive_download
 
     @mcp.tool()
     async def onedrive(
@@ -275,7 +283,9 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
             uid = await _resolve_user(user_id)
 
             if action == "list":
-                result = await graph_client.onedrive_list(uid, path, top, page_token=page_token)
+                # v2.10.2 FIX: was graph_client.onedrive_list() — method doesn't exist
+                # Correct method is onedrive_list_files() per graph_client.py
+                result = await graph_client.onedrive_list_files(uid, path, top, page_token=page_token)
                 if save_to_sandbox:
                     summary = _save_result_to_sandbox(result, session_id, "od_list")
                     return json.dumps(summary, indent=2)
@@ -288,10 +298,12 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
                     return json.dumps(summary, indent=2)
 
             elif action == "download":
-                if not item_id and path == "/":
-                    return _missing("item_id or path", action)
+                if not item_id:
+                    return _missing("item_id", action)
+                # v2.10.2 FIX: removed path= parameter — onedrive_download()
+                # only accepts (user_id, item_id, save_to_sandbox, session_id)
                 result = await graph_client.onedrive_download(
-                    uid, item_id=item_id, path=path if path != "/" else None,
+                    uid, item_id=item_id,
                     save_to_sandbox=True, session_id=session_id)
                 # v2.9.8: Make it unmistakable the file is already on disk
                 sp = result.get("sandbox_path", "")
@@ -514,5 +526,5 @@ def register_microsoft_tools(mcp, graph_client, auth_manager):
         except Exception as e:
             return _error_response(e, "resolve_share_link")
 
-    # v2.10.1: user_id required on data-access tools + multi-user safety
-    logger.info("Microsoft tools registered (4 consolidated tools, v2.10.1 — user_id required)")
+    # v2.10.2: onedrive_list -> onedrive_list_files fix + download path param fix
+    logger.info("Microsoft tools registered (4 consolidated tools, v2.10.2 — onedrive list fix)")

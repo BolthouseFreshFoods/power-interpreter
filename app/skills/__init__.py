@@ -1,26 +1,13 @@
-"""Skills Layer for Power Interpreter.
+"""Power Interpreter Skills Package.
 
-Skills are composed, multi-step workflows that orchestrate
-existing MCP tools with guardrails enforced at the code level.
+Skills are multi-step workflows that orchestrate MCP tools
+with built-in validation, error handling, and retry logic.
 
-A Tool is a screwdriver.
-A Skill is 'assemble the bookshelf' — it knows which screwdriver
-to use, in what order, and what to do when a screw is stripped.
+Modules:
+    engine.py            - SkillEngine core (registration + execution)
+    wrapper.py           - SkillToolWrapper (MCP tool bridge)
+    consolidate_files.py - First production skill (OneDrive -> Excel)
+
+Initialization is handled by app/skills_integration.py,
+called from main.py during lifespan startup.
 """
-
-from .engine import SkillEngine, SkillContext
-from .base import Skill, SkillResult, StepResult, StepStatus
-from .registry import create_skill_engine
-from .guardrails import check_code_guardrails, DEFAULT_BLOCKED_IMPORTS
-
-__all__ = [
-    "SkillEngine",
-    "SkillContext",
-    "Skill",
-    "SkillResult",
-    "StepResult",
-    "StepStatus",
-    "create_skill_engine",
-    "check_code_guardrails",
-    "DEFAULT_BLOCKED_IMPORTS",
-]

@@ -3,14 +3,17 @@ FROM python:3.12-slim
 # Set working directory
 WORKDIR /app
 
-# Install system dependencies
+# Install system dependencies (including OCR + PDF rendering tools)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     libpq-dev \
     curl \
+    tesseract-ocr \
+    tesseract-ocr-eng \
+    poppler-utils \
     && rm -rf /var/lib/apt/lists/*
 
-# Cache bust: 2026-02-23 v2.0 — force full pip reinstall
+# Cache bust: 2026-03-20 v2.1 — add OCR + PDF-to-image dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 

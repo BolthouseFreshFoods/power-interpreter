@@ -1,165 +1,131 @@
-"""Skill Engine — orchestrates skill registration and execution.
+"""Skills Engine — Server-side workflow orchestration.
 
-The engine is the bridge between the MCP tool layer and the skill
-definitions. It provides SkillContext so skills can call underlying
-tool handlers directly (server-side) without going back through
-the model.
+The SkillEngine manages skill registration and execution.
+Skills are multi-step workflows that orchestrate existing MCP tools
+with built-in validation, error handling, and retry logic.
 """
 
 import logging
-import time
-from typing import Any, Callable, Dict, List, Optional
-
-from .base import Skill, SkillResult, StepStatus
+import json
+import asyncio
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
 
-class SkillContext:
-    """Provides skills with access to underlying tool handlers.
-
-    Instead of the model deciding which tool to call next,
-    the skill calls tools directly through this context.
-    This is what makes skills deterministic.
-    """
-
-    def __init__(
-        self,
-        tool_handlers: Dict[str, Callable],
-        session_name: str = "default",
-    ):
-        self._handlers = tool_handlers
-        self.session_name = session_name
-        self.variables: Dict[str, Any] = {}  # Shared state between steps
-
-    async def call_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Any:
-        """Call an underlying MCP tool handler directly.
-
-        This bypasses the model entirely — the skill controls
-        the exact tool, exact arguments, exact order.
-        """
-        handler = self._handlers.get(tool_name)
-        if not handler:
-            available = list(self._handlers.keys())
-            raise ValueError(
-                f"Tool '{tool_name}' not found. "
-                f"Available: {available}"
-            )
-        logger.info(
-            f"[Skill] -> {tool_name}({list(arguments.keys())})"
-        )
-        start = time.time()
-        result = await handler(arguments)
-        elapsed = int((time.time() - start) * 1000)
-        logger.info(f"[Skill] <- {tool_name} ({elapsed}ms)")
-        return result
-
-    def store(self, key: str, value: Any):
-        """Store a value for use by later steps."""
-        self.variables[key] = value
-
-    def get(self, key: str, default: Any = None) -> Any:
-        """Retrieve a stored value."""
-        return self.variables.get(key, default)
-
-
 class SkillEngine:
-    """Central registry and executor for all skills."""
+    """Core engine for registering and executing skills."""
 
-    def __init__(self):
-        self._skills: Dict[str, Skill] = {}
-        self._tool_handlers: Dict[str, Callable] = {}
+    def __init__(self, mcp_server):
+        """Initialize with reference to the MCP server for tool access.
 
-    def register_tool_handler(self, name: str, handler: Callable):
-        """Register an existing MCP tool handler for skills to use.
-
-        Call this for each tool (onedrive, execute_code, ms_auth, etc.)
-        so that skills can invoke them server-side.
+        Args:
+            mcp_server: The FastMCP server instance
         """
-        self._tool_handlers[name] = handler
-        logger.debug(f"[SkillEngine] Tool handler registered: {name}")
+        self.mcp_server = mcp_server
+        self.skills: dict = {}
+        self._execution_log: list = []
 
-    def register_skill(self, skill: Skill):
-        """Register a skill."""
-        if skill.name in self._skills:
-            logger.warning(
-                f"[SkillEngine] Skill '{skill.name}' already registered, replacing"
-            )
-        self._skills[skill.name] = skill
-        logger.info(f"[SkillEngine] Registered skill: {skill.name}")
+    def register(self, skill_def: dict):
+        """Register a skill definition.
 
-    def get_skill(self, name: str) -> Optional[Skill]:
-        """Get a skill by name."""
-        return self._skills.get(name)
+        Args:
+            skill_def: Dict with keys: name, description, execute
 
-    def list_skills(self) -> List[Dict[str, Any]]:
-        """List all registered skills with their schemas."""
-        return [
-            {
-                "name": s.name,
-                "description": s.description,
-                "input_schema": s.input_schema,
-            }
-            for s in self._skills.values()
-        ]
-
-    async def run(
-        self,
-        skill_name: str,
-        params: Dict[str, Any],
-        session_name: str = "default",
-    ) -> SkillResult:
-        """Execute a skill with full orchestration.
-
-        This is the main entry point. The model calls a skill tool,
-        the MCP handler calls this, and the engine takes over.
+        Raises:
+            ValueError: If skill definition is invalid or duplicate
         """
-        skill = self._skills.get(skill_name)
-        if not skill:
-            return SkillResult(
-                skill_name=skill_name,
-                success=False,
-                error=f"Unknown skill: {skill_name}. "
-                f"Available: {list(self._skills.keys())}",
-            )
+        required_keys = ['name', 'description', 'execute']
+        for key in required_keys:
+            if key not in skill_def:
+                raise ValueError(f"Skill definition missing required key: '{key}'")
 
-        # Validate parameters
-        validation_error = skill.validate_params(params)
-        if validation_error:
-            return SkillResult(
-                skill_name=skill_name,
-                success=False,
-                error=f"Invalid parameters: {validation_error}",
-            )
+        name = skill_def['name']
+        if name in self.skills:
+            raise ValueError(f"Skill '{name}' is already registered")
 
-        # Create execution context
-        ctx = SkillContext(
-            self._tool_handlers,
-            session_name=session_name,
-        )
+        self.skills[name] = skill_def
+        logger.info(f"SkillEngine: registered '{name}'")
 
-        logger.info(f"[SkillEngine] === Running skill: {skill_name} ===")
-        start = time.time()
+    async def execute(self, skill_name: str, **kwargs) -> str:
+        """Execute a skill by name with the given arguments.
+
+        Args:
+            skill_name: Name of the registered skill
+            **kwargs: Arguments to pass to the skill's execute function
+
+        Returns:
+            String result from the skill execution
+        """
+        if skill_name not in self.skills:
+            return f"Error: Skill '{skill_name}' not found. Available: {list(self.skills.keys())}"
+
+        skill = self.skills[skill_name]
+        execute_fn = skill['execute']
+
+        start_time = datetime.utcnow()
+        logger.info(f"SkillEngine: executing '{skill_name}' with args: {list(kwargs.keys())}")
 
         try:
-            result = await skill.execute(params, ctx)
-            elapsed = int((time.time() - start) * 1000)
-            logger.info(
-                f"[SkillEngine] === Skill {skill_name} "
-                f"completed in {elapsed}ms, "
-                f"success={result.success} ==="
-            )
+            result = await execute_fn(self, **kwargs)
+            elapsed = (datetime.utcnow() - start_time).total_seconds()
+            logger.info(f"SkillEngine: '{skill_name}' completed in {elapsed:.1f}s")
+
+            self._execution_log.append({
+                'skill': skill_name,
+                'status': 'success',
+                'elapsed': elapsed,
+                'timestamp': start_time.isoformat(),
+            })
+
             return result
 
         except Exception as e:
-            elapsed = int((time.time() - start) * 1000)
+            elapsed = (datetime.utcnow() - start_time).total_seconds()
             logger.error(
-                f"[SkillEngine] === Skill {skill_name} "
-                f"CRASHED after {elapsed}ms: {e} ===",
+                f"SkillEngine: '{skill_name}' failed after {elapsed:.1f}s: {e}",
                 exc_info=True,
             )
-            return SkillResult(
-                skill_name=skill_name,
-                success=False,
-                error=f"Skill crashed: {str(e)}",
-            )
+
+            self._execution_log.append({
+                'skill': skill_name,
+                'status': 'error',
+                'error': str(e),
+                'elapsed': elapsed,
+                'timestamp': start_time.isoformat(),
+            })
+
+            return f"Skill '{skill_name}' failed: {e}"
+
+    async def call_tool(self, tool_name: str, **kwargs) -> str:
+        """Call an MCP tool by name. Used by skills to invoke other tools.
+
+        Args:
+            tool_name: Name of the MCP tool to call
+            **kwargs: Arguments for the tool
+
+        Returns:
+            String result from the tool
+        """
+        try:
+            registry = {}
+            if hasattr(self.mcp_server, '_tool_manager') and hasattr(
+                self.mcp_server._tool_manager, '_tools'
+            ):
+                registry = self.mcp_server._tool_manager._tools
+            elif hasattr(self.mcp_server, 'tools'):
+                registry = self.mcp_server.tools
+
+            if tool_name not in registry:
+                return f"Error: Tool '{tool_name}' not found in registry"
+
+            tool = registry[tool_name]
+            fn = tool.fn if hasattr(tool, 'fn') else tool
+
+            logger.info(f"SkillEngine: calling tool '{tool_name}'")
+            result = await fn(**kwargs)
+            return str(result)
+
+        except Exception as e:
+            logger.error(f"SkillEngine: tool '{tool_name}' call failed: {e}")
+            return f"Error calling {tool_name}: {e}"

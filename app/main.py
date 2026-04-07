@@ -13,8 +13,8 @@ Features:
 - Auto file storage in Postgres with public download URLs
 - Microsoft OneDrive + SharePoint integration (v1.9.0)
 
-Author: AI for Timothy Escamilla
-Version: 3.0.1
+Author: Kaffer AI for Timothy Escamilla
+Version: 3.0.2
 
 HISTORY:
   v1.7.2: fetch_from_url route fix, stable release
@@ -27,12 +27,14 @@ HISTORY:
   v2.9.2: Response guardrails — truncate oversized MCP tool results (Change #10)
   v3.0.0: Context pressure guard — per-tool caps, pressure warnings, improved recovery
   v3.0.1: Pre-execution syntax guard — catch truncated code before sandbox (Fix 5)
+  v3.0.2: Route Python logs to stdout + response budget enforcement hook
 """
 
 import asyncio
 import inspect
 import json
 import logging
+import sys
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any
@@ -49,13 +51,16 @@ from app.context_guard import (
     maybe_add_pressure_warning,
 )
 from app.mcp_server import mcp
+from app.response_budget import enforce_response_budget
 from app.routes import data, execute, files, health, jobs, sessions
 from app.routes.files import public_router as download_router
 from app.syntax_guard import check_syntax
 
 
 # Configure logging
+# IMPORTANT: stream=sys.stdout prevents Railway from tagging normal INFO logs as errors.
 logging.basicConfig(
+    stream=sys.stdout,
     level=getattr(logging, settings.LOG_LEVEL),
     format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
@@ -69,7 +74,12 @@ MCP_RESPONSE_MAX_CHARS = 50_000
 _skill_tools: dict[str, Any] = {}
 
 
-def _jsonrpc_error(msg_id: Any, code: int, message: str, status_code: int = 200) -> JSONResponse:
+def _jsonrpc_error(
+    msg_id: Any,
+    code: int,
+    message: str,
+    status_code: int = 200,
+) -> JSONResponse:
     """Build a JSON-RPC error response."""
     return JSONResponse(
         content={
@@ -82,7 +92,7 @@ def _jsonrpc_error(msg_id: Any, code: int, message: str, status_code: int = 200)
 
 
 def _safe_json_loads(body_str: str) -> dict | list:
-    """Parse JSON request body."""
+    """Parse a JSON request body."""
     return json.loads(body_str)
 
 
@@ -90,7 +100,7 @@ def _safe_json_loads(body_str: str) -> dict | list:
 async def lifespan(app: FastAPI):
     """Application lifecycle management."""
     logger.info("=" * 60)
-    logger.info("Power Interpreter MCP v3.0.1 starting...")
+    logger.info("Power Interpreter MCP v3.0.2 starting...")
     logger.info("=" * 60)
 
     settings.ensure_directories()
@@ -237,7 +247,7 @@ app = FastAPI(
         "Charts served at /charts/{session_id}/{filename}. "
         "Microsoft OneDrive + SharePoint integration."
     ),
-    version="3.0.1",
+    version="3.0.2",
     lifespan=lifespan,
     docs_url="/docs",
     redoc_url="/redoc",
@@ -340,7 +350,7 @@ async def serve_chart(session_id: str, filename: str):
                 headers={
                     "Content-Disposition": f'inline; filename="{filename}"',
                     "Cache-Control": "public, max-age=3600",
-                    "X-Power-Interpreter": "chart-serve-v3.0.1",
+                    "X-Power-Interpreter": "chart-serve-v3.0.2",
                 },
             )
 
@@ -466,9 +476,8 @@ def _validate_tool_args(fn, tool_args: dict, tool_name: str) -> str | None:
         for param_name, param in sig.parameters.items():
             if param_name in ("self", "cls"):
                 continue
-            if param.default is inspect.Parameter.empty:
-                if param_name not in tool_args:
-                    missing.append(param_name)
+            if param.default is inspect.Parameter.empty and param_name not in tool_args:
+                missing.append(param_name)
 
         if missing:
             return (
@@ -519,7 +528,7 @@ async def _handle_single_jsonrpc(data: dict):
     msg_id = data.get("id")
     params = data.get("params", {})
 
-    logger.info("MCP direct: method=%s  id=%s", method, msg_id)
+    logger.info("MCP direct: method=%s id=%s", method, msg_id)
 
     if msg_id is None or method.startswith("notifications/"):
         logger.info("MCP direct: notification '%s' ack", method)
@@ -537,7 +546,7 @@ async def _handle_single_jsonrpc(data: dict):
                 },
                 "serverInfo": {
                     "name": "Power Interpreter",
-                    "version": "3.0.1",
+                    "version": "3.0.2",
                 },
             },
         }
@@ -560,10 +569,16 @@ async def _handle_single_jsonrpc(data: dict):
     if method == "tools/call":
         tool_name = params.get("name", "")
         tool_args = params.get("arguments", {})
+
+        try:
+            args_preview = json.dumps(tool_args, default=str)[:300]
+        except Exception:
+            args_preview = str(tool_args)[:300]
+
         logger.info(
             "MCP direct: -> tools/call '%s' args=%s",
             tool_name,
-            json.dumps(tool_args)[:300],
+            args_preview,
         )
 
         registry = _get_tool_registry()
@@ -589,16 +604,13 @@ async def _handle_single_jsonrpc(data: dict):
                     "MCP direct: %s argument validation failed: %s | Full params size: %s bytes | Argument keys received: %s | Arguments empty: %s",
                     tool_name,
                     validation_error,
-                    len(json.dumps(params)),
+                    len(json.dumps(params, default=str)),
                     list(tool_args.keys()),
                     len(tool_args) == 0,
                 )
 
                 recovery_msg = get_empty_args_recovery_message(tool_name, tool_args)
-                if recovery_msg:
-                    error_text = recovery_msg
-                else:
-                    error_text = f"Error: {validation_error}"
+                error_text = recovery_msg if recovery_msg else f"Error: {validation_error}"
 
                 return {
                     "jsonrpc": "2.0",
@@ -609,7 +621,7 @@ async def _handle_single_jsonrpc(data: dict):
                     },
                 }
 
-            # ── Fix 5: Pre-execution syntax guard (v3.0.1) ────────────
+            # ── Fix 5: Pre-execution syntax guard ─────────────────────
             if tool_name == "execute_code" and "code" in tool_args:
                 syntax_issue = check_syntax(tool_args["code"])
                 if syntax_issue:
@@ -630,12 +642,18 @@ async def _handle_single_jsonrpc(data: dict):
 
             logger.info("MCP direct: invoking %s...", tool_name)
             result = await fn(**tool_args)
+
+            # ── Change #10: response budget enforcement ───────────────
+            result = enforce_response_budget(tool_name, result)
+
             result_str = str(result)
             original_len = len(result_str)
+
             logger.info("MCP direct: %s returned %s chars", tool_name, f"{original_len:,}")
             logger.info("MCP direct: result preview: %s", result_str[:300])
 
             effective_cap = get_effective_cap(tool_name, MCP_RESPONSE_MAX_CHARS)
+
             if original_len > effective_cap:
                 from app.response_guard import smart_truncate
 
@@ -652,7 +670,7 @@ async def _handle_single_jsonrpc(data: dict):
                 warned_result = maybe_add_pressure_warning(tool_name, result)
                 content = [{"type": "text", "text": warned_result}]
             elif isinstance(result, dict):
-                content = [{"type": "text", "text": json.dumps(result)}]
+                content = [{"type": "text", "text": json.dumps(result, default=str)}]
             elif isinstance(result, list):
                 content = result
             else:

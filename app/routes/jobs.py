@@ -12,10 +12,10 @@ Pattern:
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, HTTPException, Query, status
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
-from app.database import ensure_session_exists
 from app.engine.job_manager import job_manager
+from app.database import ensure_session_exists
 
 
 router = APIRouter()
@@ -27,7 +27,7 @@ PENDING_STATES = {"pending", "running"}
 
 
 class JobSubmitRequest(BaseModel):
-    """Request to submit a job for async execution."""
+    """Request to submit a job."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -41,7 +41,7 @@ class JobSubmitRequest(BaseModel):
     )
     context: Optional[Dict[str, Any]] = Field(
         default=None,
-        description="Variables to inject into execution context",
+        description="Variables to inject",
     )
     metadata: Optional[Dict[str, Any]] = Field(
         default=None,
@@ -50,36 +50,25 @@ class JobSubmitRequest(BaseModel):
 
 
 class JobSubmitResponse(BaseModel):
-    """Response returned after successful job submission."""
+    """Response from job submission."""
 
     job_id: str
     status: str = "pending"
-    message: str = (
-        "Job submitted successfully. Poll /api/jobs/{job_id}/status for progress."
-    )
+    message: str = "Job submitted successfully. Poll /api/jobs/{job_id}/status for progress."
 
 
 class JobCancelResponse(BaseModel):
-    """Response returned after a successful cancellation request."""
+    """Response from job cancellation."""
 
     job_id: str
     status: str = "cancelled"
 
 
 class JobListResponse(BaseModel):
-    """Response returned when listing jobs."""
+    """Response from job listing."""
 
     jobs: list[Dict[str, Any]]
     count: int
-
-
-def _normalize_session_id(session_id: Optional[str]) -> str:
-    """Normalize a possibly-empty session ID."""
-    if session_id is None:
-        return DEFAULT_SESSION_ID
-
-    normalized = session_id.strip()
-    return normalized or DEFAULT_SESSION_ID
 
 
 def _normalize_code(code: str) -> str:
@@ -94,7 +83,7 @@ def _normalize_code(code: str) -> str:
 
 
 def _extract_status(payload: Dict[str, Any]) -> Optional[str]:
-    """Safely extract status from a job payload."""
+    """Safely extract job status from a payload."""
     value = payload.get("status")
     return str(value) if value is not None else None
 
@@ -104,25 +93,22 @@ async def submit_job(request: JobSubmitRequest) -> JobSubmitResponse:
     """Submit a long-running job for async execution.
 
     Returns immediately with a job_id.
+    Use GET /api/jobs/{job_id}/status to check progress.
+    Use GET /api/jobs/{job_id}/result to get output when complete.
 
-    Use:
-    - GET /api/jobs/{job_id}/status to check progress
-    - GET /api/jobs/{job_id}/result to get output when complete
-
-    Recommended for:
+    Use this for:
     - Large data processing
     - Complex analysis that takes >60 seconds
-    - File/report generation
-    - Any operation that may timeout with sync execution
+    - File generation
+    - Any operation that might timeout with sync execution
     """
     code = _normalize_code(request.code)
-    session_id = _normalize_session_id(request.session_id)
 
-    await ensure_session_exists(session_id)
+    await ensure_session_exists(request.session_id or DEFAULT_SESSION_ID)
 
     job_id = await job_manager.submit_job(
         code=code,
-        session_id=session_id,
+        session_id=request.session_id,
         timeout=request.timeout,
         context=request.context,
         metadata=request.metadata,
@@ -135,13 +121,13 @@ async def submit_job(request: JobSubmitRequest) -> JobSubmitResponse:
 async def get_job_status(job_id: str) -> Dict[str, Any]:
     """Check the status of a submitted job.
 
-    Expected states include:
-    - pending
-    - running
-    - completed
-    - failed
-    - cancelled
-    - timeout
+    Returns:
+    - pending: Job is queued
+    - running: Job is executing
+    - completed: Job finished successfully
+    - failed: Job encountered an error
+    - cancelled: Job was cancelled
+    - timeout: Job exceeded time limit
     """
     job_status = await job_manager.get_job_status(job_id)
     if not job_status:
@@ -149,15 +135,14 @@ async def get_job_status(job_id: str) -> Dict[str, Any]:
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Job {job_id} not found",
         )
-
     return job_status
 
 
 @router.get("/jobs/{job_id}/result")
 async def get_job_result(job_id: str) -> Dict[str, Any]:
-    """Get the full result of a submitted job.
+    """Get the full result of a completed job.
 
-    Includes stdout, stderr, result data, files created, and related output.
+    Includes stdout, stderr, result data, files created, etc.
     """
     result = await job_manager.get_job_result(job_id)
     if not result:
@@ -167,7 +152,6 @@ async def get_job_result(job_id: str) -> Dict[str, Any]:
         )
 
     result_status = _extract_status(result)
-
     if result_status in PENDING_STATES:
         raise HTTPException(
             status_code=status.HTTP_202_ACCEPTED,
@@ -186,17 +170,16 @@ async def cancel_job(job_id: str) -> JobCancelResponse:
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Job {job_id} not found or already completed",
         )
-
-    return JobCancelResponse(job_id=job_id)
+    return JobCancelResponse(job_id=job_id, status="cancelled")
 
 
 @router.get("/jobs", response_model=JobListResponse)
 async def list_jobs(
-    session_id: Optional[str] = Query(default=None, description="Filter by session ID"),
+    session_id: Optional[str] = Query(default=None, description="Session ID filter"),
     status_filter: Optional[str] = Query(
         default=None,
         alias="status",
-        description="Filter by job status",
+        description="Job status filter",
     ),
     limit: int = Query(
         default=DEFAULT_LIST_LIMIT,
@@ -206,15 +189,9 @@ async def list_jobs(
     ),
 ) -> JobListResponse:
     """List jobs with optional filters."""
-    normalized_session_id = None
-    if session_id is not None:
-        stripped = session_id.strip()
-        normalized_session_id = stripped or DEFAULT_SESSION_ID
-
     jobs = await job_manager.list_jobs(
-        session_id=normalized_session_id,
+        session_id=session_id,
         status=status_filter,
         limit=limit,
     )
-
-    return JobListResponse(jobs=jobs
+    return JobListResponse(jobs=jobs, count=len(jobs))

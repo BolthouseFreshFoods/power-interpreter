@@ -8,7 +8,7 @@ MCP Tools (18):
     4 consolidated Microsoft tools (ms_auth, onedrive, sharepoint, resolve_share_link)
     2 admin tools (ms_auth_clear, ms_auth_list_users)
 
-Version: 2.9.6 — consolidated tools for token optimization
+Version: 2.9.7 — fix list_files tool description + download URL guidance
 
 HISTORY:
   v2.8.6: Version unification across all files.
@@ -17,6 +17,9 @@ HISTORY:
            No logic changes — only docstrings modified.
   v2.9.1: Version alignment ....
   v2.9.6: Consolidated 22 tools into 4. ~50% token reduction.
+  v2.9.7: Fix list_files and execute_code tool descriptions.
+           list_files now returns file_id + download_url per file.
+           Updated guidance: use download_url from response, never guess.
 """
 
 from mcp.server.fastmcp import FastMCP
@@ -302,15 +305,15 @@ async def execute_code(
     session_id: str = "default",
     timeout: int = 55
 ) -> list:
-    """Execute Python in a persistent sandbox. Variables, imports, and files persist across calls. Charts auto-captured as inline images. Auto-stores new files in Postgres with download URLs (format: /dl/{uuid}/{filename}). IMPORTANT: Always share download URLs EXACTLY as returned — never reconstruct from filename alone.
+    """Execute Python in a persistent sandbox. Variables, imports, and files persist across calls. Charts auto-captured as inline images. Auto-stores new files in Postgres with download URLs (format: /dl/{uuid}/{filename}). IMPORTANT: Always share download URLs EXACTLY as returned in the response — never reconstruct or guess URLs from filenames.
 
     Args:
         code: Python code to execute.
         session_id: Session ID for state persistence.
         timeout: Max seconds (default 55).
 
-            Note: Namespace resets between calls. Common modules (os, re, json, glob, shutil, datetime) are pre-injected. Do NOT use sys, subprocess, ast, requests, or pip install.
-    When files are created, provide download links using the FULL public URL: https://power-interpreter-production-6396.up.railway.app/dl/{file_id} — never use relative paths.
+    Note: Common modules (os, re, json, glob, shutil, datetime) are pre-injected. Do NOT use sys, subprocess, ast, requests, or pip install.
+    When files are created, use the download_url from the response. If you need to re-find files later, call list_files which returns file_id and download_url for each file.
     """
     url = f"{API_BASE}/api/execute"
     logger.info(f"execute_code: POST {url} session={session_id}")
@@ -444,7 +447,7 @@ async def fetch_file(
 
 @mcp.tool()
 async def list_files(session_id: Optional[str] = "default") -> str:
-    """List files in a sandbox session. Returns file_id, name, size, modified time. IMPORTANT: Download URLs must use the FULL public URL format: https://power-interpreter-production-6396.up.railway.app/dl/{file_id} — never use relative paths like /dl/...
+    """List files in a sandbox session. Each file includes file_id, download_url, name, and size. IMPORTANT: When sharing files with the user, use the download_url field from each file entry exactly as returned. Never construct download URLs manually.
 
     Args:
         session_id: Session to list files for.

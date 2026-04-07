@@ -18,22 +18,23 @@ v1.9.5: Fixed ValueError when non-UUID session_id strings are passed
 """
 
 import asyncio
-import uuid
 import logging
+import uuid
 from datetime import datetime, timedelta
-from typing import Dict, Optional, List
-from sqlalchemy import select, update, delete
-from sqlalchemy.ext.asyncio import AsyncSession
+from typing import Any, Dict, List, Optional
+
+from sqlalchemy import delete, select, update
 
 from app.config import settings
+from app.engine.executor import executor
 from app.models import Job, JobStatus
-from app.engine.executor import executor, ExecutionResult
 from app.database import get_session_factory
+
 
 logger = logging.getLogger(__name__)
 
 
-def _safe_parse_session_id(session_id: str) -> Optional[uuid.UUID]:
+def _safe_parse_session_id(session_id: Optional[str]) -> Optional[uuid.UUID]:
     """Safely parse a session_id string into a UUID.
 
     If the string is a valid UUID, parse it directly.
@@ -44,264 +45,330 @@ def _safe_parse_session_id(session_id: str) -> Optional[uuid.UUID]:
     """
     if not session_id:
         return None
+
     try:
         return uuid.UUID(session_id)
-    except ValueError:
-        return uuid.uuid5(uuid.NAMESPACE_DNS, session_id)
+    except (ValueError, TypeError):
+        return uuid.uuid5(uuid.NAMESPACE_DNS, str(session_id))
+
+
+def _safe_parse_job_id(job_id: str) -> Optional[uuid.UUID]:
+    """Safely parse a job_id into a UUID.
+
+    Returns None if the value is invalid.
+    """
+    try:
+        return uuid.UUID(job_id)
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def _utcnow() -> datetime:
+    """Return current UTC time."""
+    return datetime.utcnow()
 
 
 class JobManager:
-    """Manages async code execution jobs"""
-    
-    def __init__(self):
+    """Manages async code execution jobs."""
+
+    def __init__(self) -> None:
         self._running_jobs: Dict[str, asyncio.Task] = {}
         self._semaphore = asyncio.Semaphore(settings.MAX_CONCURRENT_JOBS)
-    
+
     async def submit_job(
         self,
         code: str,
         session_id: str = None,
         timeout: int = None,
-        context: Dict = None,
-        metadata: Dict = None
+        context: Dict[str, Any] = None,
+        metadata: Dict[str, Any] = None,
     ) -> str:
-        """Submit a job for async execution
-        
+        """Submit a job for async execution.
+
         Returns job_id immediately. Use get_job_status() to check progress.
         """
-        job_id = str(uuid.uuid4())
+        job_uuid = uuid.uuid4()
+        job_id = str(job_uuid)
         timeout = timeout or settings.JOB_TIMEOUT
-        
-        # Create job record in database
+
         factory = get_session_factory()
         async with factory() as session:
             job = Job(
-                id=uuid.UUID(job_id),
+                id=job_uuid,
                 session_id=_safe_parse_session_id(session_id),
                 code=code,
                 status=JobStatus.PENDING,
-                submitted_at=datetime.utcnow(),
-                metadata_=metadata or {}
+                submitted_at=_utcnow(),
+                metadata_=metadata or {},
             )
             session.add(job)
             await session.commit()
-        
-        # Start execution in background
+
         task = asyncio.create_task(
-            self._execute_job(job_id, code, session_id or "default", timeout, context)
+            self._execute_job(
+                job_id=job_id,
+                code=code,
+                session_id=session_id or "default",
+                timeout=timeout,
+                context=context,
+            )
         )
         self._running_jobs[job_id] = task
-        
-        # Cleanup task reference when done
-        task.add_done_callback(lambda t: self._running_jobs.pop(job_id, None))
-        
-        logger.info(f"Job {job_id} submitted (session: {session_id})")
+        task.add_done_callback(lambda _: self._running_jobs.pop(job_id, None))
+
+        logger.info("Job %s submitted (session: %s)", job_id, session_id)
         return job_id
-    
+
     async def _execute_job(
         self,
         job_id: str,
         code: str,
         session_id: str,
         timeout: int,
-        context: Dict = None
-    ):
-        """Execute a job with semaphore limiting"""
+        context: Dict[str, Any] = None,
+    ) -> None:
+        """Execute a job with semaphore limiting."""
+        job_uuid = _safe_parse_job_id(job_id)
+        if job_uuid is None:
+            logger.error("Cannot execute job with invalid job_id: %s", job_id)
+            return
+
         async with self._semaphore:
             factory = get_session_factory()
-            
-            # Update status to RUNNING
+
             async with factory() as session:
                 await session.execute(
                     update(Job)
-                    .where(Job.id == uuid.UUID(job_id))
+                    .where(Job.id == job_uuid)
                     .values(
                         status=JobStatus.RUNNING,
-                        started_at=datetime.utcnow()
+                        started_at=_utcnow(),
                     )
                 )
                 await session.commit()
-            
-            logger.info(f"Job {job_id} started execution")
-            
-            # Execute the code
+
+            logger.info("Job %s started execution", job_id)
+
             try:
                 exec_result = await executor.execute(
                     code=code,
                     session_id=session_id,
                     timeout=timeout,
-                    context=context
+                    context=context,
                 )
-                
-                # Update job with results
+
                 async with factory() as session:
-                    status = JobStatus.COMPLETED if exec_result.success else JobStatus.FAILED
-                    
+                    final_status = (
+                        JobStatus.COMPLETED
+                        if exec_result.success
+                        else JobStatus.FAILED
+                    )
+
                     await session.execute(
                         update(Job)
-                        .where(Job.id == uuid.UUID(job_id))
+                        .where(Job.id == job_uuid)
                         .values(
-                            status=status,
-                            completed_at=datetime.utcnow(),
+                            status=final_status,
+                            completed_at=_utcnow(),
                             execution_time_ms=exec_result.execution_time_ms,
-                            stdout=exec_result.stdout[:100000],  # Limit stored output
-                            stderr=exec_result.stderr[:100000],
+                            stdout=(exec_result.stdout or "")[:100000],
+                            stderr=(exec_result.stderr or "")[:100000],
                             result=exec_result.to_dict(),
                             error_message=exec_result.error_message,
                             error_traceback=exec_result.error_traceback,
                             memory_used_mb=exec_result.memory_used_mb,
-                            files_created=exec_result.files_created
+                            files_created=exec_result.files_created,
                         )
                     )
                     await session.commit()
-                
+
                 logger.info(
-                    f"Job {job_id} completed: {status.value} "
-                    f"({exec_result.execution_time_ms}ms)"
+                    "Job %s completed: %s (%sms)",
+                    job_id,
+                    final_status.value,
+                    exec_result.execution_time_ms,
                 )
-            
-            except Exception as e:
-                logger.error(f"Job {job_id} failed with unexpected error: {e}")
+
+            except asyncio.CancelledError:
+                logger.info("Job %s received cancellation", job_id)
+
                 async with factory() as session:
                     await session.execute(
                         update(Job)
-                        .where(Job.id == uuid.UUID(job_id))
+                        .where(Job.id == job_uuid)
                         .values(
-                            status=JobStatus.FAILED,
-                            completed_at=datetime.utcnow(),
-                            error_message=str(e)
+                            status=JobStatus.CANCELLED,
+                            completed_at=_utcnow(),
                         )
                     )
                     await session.commit()
-    
-    async def get_job_status(self, job_id: str) -> Optional[Dict]:
-        """Get current status of a job"""
+
+                raise
+
+            except Exception as exc:
+                logger.exception("Job %s failed with unexpected error", job_id)
+
+                async with factory() as session:
+                    await session.execute(
+                        update(Job)
+                        .where(Job.id == job_uuid)
+                        .values(
+                            status=JobStatus.FAILED,
+                            completed_at=_utcnow(),
+                            error_message=str(exc),
+                        )
+                    )
+                    await session.commit()
+
+    async def get_job_status(self, job_id: str) -> Optional[Dict[str, Any]]:
+        """Get current status of a job."""
+        job_uuid = _safe_parse_job_id(job_id)
+        if job_uuid is None:
+            return None
+
         factory = get_session_factory()
         async with factory() as session:
             result = await session.execute(
-                select(Job).where(Job.id == uuid.UUID(job_id))
+                select(Job).where(Job.id == job_uuid)
             )
             job = result.scalar_one_or_none()
-            
+
             if not job:
                 return None
-            
+
             elapsed = None
             if job.started_at:
-                end = job.completed_at or datetime.utcnow()
+                end = job.completed_at or _utcnow()
                 elapsed = int((end - job.started_at).total_seconds() * 1000)
-            
+
             return {
-                'job_id': str(job.id),
-                'status': job.status.value,
-                'submitted_at': job.submitted_at.isoformat() if job.submitted_at else None,
-                'started_at': job.started_at.isoformat() if job.started_at else None,
-                'completed_at': job.completed_at.isoformat() if job.completed_at else None,
-                'elapsed_ms': elapsed,
-                'execution_time_ms': job.execution_time_ms,
-                'has_result': job.result is not None,
-                'has_error': job.error_message is not None,
+                "job_id": str(job.id),
+                "status": job.status.value,
+                "submitted_at": job.submitted_at.isoformat() if job.submitted_at else None,
+                "started_at": job.started_at.isoformat() if job.started_at else None,
+                "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+                "elapsed_ms": elapsed,
+                "execution_time_ms": job.execution_time_ms,
+                "has_result": job.result is not None,
+                "has_error": job.error_message is not None,
             }
-    
-    async def get_job_result(self, job_id: str) -> Optional[Dict]:
-        """Get full result of a completed job"""
+
+    async def get_job_result(self, job_id: str) -> Optional[Dict[str, Any]]:
+        """Get full result of a completed job."""
+        job_uuid = _safe_parse_job_id(job_id)
+        if job_uuid is None:
+            return None
+
         factory = get_session_factory()
         async with factory() as session:
             result = await session.execute(
-                select(Job).where(Job.id == uuid.UUID(job_id))
+                select(Job).where(Job.id == job_uuid)
             )
             job = result.scalar_one_or_none()
-            
+
             if not job:
                 return None
-            
+
             return {
-                'job_id': str(job.id),
-                'status': job.status.value,
-                'code': job.code,
-                'stdout': job.stdout,
-                'stderr': job.stderr,
-                'result': job.result,
-                'error_message': job.error_message,
-                'error_traceback': job.error_traceback,
-                'execution_time_ms': job.execution_time_ms,
-                'memory_used_mb': job.memory_used_mb,
-                'files_created': job.files_created,
-                'submitted_at': job.submitted_at.isoformat() if job.submitted_at else None,
-                'started_at': job.started_at.isoformat() if job.started_at else None,
-                'completed_at': job.completed_at.isoformat() if job.completed_at else None,
+                "job_id": str(job.id),
+                "status": job.status.value,
+                "code": job.code,
+                "stdout": job.stdout,
+                "stderr": job.stderr,
+                "result": job.result,
+                "error_message": job.error_message,
+                "error_traceback": job.error_traceback,
+                "execution_time_ms": job.execution_time_ms,
+                "memory_used_mb": job.memory_used_mb,
+                "files_created": job.files_created,
+                "submitted_at": job.submitted_at.isoformat() if job.submitted_at else None,
+                "started_at": job.started_at.isoformat() if job.started_at else None,
+                "completed_at": job.completed_at.isoformat() if job.completed_at else None,
             }
-    
+
     async def cancel_job(self, job_id: str) -> bool:
-        """Cancel a running job"""
+        """Cancel a running job."""
+        job_uuid = _safe_parse_job_id(job_id)
+        if job_uuid is None:
+            return False
+
         task = self._running_jobs.get(job_id)
         if task and not task.done():
             task.cancel()
-            
+
             factory = get_session_factory()
             async with factory() as session:
                 await session.execute(
                     update(Job)
-                    .where(Job.id == uuid.UUID(job_id))
+                    .where(Job.id == job_uuid)
                     .values(
                         status=JobStatus.CANCELLED,
-                        completed_at=datetime.utcnow()
+                        completed_at=_utcnow(),
                     )
                 )
                 await session.commit()
-            
-            logger.info(f"Job {job_id} cancelled")
+
+            logger.info("Job %s cancelled", job_id)
             return True
+
         return False
-    
+
     async def list_jobs(
-        self, 
-        session_id: str = None, 
+        self,
+        session_id: str = None,
         status: str = None,
-        limit: int = 50
-    ) -> List[Dict]:
-        """List jobs with optional filters"""
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """List jobs with optional filters."""
         factory = get_session_factory()
         async with factory() as session:
             query = select(Job).order_by(Job.submitted_at.desc()).limit(limit)
-            
+
             if session_id:
                 query = query.where(Job.session_id == _safe_parse_session_id(session_id))
+
             if status:
-                query = query.where(Job.status == JobStatus(status))
-            
+                try:
+                    query = query.where(Job.status == JobStatus(status))
+                except ValueError:
+                    return []
+
             result = await session.execute(query)
             jobs = result.scalars().all()
-            
-            return [{
-                'job_id': str(j.id),
-                'status': j.status.value,
-                'submitted_at': j.submitted_at.isoformat() if j.submitted_at else None,
-                'execution_time_ms': j.execution_time_ms,
-                'has_error': j.error_message is not None,
-            } for j in jobs]
-    
-    async def cleanup_old_jobs(self, hours: int = None):
-        """Delete jobs older than specified hours"""
+
+            return [
+                {
+                    "job_id": str(job.id),
+                    "status": job.status.value,
+                    "submitted_at": job.submitted_at.isoformat() if job.submitted_at else None,
+                    "execution_time_ms": job.execution_time_ms,
+                    "has_error": job.error_message is not None,
+                }
+                for job in jobs
+            ]
+
+    async def cleanup_old_jobs(self, hours: int = None) -> int:
+        """Delete jobs older than specified hours."""
         hours = hours or settings.JOB_CLEANUP_HOURS
-        cutoff = datetime.utcnow() - timedelta(hours=hours)
-        
+        cutoff = _utcnow() - timedelta(hours=hours)
+
         factory = get_session_factory()
         async with factory() as session:
             result = await session.execute(
                 delete(Job).where(Job.submitted_at < cutoff)
             )
             await session.commit()
-            
-            count = result.rowcount
+
+            count = result.rowcount or 0
             if count > 0:
-                logger.info(f"Cleaned up {count} old jobs (older than {hours}h)")
+                logger.info("Cleaned up %s old jobs (older than %sh)", count, hours)
+
             return count
-    
+
     @property
     def active_job_count(self) -> int:
-        """Number of currently running jobs"""
-        return len([t for t in self._running_jobs.values() if not t.done()])
+        """Number of currently running jobs."""
+        return len([task for task in self._running_jobs.values() if not task.done()])
 
 
 # Singleton

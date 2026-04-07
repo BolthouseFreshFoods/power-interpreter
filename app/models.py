@@ -9,17 +9,28 @@ All persistent data models for:
 - Execution logs (audit trail)
 """
 
+import enum
 import uuid
 from datetime import datetime
+
 from sqlalchemy import (
-    Column, String, Text, Integer, BigInteger, Float,
-    Boolean, DateTime, JSON, ForeignKey, Index, Enum as SQLEnum,
-    LargeBinary
+    BigInteger,
+    Boolean,
+    Column,
+    DateTime,
+    Enum as SQLEnum,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    LargeBinary,
+    String,
+    Text,
 )
-from sqlalchemy.dialects.postgresql import UUID, JSONB
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import relationship
+
 from app.database import Base
-import enum
 
 
 # ============================================================
@@ -49,7 +60,7 @@ class FileType(str, enum.Enum):
 
 class Session(Base):
     __tablename__ = "sessions"
-    
+
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name = Column(String(255), nullable=False)
     description = Column(Text, default="")
@@ -57,11 +68,14 @@ class Session(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     is_active = Column(Boolean, default=True)
     metadata_ = Column("metadata", JSONB, default=dict)
-    
+
     # Relationships
     jobs = relationship("Job", back_populates="session", cascade="all, delete-orphan")
     files = relationship("File", back_populates="session", cascade="all, delete-orphan")
     datasets = relationship("Dataset", back_populates="session", cascade="all, delete-orphan")
+
+    def __repr__(self) -> str:
+        return f"<Session id={self.id} name={self.name!r} active={self.is_active}>"
 
 
 # ============================================================
@@ -70,44 +84,47 @@ class Session(Base):
 
 class Job(Base):
     __tablename__ = "jobs"
-    
+
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     session_id = Column(UUID(as_uuid=True), ForeignKey("sessions.id"), nullable=True)
-    
+
     # Job details
     code = Column(Text, nullable=False)  # Python code to execute
     status = Column(SQLEnum(JobStatus), default=JobStatus.PENDING, nullable=False)
     priority = Column(Integer, default=0)  # Higher = more important
-    
+
     # Execution tracking
     submitted_at = Column(DateTime, default=datetime.utcnow)
     started_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)
     execution_time_ms = Column(BigInteger, nullable=True)
-    
+
     # Results
     stdout = Column(Text, default="")  # Print output
     stderr = Column(Text, default="")  # Error output
     result = Column(JSONB, nullable=True)  # Structured result
     error_message = Column(Text, nullable=True)
     error_traceback = Column(Text, nullable=True)
-    
+
     # Resource tracking
     memory_used_mb = Column(Float, nullable=True)
     files_created = Column(JSONB, default=list)  # List of file paths created
-    
+
     # Metadata
     metadata_ = Column("metadata", JSONB, default=dict)
-    
+
     # Relationships
     session = relationship("Session", back_populates="jobs")
-    
+
     # Indexes
     __table_args__ = (
-        Index('idx_jobs_status', 'status'),
-        Index('idx_jobs_session', 'session_id'),
-        Index('idx_jobs_submitted', 'submitted_at'),
+        Index("idx_jobs_status", "status"),
+        Index("idx_jobs_session", "session_id"),
+        Index("idx_jobs_submitted", "submitted_at"),
     )
+
+    def __repr__(self) -> str:
+        return f"<Job id={self.id} status={self.status} session_id={self.session_id}>"
 
 
 # ============================================================
@@ -116,37 +133,40 @@ class Job(Base):
 
 class File(Base):
     __tablename__ = "files"
-    
+
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     session_id = Column(UUID(as_uuid=True), ForeignKey("sessions.id"), nullable=True)
-    
+
     # File info
     filename = Column(String(500), nullable=False)
     original_filename = Column(String(500), nullable=True)  # Original upload name
     file_type = Column(SQLEnum(FileType), default=FileType.UPLOAD)
     mime_type = Column(String(100), default="application/octet-stream")
     file_size = Column(BigInteger, default=0)  # Bytes
-    
+
     # Storage
     storage_path = Column(String(1000), nullable=False)  # Path on persistent volume
     checksum = Column(String(64), nullable=True)  # SHA-256
-    
+
     # Metadata
     row_count = Column(BigInteger, nullable=True)  # For CSV/datasets
     column_count = Column(Integer, nullable=True)
     columns = Column(JSONB, nullable=True)  # Column names and types
     preview = Column(JSONB, nullable=True)  # First few rows
-    
+
     created_at = Column(DateTime, default=datetime.utcnow)
     metadata_ = Column("metadata", JSONB, default=dict)
-    
+
     # Relationships
     session = relationship("Session", back_populates="files")
-    
+
     __table_args__ = (
-        Index('idx_files_session', 'session_id'),
-        Index('idx_files_type', 'file_type'),
+        Index("idx_files_session", "session_id"),
+        Index("idx_files_type", "file_type"),
     )
+
+    def __repr__(self) -> str:
+        return f"<File id={self.id} filename={self.filename!r} type={self.file_type}>"
 
 
 # ============================================================
@@ -163,33 +183,33 @@ class File(Base):
 
 class SandboxFile(Base):
     __tablename__ = "sandbox_files"
-    
+
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     session_id = Column(String(255), nullable=False, index=True)  # Matches executor session_id (string, not FK)
-    
+
     # File identity
-    filename = Column(String(500), nullable=False)          # e.g. "report.xlsx"
+    filename = Column(String(500), nullable=False)  # e.g. "report.xlsx"
     mime_type = Column(String(200), default="application/octet-stream")
-    file_size = Column(BigInteger, default=0)               # Bytes
-    checksum = Column(String(64), nullable=True)            # SHA-256 for dedup
-    
+    file_size = Column(BigInteger, default=0)  # Bytes
+    checksum = Column(String(64), nullable=True)  # SHA-256 for dedup
+
     # Binary content - stored directly in Postgres
-    content = Column(LargeBinary, nullable=False)           # The actual file bytes
-    
+    content = Column(LargeBinary, nullable=False)  # The actual file bytes
+
     # Lifecycle
     created_at = Column(DateTime, default=datetime.utcnow)
-    expires_at = Column(DateTime, nullable=True)            # Optional TTL for cleanup
-    download_count = Column(Integer, default=0)             # Track usage
-    
+    expires_at = Column(DateTime, nullable=True)  # Optional TTL for cleanup
+    download_count = Column(Integer, default=0)  # Track usage
+
     # Indexes for fast lookup
     __table_args__ = (
-        Index('idx_sandbox_files_session', 'session_id'),
-        Index('idx_sandbox_files_created', 'created_at'),
-        Index('idx_sandbox_files_expires', 'expires_at'),
-        Index('idx_sandbox_files_checksum', 'checksum'),
+        Index("idx_sandbox_files_session", "session_id"),
+        Index("idx_sandbox_files_created", "created_at"),
+        Index("idx_sandbox_files_expires", "expires_at"),
+        Index("idx_sandbox_files_checksum", "checksum"),
     )
-    
-    def __repr__(self):
+
+    def __repr__(self) -> str:
         return (
             f"<SandboxFile {self.id}: {self.filename} "
             f"({self.file_size} bytes, session={self.session_id})>"
@@ -202,38 +222,41 @@ class SandboxFile(Base):
 
 class Dataset(Base):
     __tablename__ = "datasets"
-    
+
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     session_id = Column(UUID(as_uuid=True), ForeignKey("sessions.id"), nullable=True)
-    
+
     # Dataset info
-    name = Column(String(255), nullable=False)  # Logical name (e.g., "vestis_invoices")
+    name = Column(String(255), nullable=False)  # Logical name
     table_name = Column(String(255), nullable=False, unique=True)  # Actual PG table name
     description = Column(Text, default="")
-    
+
     # Schema
     row_count = Column(BigInteger, default=0)
     column_count = Column(Integer, default=0)
     columns = Column(JSONB, nullable=True)  # [{name, type, nullable}]
-    
+
     # Source
     source_file_id = Column(UUID(as_uuid=True), ForeignKey("files.id"), nullable=True)
     source_filename = Column(String(500), nullable=True)
-    
+
     # Size tracking
     size_bytes = Column(BigInteger, default=0)
-    
+
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     metadata_ = Column("metadata", JSONB, default=dict)
-    
+
     # Relationships
     session = relationship("Session", back_populates="datasets")
-    
+
     __table_args__ = (
-        Index('idx_datasets_session', 'session_id'),
-        Index('idx_datasets_name', 'name'),
+        Index("idx_datasets_session", "session_id"),
+        Index("idx_datasets_name", "name"),
     )
+
+    def __repr__(self) -> str:
+        return f"<Dataset id={self.id} name={self.name!r} table_name={self.table_name!r}>"
 
 
 # ============================================================
@@ -242,21 +265,24 @@ class Dataset(Base):
 
 class ExecutionLog(Base):
     __tablename__ = "execution_logs"
-    
+
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     job_id = Column(UUID(as_uuid=True), ForeignKey("jobs.id"), nullable=True)
-    
+
     # Log entry
     level = Column(String(20), default="INFO")  # INFO, WARNING, ERROR
     message = Column(Text, nullable=False)
     timestamp = Column(DateTime, default=datetime.utcnow)
-    
+
     # Context
     code_snippet = Column(Text, nullable=True)  # Relevant code
     metadata_ = Column("metadata", JSONB, default=dict)
-    
+
     __table_args__ = (
-        Index('idx_logs_job', 'job_id'),
-        Index('idx_logs_timestamp', 'timestamp'),
-        Index('idx_logs_level', 'level'),
+        Index("idx_logs_job", "job_id"),
+        Index("idx_logs_timestamp", "timestamp"),
+        Index("idx_logs_level", "level"),
     )
+
+    def __repr__(self) -> str:
+        return f"<ExecutionLog id={self.id} level={self.level} job_id={self.job_id}>"

@@ -466,7 +466,6 @@ async def handle_mcp_jsonrpc(request: Request):
         body = await request.body()
         body_str = body.decode("utf-8", errors="replace")
         logger.info("MCP direct: received %s bytes", len(body))
-        logger.info("MCP direct: body preview=%s", body_str[:160].replace("\n", "\\n"))
         data = _safe_json_loads(body_str)
     except Exception as e:
         logger.error("MCP direct: parse error: %s", e)

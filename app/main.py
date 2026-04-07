@@ -13,7 +13,7 @@ Features:
 - Auto file storage in Postgres with public download URLs
 - Microsoft OneDrive + SharePoint integration (v1.9.0)
 
-Author: Kaffer AI for Timothy Escamilla
+Author: AI for Timothy Escamilla
 Version: 3.0.1
 
 HISTORY:
@@ -29,33 +29,36 @@ HISTORY:
   v3.0.1: Pre-execution syntax guard — catch truncated code before sandbox (Fix 5)
 """
 
-import logging
 import asyncio
-import json
 import inspect
+import json
+import logging
 from contextlib import asynccontextmanager
 from datetime import datetime
-from fastapi import FastAPI, Depends, Request
-from fastapi.responses import Response, JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
+from typing import Any
 
-from app.config import settings
+from fastapi import Depends, FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, Response
+
 from app.auth import verify_api_key
-from app.routes import execute, jobs, files, data, sessions, health
-from app.routes.files import public_router as download_router
-from app.mcp_server import mcp
+from app.config import settings
 from app.context_guard import (
     get_effective_cap,
-    maybe_add_pressure_warning,
     get_empty_args_recovery_message,
+    maybe_add_pressure_warning,
 )
+from app.mcp_server import mcp
+from app.routes import data, execute, files, health, jobs, sessions
+from app.routes.files import public_router as download_router
 from app.syntax_guard import check_syntax
+
 
 # Configure logging
 logging.basicConfig(
     level=getattr(logging, settings.LOG_LEVEL),
-    format='%(asctime)s | %(name)s | %(levelname)s | %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+    format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
 
@@ -63,15 +66,32 @@ logger = logging.getLogger(__name__)
 MCP_RESPONSE_MAX_CHARS = 50_000
 
 # ── Skills Layer ────────────────────────────────────────────────────────────────
-_skill_tools: dict = {}
+_skill_tools: dict[str, Any] = {}
+
+
+def _jsonrpc_error(msg_id: Any, code: int, message: str, status_code: int = 200) -> JSONResponse:
+    """Build a JSON-RPC error response."""
+    return JSONResponse(
+        content={
+            "jsonrpc": "2.0",
+            "error": {"code": code, "message": message},
+            "id": msg_id,
+        },
+        status_code=status_code,
+    )
+
+
+def _safe_json_loads(body_str: str) -> dict | list:
+    """Parse JSON request body."""
+    return json.loads(body_str)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Application lifecycle management"""
-    # --- STARTUP ---
-    logger.info("="*60)
+    """Application lifecycle management."""
+    logger.info("=" * 60)
     logger.info("Power Interpreter MCP v3.0.1 starting...")
-    logger.info("="*60)
+    logger.info("=" * 60)
 
     settings.ensure_directories()
 
@@ -79,11 +99,12 @@ async def lifespan(app: FastAPI):
     if settings.DATABASE_URL:
         try:
             from app.database import init_database
+
             await init_database()
             db_ok = True
             logger.info("Database initialized successfully")
         except Exception as e:
-            logger.warning(f"Database initialization failed: {e}")
+            logger.warning("Database initialization failed: %s", e)
             logger.warning("App will start without database. Some features disabled.")
     else:
         logger.warning("No DATABASE_URL configured. Running without database.")
@@ -92,32 +113,31 @@ async def lifespan(app: FastAPI):
     if db_ok:
         try:
             from app.mcp_server import _ms_auth
+
             if _ms_auth:
                 await _ms_auth.ensure_db_table()
                 logger.info("Microsoft token persistence: ENABLED (Postgres)")
             else:
                 logger.info("Microsoft token persistence: SKIPPED (no auth manager)")
         except Exception as e:
-            logger.warning(f"Microsoft token table setup failed: {e}")
+            logger.warning("Microsoft token table setup failed: %s", e)
             logger.warning("Microsoft auth will work but tokens won't persist across deploys")
-   
-        # ── Skills Layer Integration ──────────────────────────────────
+
         try:
             from app.skills_integration import initialize_skills
+
             _skills_result = await initialize_skills(mcp)
             if _skills_result:
                 global _skill_tools
                 _skill_tools = _skills_result
-                logger.info(
-                    f"Skills layer: {len(_skill_tools)} skill tools registered"
-                )
+                logger.info("Skills layer: %s skill tools registered", len(_skill_tools))
             else:
                 logger.info("Skills layer: no skills registered")
         except ImportError:
             logger.info("Skills layer: module not found, skipping")
         except Exception as e:
-            logger.warning(f"Skills layer initialization failed: {e}")       
- 
+            logger.warning("Skills layer initialization failed: %s", e)
+
     cleanup_task = None
     if db_ok:
         cleanup_task = asyncio.create_task(_periodic_cleanup())
@@ -125,78 +145,85 @@ async def lifespan(app: FastAPI):
     public_url = settings.public_base_url
 
     logger.info("Power Interpreter ready!")
-    logger.info(f"  Database: {'connected' if db_ok else 'NOT CONNECTED'}")
-    logger.info(f"  Sandbox dir: {settings.SANDBOX_DIR}")
-    logger.info(f"  Public URL: {public_url or '(auto-detect from RAILWAY_PUBLIC_DOMAIN)'}")
-    logger.info(f"  Download endpoint: /dl/{{file_id}} (public, no auth)")
-    logger.info(f"  Chart endpoint: /charts/{{session_id}}/{{filename}} (public, no auth)")
-    logger.info(f"  Sandbox file max: {settings.SANDBOX_FILE_MAX_MB} MB")
-    logger.info(f"  Sandbox file TTL: {settings.SANDBOX_FILE_TTL_HOURS} hours")
-    logger.info(f"  Max execution time: {settings.MAX_EXECUTION_TIME}s")
-    logger.info(f"  Max memory: {settings.MAX_MEMORY_MB} MB")
-    logger.info(f"  Max concurrent jobs: {settings.MAX_CONCURRENT_JOBS}")
-    logger.info(f"  Job timeout: {settings.JOB_TIMEOUT}s")
-    logger.info(f"  MCP SSE transport: GET /mcp/sse (standard clients)")
-    logger.info(f"  MCP JSON-RPC direct: POST /mcp/sse (SimTheory)")
+    logger.info("  Database: %s", "connected" if db_ok else "NOT CONNECTED")
+    logger.info("  Sandbox dir: %s", settings.SANDBOX_DIR)
+    logger.info(
+        "  Public URL: %s",
+        public_url or "(auto-detect from RAILWAY_PUBLIC_DOMAIN)",
+    )
+    logger.info("  Download endpoint: /dl/{file_id} (public, no auth)")
+    logger.info("  Chart endpoint: /charts/{session_id}/{filename} (public, no auth)")
+    logger.info("  Sandbox file max: %s MB", settings.SANDBOX_FILE_MAX_MB)
+    logger.info("  Sandbox file TTL: %s hours", settings.SANDBOX_FILE_TTL_HOURS)
+    logger.info("  Max execution time: %ss", settings.MAX_EXECUTION_TIME)
+    logger.info("  Max memory: %s MB", settings.MAX_MEMORY_MB)
+    logger.info("  Max concurrent jobs: %s", settings.MAX_CONCURRENT_JOBS)
+    logger.info("  Job timeout: %ss", settings.JOB_TIMEOUT)
+    logger.info("  MCP SSE transport: GET /mcp/sse (standard clients)")
+    logger.info("  MCP JSON-RPC direct: POST /mcp/sse (SimTheory)")
 
     yield
 
-    # --- SHUTDOWN ---
     logger.info("Power Interpreter shutting down...")
     if cleanup_task:
         cleanup_task.cancel()
+
     if db_ok:
         try:
             from app.database import shutdown_database
+
             await shutdown_database()
         except Exception:
             pass
+
     logger.info("Shutdown complete")
 
 
 async def _periodic_cleanup():
-    """Periodically clean up old jobs, temp files, and expired sandbox files"""
+    """Periodically clean up old jobs, temp files, and expired sandbox files."""
     while True:
         try:
             await asyncio.sleep(3600)
 
             from app.engine.job_manager import job_manager
+
             count = await job_manager.cleanup_old_jobs()
             if count:
-                logger.info(f"Periodic cleanup: removed {count} old jobs")
+                logger.info("Periodic cleanup: removed %s old jobs", count)
 
             try:
                 await _cleanup_expired_sandbox_files()
             except Exception as e:
-                logger.error(f"Sandbox file cleanup error: {e}")
+                logger.error("Sandbox file cleanup error: %s", e)
 
         except asyncio.CancelledError:
             break
         except Exception as e:
-            logger.error(f"Cleanup error: {e}")
+            logger.error("Cleanup error: %s", e)
 
 
 async def _cleanup_expired_sandbox_files():
     """Delete sandbox files past their TTL from Postgres."""
     try:
+        from sqlalchemy import delete
+
         from app.database import get_session_factory
         from app.models import SandboxFile
-        from sqlalchemy import delete
 
         factory = get_session_factory()
         async with factory() as session:
             result = await session.execute(
                 delete(SandboxFile).where(
                     SandboxFile.expires_at != None,
-                    SandboxFile.expires_at < datetime.utcnow()
+                    SandboxFile.expires_at < datetime.utcnow(),
                 )
             )
             deleted = result.rowcount
             if deleted:
                 await session.commit()
-                logger.info(f"Cleaned up {deleted} expired sandbox files")
+                logger.info("Cleaned up %s expired sandbox files", deleted)
     except Exception as e:
-        logger.error(f"Failed to clean expired sandbox files: {e}")
+        logger.error("Failed to clean expired sandbox files: %s", e)
 
 
 # Create FastAPI app
@@ -238,12 +265,13 @@ async def serve_chart(session_id: str, filename: str):
     Looks up the most recent matching file in Postgres and serves it.
     Public endpoint — no authentication required.
     """
-    logger.info(f"Chart request: session={session_id} filename={filename}")
+    logger.info("Chart request: session=%s filename=%s", session_id, filename)
 
     try:
+        from sqlalchemy import select
+
         from app.database import get_session_factory
         from app.models import SandboxFile
-        from sqlalchemy import select
 
         factory = get_session_factory()
         async with factory() as db_session:
@@ -257,48 +285,53 @@ async def serve_chart(session_id: str, filename: str):
             file_record = result.scalar_one_or_none()
 
             if not file_record:
-                logger.warning(f"Chart not found: session={session_id} filename={filename}")
+                logger.warning("Chart not found: session=%s filename=%s", session_id, filename)
                 return JSONResponse(
                     status_code=404,
                     content={
                         "error": f"Chart not found: {session_id}/{filename}",
                         "hint": "The chart may have expired or the session_id may be wrong.",
-                    }
+                    },
                 )
 
-            content_type = getattr(file_record, 'content_type', None) or 'application/octet-stream'
+            content_type = getattr(file_record, "content_type", None) or "application/octet-stream"
             fname_lower = filename.lower()
-            if fname_lower.endswith('.png'):
-                content_type = 'image/png'
-            elif fname_lower.endswith('.jpg') or fname_lower.endswith('.jpeg'):
-                content_type = 'image/jpeg'
-            elif fname_lower.endswith('.svg'):
-                content_type = 'image/svg+xml'
-            elif fname_lower.endswith('.gif'):
-                content_type = 'image/gif'
-            elif fname_lower.endswith('.pdf'):
-                content_type = 'application/pdf'
+            if fname_lower.endswith(".png"):
+                content_type = "image/png"
+            elif fname_lower.endswith(".jpg") or fname_lower.endswith(".jpeg"):
+                content_type = "image/jpeg"
+            elif fname_lower.endswith(".svg"):
+                content_type = "image/svg+xml"
+            elif fname_lower.endswith(".gif"):
+                content_type = "image/gif"
+            elif fname_lower.endswith(".pdf"):
+                content_type = "application/pdf"
 
-            file_data = getattr(file_record, 'file_data', None)
+            file_data = getattr(file_record, "file_data", None)
             if file_data is None:
-                file_data = getattr(file_record, 'data', None)
+                file_data = getattr(file_record, "data", None)
             if file_data is None:
-                file_data = getattr(file_record, 'content', None)
+                file_data = getattr(file_record, "content", None)
 
             if file_data is None:
                 logger.error(
-                    f"Chart found but no binary data: session={session_id} "
-                    f"filename={filename} record_id={getattr(file_record, 'id', '?')}"
+                    "Chart found but no binary data: session=%s filename=%s record_id=%s",
+                    session_id,
+                    filename,
+                    getattr(file_record, "id", "?"),
                 )
                 return JSONResponse(
                     status_code=500,
-                    content={"error": "File record found but binary data is missing"}
+                    content={"error": "File record found but binary data is missing"},
                 )
 
             file_size = len(file_data)
             logger.info(
-                f"Chart served: session={session_id} filename={filename} "
-                f"size={file_size} bytes content_type={content_type}"
+                "Chart served: session=%s filename=%s size=%s bytes content_type=%s",
+                session_id,
+                filename,
+                file_size,
+                content_type,
             )
 
             return Response(
@@ -308,20 +341,26 @@ async def serve_chart(session_id: str, filename: str):
                     "Content-Disposition": f'inline; filename="{filename}"',
                     "Cache-Control": "public, max-age=3600",
                     "X-Power-Interpreter": "chart-serve-v3.0.1",
-                }
+                },
             )
 
     except ImportError as e:
-        logger.error(f"Chart serve import error: {e}")
+        logger.error("Chart serve import error: %s", e)
         return JSONResponse(
             status_code=503,
-            content={"error": "Database not available"}
+            content={"error": "Database not available"},
         )
     except Exception as e:
-        logger.error(f"Chart serve error: session={session_id} filename={filename}: {e}", exc_info=True)
+        logger.error(
+            "Chart serve error: session=%s filename=%s: %s",
+            session_id,
+            filename,
+            e,
+            exc_info=True,
+        )
         return JSONResponse(
             status_code=500,
-            content={"error": f"Internal error serving chart: {e}"}
+            content={"error": f"Internal error serving chart: {e}"},
         )
 
 
@@ -329,13 +368,12 @@ async def serve_chart(session_id: str, filename: str):
 # DIRECT MCP JSON-RPC HANDLER (for SimTheory)
 # =============================================================================
 
-
 def _build_tool_schema(tool) -> dict:
     """Build the JSON Schema for a tool's input parameters."""
-    if hasattr(tool, 'parameters') and tool.parameters:
+    if hasattr(tool, "parameters") and tool.parameters:
         return tool.parameters
 
-    fn = tool.fn if hasattr(tool, 'fn') else tool
+    fn = tool.fn if hasattr(tool, "fn") else tool
     if not callable(fn):
         return {"type": "object", "properties": {}}
 
@@ -344,7 +382,7 @@ def _build_tool_schema(tool) -> dict:
     required = []
 
     for param_name, param in sig.parameters.items():
-        if param_name in ('self', 'cls'):
+        if param_name in ("self", "cls"):
             continue
 
         prop = {"type": "string"}
@@ -356,9 +394,9 @@ def _build_tool_schema(tool) -> dict:
                 str: "string",
             }
             ann = param.annotation
-            origin = getattr(ann, '__origin__', None)
+            origin = getattr(ann, "__origin__", None)
             if origin is not None:
-                args = getattr(ann, '__args__', ())
+                args = getattr(ann, "__args__", ())
                 if args:
                     ann = args[0]
             prop["type"] = type_map.get(ann, "string")
@@ -381,16 +419,15 @@ def _get_tool_registry():
     """Get the tool registry from the MCP server, including skills."""
     base = {}
     try:
-        if hasattr(mcp, '_tool_manager') and hasattr(mcp._tool_manager, '_tools'):
+        if hasattr(mcp, "_tool_manager") and hasattr(mcp._tool_manager, "_tools"):
             base = mcp._tool_manager._tools
-        elif hasattr(mcp, 'tools'):
+        elif hasattr(mcp, "tools"):
             base = mcp.tools
         else:
             logger.warning("Could not find tool registry on MCP server")
     except Exception as e:
-        logger.error(f"Error accessing tool registry: {e}")
+        logger.error("Error accessing tool registry: %s", e)
 
-    # Merge skill tools if the skills layer is active
     if _skill_tools:
         merged = dict(base)
         merged.update(_skill_tools)
@@ -402,18 +439,22 @@ def _get_tools_list() -> list:
     """Build the tools/list response array."""
     result = []
     registry = _get_tool_registry()
+
     for name, tool in registry.items():
         desc = ""
-        if hasattr(tool, 'description'):
+        if hasattr(tool, "description"):
             desc = tool.description or ""
-        elif hasattr(tool, 'fn') and tool.fn.__doc__:
+        elif hasattr(tool, "fn") and tool.fn.__doc__:
             desc = tool.fn.__doc__.strip()
 
-        result.append({
-            "name": name,
-            "description": desc,
-            "inputSchema": _build_tool_schema(tool),
-        })
+        result.append(
+            {
+                "name": name,
+                "description": desc,
+                "inputSchema": _build_tool_schema(tool),
+            }
+        )
+
     return result
 
 
@@ -423,11 +464,12 @@ def _validate_tool_args(fn, tool_args: dict, tool_name: str) -> str | None:
         sig = inspect.signature(fn)
         missing = []
         for param_name, param in sig.parameters.items():
-            if param_name in ('self', 'cls'):
+            if param_name in ("self", "cls"):
                 continue
             if param.default is inspect.Parameter.empty:
                 if param_name not in tool_args:
                     missing.append(param_name)
+
         if missing:
             return (
                 f"Missing required parameter(s) for '{tool_name}': {', '.join(missing)}. "
@@ -435,6 +477,7 @@ def _validate_tool_args(fn, tool_args: dict, tool_name: str) -> str | None:
             )
     except Exception:
         pass
+
     return None
 
 
@@ -444,32 +487,30 @@ async def handle_mcp_jsonrpc(request: Request):
     try:
         body = await request.body()
         body_str = body.decode("utf-8", errors="replace")
-        logger.info(f"MCP direct: received {len(body)} bytes")
-        logger.info(f"MCP direct: {body_str[:500]}")
-        data = json.loads(body_str)
+        logger.info("MCP direct: received %s bytes", len(body))
+        logger.info("MCP direct: %s", body_str[:500])
+        data = _safe_json_loads(body_str)
     except Exception as e:
-        logger.error(f"MCP direct: parse error: {e}")
-        return JSONResponse(content={
-            "jsonrpc": "2.0",
-            "error": {"code": -32700, "message": f"Parse error: {e}"},
-            "id": None,
-        }, status_code=400)
+        logger.error("MCP direct: parse error: %s", e)
+        return _jsonrpc_error(None, -32700, f"Parse error: {e}", status_code=400)
 
     if isinstance(data, list):
-        logger.info(f"MCP direct: batch request, {len(data)} messages")
+        logger.info("MCP direct: batch request, %s messages", len(data))
         responses = []
         for item in data:
             resp = await _handle_single_jsonrpc(item)
             if resp is not None:
                 responses.append(resp)
+
         if not responses:
             return Response(status_code=204)
+
         return JSONResponse(content=responses)
-    else:
-        result = await _handle_single_jsonrpc(data)
-        if result is None:
-            return Response(status_code=204)
-        return JSONResponse(content=result)
+
+    result = await _handle_single_jsonrpc(data)
+    if result is None:
+        return Response(status_code=204)
+    return JSONResponse(content=result)
 
 
 async def _handle_single_jsonrpc(data: dict):
@@ -478,10 +519,10 @@ async def _handle_single_jsonrpc(data: dict):
     msg_id = data.get("id")
     params = data.get("params", {})
 
-    logger.info(f"MCP direct: method={method}  id={msg_id}")
+    logger.info("MCP direct: method=%s  id=%s", method, msg_id)
 
     if msg_id is None or method.startswith("notifications/"):
-        logger.info(f"MCP direct: notification '{method}' ack")
+        logger.info("MCP direct: notification '%s' ack", method)
         return None
 
     if method == "initialize":
@@ -506,9 +547,10 @@ async def _handle_single_jsonrpc(data: dict):
 
     if method == "tools/list":
         tools = _get_tools_list()
-        logger.info(f"MCP direct: -> {len(tools)} tools")
+        logger.info("MCP direct: -> %s tools", len(tools))
         for t in tools:
-            logger.info(f"  tool: {t['name']}")
+            logger.info("  tool: %s", t["name"])
+
         return {
             "jsonrpc": "2.0",
             "id": msg_id,
@@ -518,11 +560,19 @@ async def _handle_single_jsonrpc(data: dict):
     if method == "tools/call":
         tool_name = params.get("name", "")
         tool_args = params.get("arguments", {})
-        logger.info(f"MCP direct: -> tools/call '{tool_name}' args={json.dumps(tool_args)[:300]}")
+        logger.info(
+            "MCP direct: -> tools/call '%s' args=%s",
+            tool_name,
+            json.dumps(tool_args)[:300],
+        )
 
         registry = _get_tool_registry()
         if tool_name not in registry:
-            logger.error(f"MCP direct: tool '{tool_name}' not found. Available: {list(registry.keys())}")
+            logger.error(
+                "MCP direct: tool '%s' not found. Available: %s",
+                tool_name,
+                list(registry.keys()),
+            )
             return {
                 "jsonrpc": "2.0",
                 "id": msg_id,
@@ -531,15 +581,17 @@ async def _handle_single_jsonrpc(data: dict):
 
         try:
             tool = registry[tool_name]
-            fn = tool.fn if hasattr(tool, 'fn') else tool
+            fn = tool.fn if hasattr(tool, "fn") else tool
 
             validation_error = _validate_tool_args(fn, tool_args, tool_name)
             if validation_error:
                 logger.warning(
-                    f"MCP direct: {tool_name} argument validation failed: {validation_error} | "
-                    f"Full params size: {len(json.dumps(params))} bytes | "
-                    f"Argument keys received: {list(tool_args.keys())} | "
-                    f"Arguments empty: {len(tool_args) == 0}"
+                    "MCP direct: %s argument validation failed: %s | Full params size: %s bytes | Argument keys received: %s | Arguments empty: %s",
+                    tool_name,
+                    validation_error,
+                    len(json.dumps(params)),
+                    list(tool_args.keys()),
+                    len(tool_args) == 0,
                 )
 
                 recovery_msg = get_empty_args_recovery_message(tool_name, tool_args)
@@ -558,17 +610,14 @@ async def _handle_single_jsonrpc(data: dict):
                 }
 
             # ── Fix 5: Pre-execution syntax guard (v3.0.1) ────────────
-            # Catch truncated code BEFORE it reaches the sandbox.
-            # Saves 200-500ms per failed execution and gives the model
-            # actionable guidance to retry with shorter code.
-            # Ref: Railway logs 2026-03-18T23:53Z (spc3_hydrocooler)
             if tool_name == "execute_code" and "code" in tool_args:
                 syntax_issue = check_syntax(tool_args["code"])
                 if syntax_issue:
                     logger.warning(
-                        f"MCP direct: {tool_name} syntax guard caught truncated code "
-                        f"(session={tool_args.get('session_id', 'unknown')}, "
-                        f"code_len={len(tool_args['code'])})"
+                        "MCP direct: %s syntax guard caught truncated code (session=%s, code_len=%s)",
+                        tool_name,
+                        tool_args.get("session_id", "unknown"),
+                        len(tool_args["code"]),
                     )
                     return {
                         "jsonrpc": "2.0",
@@ -579,22 +628,25 @@ async def _handle_single_jsonrpc(data: dict):
                         },
                     }
 
-            logger.info(f"MCP direct: invoking {tool_name}...")
+            logger.info("MCP direct: invoking %s...", tool_name)
             result = await fn(**tool_args)
             result_str = str(result)
             original_len = len(result_str)
-            logger.info(f"MCP direct: {tool_name} returned {original_len:,} chars")
-            logger.info(f"MCP direct: result preview: {result_str[:300]}")
+            logger.info("MCP direct: %s returned %s chars", tool_name, f"{original_len:,}")
+            logger.info("MCP direct: result preview: %s", result_str[:300])
 
             effective_cap = get_effective_cap(tool_name, MCP_RESPONSE_MAX_CHARS)
             if original_len > effective_cap:
                 from app.response_guard import smart_truncate
+
                 truncated_result = smart_truncate(result_str[:effective_cap])
                 content = [{"type": "text", "text": truncated_result}]
                 logger.warning(
-                    f"MCP direct: {tool_name} response TRUNCATED "
-                    f"{original_len:,} -> {len(truncated_result):,} chars "
-                    f"(cap: {effective_cap:,})"
+                    "MCP direct: %s response TRUNCATED %s -> %s chars (cap: %s)",
+                    tool_name,
+                    f"{original_len:,}",
+                    f"{len(truncated_result):,}",
+                    f"{effective_cap:,}",
                 )
             elif isinstance(result, str):
                 warned_result = maybe_add_pressure_warning(tool_name, result)
@@ -613,7 +665,7 @@ async def _handle_single_jsonrpc(data: dict):
             }
 
         except Exception as e:
-            logger.error(f"MCP direct: {tool_name} error: {e}", exc_info=True)
+            logger.error("MCP direct: %s error: %s", tool_name, e, exc_info=True)
             return {
                 "jsonrpc": "2.0",
                 "id": msg_id,
@@ -623,7 +675,7 @@ async def _handle_single_jsonrpc(data: dict):
                 },
             }
 
-    logger.warning(f"MCP direct: unknown method '{method}'")
+    logger.warning("MCP direct: unknown method '%s'", method)
     return {
         "jsonrpc": "2.0",
         "id": msg_id,

@@ -1,208 +1,142 @@
-# Power Interpreter — Skills Layer
+# Skills Guide
 
-## What Are Skills?
+This document explains how Skills work in **Power Interpreter**, why they exist, and how to safely add new ones.
 
-Skills are **composed, multi-step workflows** that orchestrate existing MCP tools with guardrails enforced at the code level.
+## What is a Skill?
 
-| Layer | What It Is | Example |
-|-------|-----------|--------|
-| **Tool** | Single atomic function | `onedrive(action="download")` |
-| **Skill** | Multi-step pipeline | "Download from OneDrive → process with pandas → save to sandbox → deliver download URL" |
+A **Skill** is a composed, multi-step workflow that orchestrates existing MCP tools with guardrails enforced in code.
 
-A tool is a screwdriver. A skill is "assemble the bookshelf."
+Skills are intentionally different from atomic tools:
+- **Tools** do one thing.
+- **Skills** chain tools together to complete a real workflow.
 
-## Why Skills Exist
+Example workflow:
 
-Every skill was born from a real production failure:
+`Download from OneDrive → process with pandas/openpyxl → save in sandbox → deliver file`
 
-| Failure | Root Cause | Skill Fix |
-|---------|-----------|----------|
-| Model uses `urllib` instead of `onedrive` tool | No routing enforcement | Skill hardcodes: onedrive for files |
-| Model saves to `/tmp/` | No path enforcement | Skill saves to `/app/sandbox_data/{session}/` |
-| `dataframe_to_rows` crashes | Sandbox limitation | Skill uses `ws.append()` |
-| Model loops on file delivery | No completion criteria | Skill retries once, then stops |
-| 400K+ chars flood stdout | No output limits | Skill only prints summaries |
+## Why Skills Exist (Historical Failure Modes)
+
+Skills were introduced to prevent recurring production failures:
+
+1. **Routing Enforcement**
+   - Prevents model drift into external libraries like `urllib`, `requests`, `httpx`, `subprocess` when internal MCP tools are required.
+
+2. **Path Enforcement**
+   - Forces output into the correct sandbox location:
+   - `/app/sandbox_data/{session}/`
+
+3. **Sandbox Runtime Limits**
+   - Avoids fragile patterns that crash in constrained environments.
+   - Example: Prefer `ws.append()` for Excel writes.
+
+4. **Output Flooding Prevention**
+   - Restricts unbounded stdout/log output from generated code.
+
+5. **Authentication Session Integrity**
+   - Enforces Power Interpreter’s own `ms_auth` path so internal session records are created.
+
+6. **Completion Criteria & Retry Controls**
+   - Explicit retry logic prevents infinite loops and incomplete delivery states.
+
+---
+
+## Critical Auth Gotcha: `ForeignKeyViolationError`
+
+### Root Cause
+
+The most important failure pattern is using an **external Microsoft auth flow** instead of Power Interpreter’s internal `ms_auth` tool.
+
+When external auth is used:
+- Power Interpreter session tracking is bypassed.
+- No corresponding `Session` row is created in Power Interpreter’s database.
+
+### Observable Failure
+
+Subsequent `submit_job` requests fail with database integrity errors because the `session_id` does not exist in the `sessions` table.
+
+Typical symptom:
+- `sqlalchemy.exc.IntegrityError`
+- `asyncpg.exceptions.ForeignKeyViolationError`
+- `500 Internal Server Error`
+
+### Rule (Non-Negotiable)
+
+For any workflow that touches Power Interpreter execution, authentication **must** run through Power Interpreter’s own `ms_auth` tool (directly or via skill orchestration).
+
+---
 
 ## Architecture
 
-```
-┌─────────────────────────────────┐
-│        SimTheory Model          │
-│  (calls skill_consolidate_files │
-│   instead of individual tools)  │
-└──────────────┬──────────────────┘
-               │
-┌──────────────▼──────────────────┐
-│     SKILLS ENGINE               │
-│  ┌───────────────────────────┐  │
-│  │ ConsolidateFilesSkill     │  │
-│  │  Step 1: ms_auth          │  │
-│  │  Step 2: onedrive → list  │  │
-│  │  Step 3: onedrive → dl    │  │
-│  │  Step 4: execute_code     │  │
-│  │  Step 5: list_files → URL │  │
-│  │  GUARDRAILS: no urllib,   │  │
-│  │  no /tmp, no data dumps   │  │
-│  └───────────────────────────┘  │
-└──────────────┬──────────────────┘
-               │
-┌──────────────▼──────────────────┐
-│        MCP TOOL LAYER           │
-│  onedrive | execute_code |      │
-│  ms_auth | list_files | ...     │
-└─────────────────────────────────┘
+```text
+SimTheory Model
+   -> SKILLS ENGINE (guardrails + orchestration)
+      -> MCP TOOL LAYER (ms_auth, onedrive, execute_code, list_files, etc.)
 ```
 
-## Available Skills
-
-### `skill_consolidate_files`
-
-Downloads files from OneDrive and consolidates into one Excel workbook.
-
-**Parameters:**
-| Param | Type | Required | Description |
-|-------|------|----------|-------------|
-| `user_email` | string | Yes | Microsoft 365 email (e.g., user@bolthousefresh.com) |
-| `folder_path` | string | Yes | OneDrive folder path |
-| `file_names` | string[] | No | Specific files (default: all) |
-| `output_filename` | string | No | Output name (default: Consolidated_Output.xlsx) |
-| `session_name` | string | No | Session for storage (default: consolidate) |
-
-**Guardrails:**
-- Blocked: urllib, requests, httpx, subprocess
-- Blocked: graph.microsoft.com URLs in code
-- Blocked: dataframe_to_rows (use ws.append)
-- Max code lines: 40 per execute_code call
-- Max print statements: 10 per call
-- Output path: forced to `/app/sandbox_data/{session}/`
-- Delivery: one retry max, then stops
-
-## Integration with app/main.py
-
-The skills layer requires **3 small changes** to `app/main.py`.
-These are designed to be non-breaking — if the skills module
-is missing, the app runs exactly as before.
+The Skills Engine is a strict control layer between model intent and tool execution.
 
 ---
 
-### Change 1: Add module-level variable
+## Required `app/main.py` Integration
 
-**Location:** After the imports block, near `MCP_RESPONSE_MAX_CHARS`
+To enable Skills without breaking existing behavior, apply these **three changes**:
 
-```python
-# ── Skills Layer ──
-_skill_tools: dict = {}
-```
+1. **Module-level registry cache**
+   - Add a module-level variable:
+   - `_skill_tools: dict = {}`
 
----
+2. **Initialize skills in `lifespan()`**
+   - In a guarded `try/except`, call:
+   - `app.skills_integration.initialize_skills(mcp)`
+   - Store results in `_skill_tools`.
 
-### Change 2: Initialize in lifespan()
+3. **Merge skill tools into runtime registry**
+   - Update `_get_tool_registry()` to merge base MCP tools + `_skill_tools`.
 
-**Location:** Inside `lifespan()`, after the Microsoft token
-persistence block (`await _ms_auth.ensure_db_table()`)
-
-```python
-    # ── Skills Layer Integration ──
-    try:
-        from app.skills_integration import initialize_skills
-        _skills_result = await initialize_skills(mcp)
-        if _skills_result:
-            global _skill_tools
-            _skill_tools = _skills_result
-            logger.info(
-                f"Skills layer: {len(_skill_tools)} skill tools registered"
-            )
-        else:
-            logger.info("Skills layer: no skills registered")
-    except ImportError:
-        logger.info("Skills layer: module not found, skipping")
-    except Exception as e:
-        logger.warning(f"Skills layer initialization failed: {e}")
-```
+This makes skills discoverable by `tools/list` and callable via `tools/call` automatically.
 
 ---
-
-### Change 3: Merge skills into tool registry
-
-**Location:** Replace the existing `_get_tool_registry()` function
-
-```python
-def _get_tool_registry():
-    """Get the tool registry from the MCP server, including skills."""
-    base = {}
-    try:
-        if hasattr(mcp, '_tool_manager') and hasattr(mcp._tool_manager, '_tools'):
-            base = mcp._tool_manager._tools
-        elif hasattr(mcp, 'tools'):
-            base = mcp.tools
-        else:
-            logger.warning("Could not find tool registry on MCP server")
-    except Exception as e:
-        logger.error(f"Error accessing tool registry: {e}")
-
-    # Merge skill tools if the skills layer is active
-    if _skill_tools:
-        merged = dict(base)
-        merged.update(_skill_tools)
-        return merged
-    return base
-```
-
----
-
-### Why This Works
-
-The `SkillToolWrapper` class (in `skills_integration.py`) provides
-the same interface as FastMCP's internal tool objects:
-- `.fn` — the async handler called by `_handle_mcp_direct()`
-- `.description` — shown in `tools/list` response
-- `.parameters` / `.inputSchema` — the JSON Schema
-- `.name` — the tool name
-
-Because `_handle_mcp_direct()` uses `_get_tool_registry()` for
-both `tools/list` and `tools/call`, merging skill wrappers into
-that registry means skills automatically appear as MCP tools —
-no changes needed to the request handling logic.
-
-The design is **fail-safe**: if the skills module is missing or
-crashes during init, `_skill_tools` stays empty and the app
-runs exactly as v3.0.1.
 
 ## Adding a New Skill
 
-1. Create `app/skills/definitions/your_skill.py`
-2. Extend the `Skill` base class
-3. Implement `execute()` with step methods
-4. Register in `app/skills/registry.py`
+1. Create a new class in:
+   - `app/skills/definitions/`
+2. Extend the `Skill` base class.
+3. Implement `execute()` using chained `ctx.call_tool()` calls.
+4. Register in:
+   - `app/skills/registry.py` via `create_skill_engine()`.
 
-```python
-from app.skills.base import Skill, SkillResult, StepResult, StepStatus
-from app.skills.engine import SkillContext
+---
 
-class YourSkill(Skill):
-    name = "skill_your_name"
-    description = "What it does"
-    input_schema = { ... }
+## Reference Skill: `skill_consolidate_files`
 
-    async def execute(self, params, ctx: SkillContext) -> SkillResult:
-        # Step 1
-        result = await ctx.call_tool("onedrive", {...})
-        # Step 2
-        result = await ctx.call_tool("execute_code", {...})
-        # Return structured result
-        return SkillResult(...)
-```
+### Purpose
+Download selected OneDrive files and consolidate into one Excel workbook.
 
-Then register in `app/skills/registry.py`:
+### Parameters
+- `user_email` (required, string)
+- `folder_path` (required, string)
+- `file_names` (optional, string[])
+- `output_filename` (optional, default: `Consolidated_Output.xlsx`)
+- `session_name` (optional, default: `consolidate`)
 
-```python
-from .definitions.your_skill import YourSkill
+### Guardrails
+- Block external libs/routes: `urllib`, `requests`, `httpx`, `subprocess`, direct Graph URL usage.
+- Prefer `ws.append()` for Excel writing.
+- Limit generated code chunk size (e.g., line cap) and print count.
+- Enforce sandbox output path.
+- Limit delivery retries.
 
-def create_skill_engine() -> SkillEngine:
-    engine = SkillEngine()
-    engine.register_skill(ConsolidateFilesSkill())
-    engine.register_skill(YourSkill())  # <-- add here
-    return engine
-```
+---
 
-The skill automatically becomes a new MCP tool on next deploy.
+## Operational Checklist
+
+Before promoting a skill:
+- [ ] Uses `ms_auth` for PI-bound workflows.
+- [ ] Never writes outside `/app/sandbox_data/{session}/`.
+- [ ] No direct external HTTP library calls when MCP tools exist.
+- [ ] Handles retries with explicit upper bounds.
+- [ ] Emits bounded stdout.
+- [ ] Registers cleanly in skill registry.
+
+If all items pass, the skill is production-ready.

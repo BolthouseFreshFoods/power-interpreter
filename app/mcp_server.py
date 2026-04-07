@@ -8,7 +8,7 @@ MCP Tools (18):
     4 consolidated Microsoft tools (ms_auth, onedrive, sharepoint, resolve_share_link)
     2 admin tools (ms_auth_clear, ms_auth_list_users)
 
-Version: 2.9.7 — fix list_files tool description + download URL guidance
+Version: 3.0.2 — structured tool logging + preserved tool contracts
 
 HISTORY:
   v2.8.6: Version unification across all files.
@@ -20,13 +20,16 @@ HISTORY:
   v2.9.7: Fix list_files and execute_code tool descriptions.
            list_files now returns file_id + download_url per file.
            Updated guidance: use download_url from response, never guess.
+  v3.0.2: Structured MCP tool invocation logging with timing and status.
 """
 
 import base64
+import hashlib
 import json
 import logging
 import os
 import re
+import time
 from typing import Dict, List, Optional, Tuple
 
 import httpx
@@ -83,8 +86,48 @@ def _safe_json_loads(text: str) -> Optional[Dict]:
         return None
 
 
-def _error_text(prefix: str, message: str) -> str:
-    return f"{prefix}: {message}"
+def _hash_text(value: str) -> str:
+    """Return a short privacy-safe hash for correlation."""
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+
+
+def log_tool_call(
+    session_id: Optional[str],
+    user_email: Optional[str],
+    tool_name: str,
+    status: str,
+    duration_ms: float,
+    error_code: Optional[int] = None,
+    extra: Optional[Dict] = None,
+) -> None:
+    """Structured log entry for every MCP tool invocation."""
+    entry = {
+        "event": "tool_call",
+        "session_id": (session_id or "default")[:12],
+        "user": user_email or "anonymous",
+        "tool": tool_name,
+        "status": status,
+        "duration_ms": round(duration_ms, 1),
+    }
+
+    if error_code is not None:
+        entry["error_code"] = error_code
+
+    if extra:
+        entry.update(extra)
+
+    logger.info(json.dumps(entry, default=str))
+
+
+def _session_for_tool(tool_name: str, kwargs: Dict) -> str:
+    """Best-effort session extraction for structured logging."""
+    if "session_id" in kwargs and kwargs.get("session_id"):
+        return str(kwargs["session_id"])
+    return "default"
+
+
+def _status_from_http(status_code: int) -> str:
+    return "success" if status_code < 400 else "error"
 
 
 async def _request_text(
@@ -98,19 +141,36 @@ async def _request_text(
     """Make an internal API request and return response text."""
     logger.info("%s %s", method.upper(), url)
 
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.request(
-                method=method.upper(),
-                url=url,
-                headers=_headers(),
-                json=json_body,
-                params=params,
-            )
-            return resp.text
-    except Exception as e:
-        logger.error("HTTP request failed: %s %s -> %s", method.upper(), url, e, exc_info=True)
-        return _error_text("Internal API request failed", str(e))
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.request(
+            method=method.upper(),
+            url=url,
+            headers=_headers(),
+            json=json_body,
+            params=params,
+        )
+        return resp.text
+
+
+async def _request_json(
+    method: str,
+    url: str,
+    *,
+    timeout: int,
+    json_body: Optional[Dict] = None,
+    params: Optional[Dict] = None,
+) -> httpx.Response:
+    """Make an internal API request and return the raw response."""
+    logger.info("%s %s", method.upper(), url)
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        return await client.request(
+            method=method.upper(),
+            url=url,
+            headers=_headers(),
+            json=json_body,
+            params=params,
+        )
 
 
 # ============================================================
@@ -307,12 +367,10 @@ def _build_content_blocks(resp_text: str) -> list:
 
     blocks = []
 
-    # Block 1: stdout
     stdout = data.get("stdout", "").strip()
     if stdout:
         blocks.append({"type": "text", "text": stdout})
 
-    # Block 2: Error information
     if not data.get("success", False):
         error_msg = data.get("error_message", "Unknown error")
         error_tb = data.get("error_traceback", "")
@@ -323,7 +381,6 @@ def _build_content_blocks(resp_text: str) -> list:
             error_text += f"\n\nTraceback:\n{error_tb}"
         blocks.append({"type": "text", "text": error_text})
 
-    # Block 3: Non-image download links
     download_urls = data.get("download_urls", [])
     non_image_downloads = [d for d in download_urls if not d.get("is_image", False)]
     for info in non_image_downloads:
@@ -338,7 +395,6 @@ def _build_content_blocks(resp_text: str) -> list:
                 }
             )
 
-    # Block 4: Metadata
     meta_parts = []
     exec_time = data.get("execution_time_ms", 0)
     if exec_time:
@@ -363,6 +419,51 @@ def _build_content_blocks(resp_text: str) -> list:
 
 
 # ============================================================
+# TOOL LOGGING WRAPPER
+# ============================================================
+
+def _log_success(
+    *,
+    tool_name: str,
+    started: float,
+    session_id: Optional[str],
+    status_code: Optional[int] = None,
+    extra: Optional[Dict] = None,
+) -> None:
+    log_tool_call(
+        session_id=session_id,
+        user_email=None,
+        tool_name=tool_name,
+        status="success" if status_code is None else _status_from_http(status_code),
+        duration_ms=(time.perf_counter() - started) * 1000,
+        error_code=status_code if status_code is not None and status_code >= 400 else None,
+        extra=extra,
+    )
+
+
+def _log_error(
+    *,
+    tool_name: str,
+    started: float,
+    session_id: Optional[str],
+    exc: Exception,
+    extra: Optional[Dict] = None,
+) -> None:
+    payload = {"exception": type(exc).__name__}
+    if extra:
+        payload.update(extra)
+
+    log_tool_call(
+        session_id=session_id,
+        user_email=None,
+        tool_name=tool_name,
+        status="error",
+        duration_ms=(time.perf_counter() - started) * 1000,
+        extra=payload,
+    )
+
+
+# ============================================================
 # CODE EXECUTION TOOLS
 # ============================================================
 
@@ -384,6 +485,7 @@ async def execute_code(
     """
     url = f"{API_BASE}/api/execute"
     logger.info("execute_code: POST %s session=%s", url, session_id)
+    started = time.perf_counter()
 
     try:
         async with httpx.AsyncClient(timeout=timeout + 5) as client:
@@ -392,10 +494,27 @@ async def execute_code(
                 headers=_headers(),
                 json={"code": code, "session_id": session_id, "timeout": timeout},
             )
+
             blocks = _build_content_blocks(resp.text)
             blocks = await _enrich_blocks_with_images(blocks, resp.text)
+
+            _log_success(
+                tool_name="execute_code",
+                started=started,
+                session_id=session_id,
+                status_code=resp.status_code,
+                extra={"code_len": len(code)},
+            )
             return blocks
+
     except Exception as e:
+        _log_error(
+            tool_name="execute_code",
+            started=started,
+            session_id=session_id,
+            exc=e,
+            extra={"code_len": len(code)},
+        )
         logger.error("execute_code: error: %s", e, exc_info=True)
         return [{"type": "text", "text": f"Error calling execute_code API: {e}"}]
 
@@ -417,6 +536,8 @@ async def fetch_from_url(
         filename: Name to save as in sandbox. Derived from URL if omitted.
         session_id: Session for file isolation.
     """
+    started = time.perf_counter()
+
     if not filename:
         from urllib.parse import urlparse
 
@@ -432,38 +553,60 @@ async def fetch_from_url(
     )
 
     try:
-        async with httpx.AsyncClient(timeout=120) as client:
-            resp = await client.post(
-                api_url,
-                headers=_headers(),
-                json={"url": url, "filename": filename, "session_id": session_id},
-            )
-            logger.info("fetch_from_url: response status=%s", resp.status_code)
+        resp = await _request_json(
+            "POST",
+            api_url,
+            timeout=120,
+            json_body={"url": url, "filename": filename, "session_id": session_id},
+        )
+        logger.info("fetch_from_url: response status=%s", resp.status_code)
 
-            if resp.status_code == 200:
-                data = resp.json()
-                return [
-                    {
-                        "type": "text",
-                        "text": (
-                            f"File fetched successfully!\n"
-                            f"  Filename : {data.get('filename')}\n"
-                            f"  Size     : {data.get('size_human')}\n"
-                            f"  Path     : {data.get('path')}\n"
-                            f"  Session  : {data.get('session_id')}\n"
-                            f"  Preview  : {data.get('preview', 'N/A')}\n\n"
-                            f"Now call execute_code to work with this file."
-                        ),
-                    }
-                ]
+        _log_success(
+            tool_name="fetch_from_url",
+            started=started,
+            session_id=session_id,
+            status_code=resp.status_code,
+            extra={
+                "filename": filename,
+                "url_hash": _hash_text(url),
+            },
+        )
 
+        if resp.status_code == 200:
+            data = resp.json()
             return [
                 {
                     "type": "text",
-                    "text": f"fetch_from_url failed (HTTP {resp.status_code}):\n  {resp.text[:300]}",
+                    "text": (
+                        f"File fetched successfully!\n"
+                        f"  Filename : {data.get('filename')}\n"
+                        f"  Size     : {data.get('size_human')}\n"
+                        f"  Path     : {data.get('path')}\n"
+                        f"  Session  : {data.get('session_id')}\n"
+                        f"  Preview  : {data.get('preview', 'N/A')}\n\n"
+                        f"Now call execute_code to work with this file."
+                    ),
                 }
             ]
+
+        return [
+            {
+                "type": "text",
+                "text": f"fetch_from_url failed (HTTP {resp.status_code}):\n  {resp.text[:300]}",
+            }
+        ]
+
     except Exception as e:
+        _log_error(
+            tool_name="fetch_from_url",
+            started=started,
+            session_id=session_id,
+            exc=e,
+            extra={
+                "filename": filename,
+                "url_hash": _hash_text(url),
+            },
+        )
         logger.error("fetch_from_url: error: %s", e, exc_info=True)
         return [{"type": "text", "text": f"fetch_from_url error: {e}"}]
 
@@ -483,19 +626,35 @@ async def upload_file(
     """
     url = f"{API_BASE}/api/files/upload"
     logger.info("upload_file: POST %s filename=%s", url, filename)
+    started = time.perf_counter()
+
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.post(
-                url,
-                headers=_headers(),
-                json={
-                    "filename": filename,
-                    "content_base64": content_base64,
-                    "session_id": session_id,
-                },
-            )
-            return resp.text
+        resp = await _request_json(
+            "POST",
+            url,
+            timeout=60,
+            json_body={
+                "filename": filename,
+                "content_base64": content_base64,
+                "session_id": session_id,
+            },
+        )
+        _log_success(
+            tool_name="upload_file",
+            started=started,
+            session_id=session_id,
+            status_code=resp.status_code,
+            extra={"filename": filename},
+        )
+        return resp.text
     except Exception as e:
+        _log_error(
+            tool_name="upload_file",
+            started=started,
+            session_id=session_id,
+            exc=e,
+            extra={"filename": filename},
+        )
         logger.error("upload_file: error: %s", e, exc_info=True)
         return f"Error calling upload_file API: {e}"
 
@@ -515,15 +674,31 @@ async def fetch_file(
     """
     api_url = f"{API_BASE}/api/files/fetch"
     logger.info("fetch_file: POST %s", api_url)
+    started = time.perf_counter()
+
     try:
-        async with httpx.AsyncClient(timeout=120) as client:
-            resp = await client.post(
-                api_url,
-                headers=_headers(),
-                json={"url": url, "filename": filename, "session_id": session_id},
-            )
-            return resp.text
+        resp = await _request_json(
+            "POST",
+            api_url,
+            timeout=120,
+            json_body={"url": url, "filename": filename, "session_id": session_id},
+        )
+        _log_success(
+            tool_name="fetch_file",
+            started=started,
+            session_id=session_id,
+            status_code=resp.status_code,
+            extra={"filename": filename, "url_hash": _hash_text(url)},
+        )
+        return resp.text
     except Exception as e:
+        _log_error(
+            tool_name="fetch_file",
+            started=started,
+            session_id=session_id,
+            exc=e,
+            extra={"filename": filename, "url_hash": _hash_text(url)},
+        )
         logger.error("fetch_file: error: %s", e, exc_info=True)
         return f"Error calling fetch_file API: {e}"
 
@@ -537,15 +712,29 @@ async def list_files(session_id: Optional[str] = "default") -> str:
     """
     url = f"{API_BASE}/api/files"
     logger.info("list_files: GET %s", url)
+    started = time.perf_counter()
+
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(
-                url,
-                headers=_headers(),
-                params={"session_id": session_id},
-            )
-            return resp.text
+        resp = await _request_json(
+            "GET",
+            url,
+            timeout=10,
+            params={"session_id": session_id},
+        )
+        _log_success(
+            tool_name="list_files",
+            started=started,
+            session_id=session_id,
+            status_code=resp.status_code,
+        )
+        return resp.text
     except Exception as e:
+        _log_error(
+            tool_name="list_files",
+            started=started,
+            session_id=session_id,
+            exc=e,
+        )
         logger.error("list_files: error: %s", e, exc_info=True)
         return f"Error calling list_files API: {e}"
 
@@ -569,15 +758,31 @@ async def submit_job(
     """
     url = f"{API_BASE}/api/jobs/submit"
     logger.info("submit_job: POST %s", url)
+    started = time.perf_counter()
+
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.post(
-                url,
-                headers=_headers(),
-                json={"code": code, "session_id": session_id, "timeout": timeout},
-            )
-            return resp.text
+        resp = await _request_json(
+            "POST",
+            url,
+            timeout=10,
+            json_body={"code": code, "session_id": session_id, "timeout": timeout},
+        )
+        _log_success(
+            tool_name="submit_job",
+            started=started,
+            session_id=session_id,
+            status_code=resp.status_code,
+            extra={"code_len": len(code)},
+        )
+        return resp.text
     except Exception as e:
+        _log_error(
+            tool_name="submit_job",
+            started=started,
+            session_id=session_id,
+            exc=e,
+            extra={"code_len": len(code)},
+        )
         logger.error("submit_job: error: %s", e, exc_info=True)
         return f"Error calling submit_job API: {e}"
 
@@ -591,11 +796,26 @@ async def get_job_status(job_id: str) -> str:
     """
     url = f"{API_BASE}/api/jobs/{job_id}/status"
     logger.info("get_job_status: GET %s", url)
+    started = time.perf_counter()
+
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(url, headers=_headers())
-            return resp.text
+        resp = await _request_json("GET", url, timeout=10)
+        _log_success(
+            tool_name="get_job_status",
+            started=started,
+            session_id="default",
+            status_code=resp.status_code,
+            extra={"job_id": job_id},
+        )
+        return resp.text
     except Exception as e:
+        _log_error(
+            tool_name="get_job_status",
+            started=started,
+            session_id="default",
+            exc=e,
+            extra={"job_id": job_id},
+        )
         logger.error("get_job_status: error: %s", e, exc_info=True)
         return f"Error calling get_job_status API: {e}"
 
@@ -609,13 +829,30 @@ async def get_job_result(job_id: str) -> list:
     """
     url = f"{API_BASE}/api/jobs/{job_id}/result"
     logger.info("get_job_result: GET %s", url)
+    started = time.perf_counter()
+
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.get(url, headers=_headers())
-            blocks = _build_content_blocks(resp.text)
-            blocks = await _enrich_blocks_with_images(blocks, resp.text)
-            return blocks
+        resp = await _request_json("GET", url, timeout=30)
+
+        blocks = _build_content_blocks(resp.text)
+        blocks = await _enrich_blocks_with_images(blocks, resp.text)
+
+        _log_success(
+            tool_name="get_job_result",
+            started=started,
+            session_id="default",
+            status_code=resp.status_code,
+            extra={"job_id": job_id},
+        )
+        return blocks
     except Exception as e:
+        _log_error(
+            tool_name="get_job_result",
+            started=started,
+            session_id="default",
+            exc=e,
+            extra={"job_id": job_id},
+        )
         logger.error("get_job_result: error: %s", e, exc_info=True)
         return [{"type": "text", "text": f"Error calling get_job_result API: {e}"}]
 
@@ -641,20 +878,36 @@ async def load_dataset(
     """
     url = f"{API_BASE}/api/data/load-csv"
     logger.info("load_dataset: POST %s", url)
+    started = time.perf_counter()
+
     try:
-        async with httpx.AsyncClient(timeout=300) as client:
-            resp = await client.post(
-                url,
-                headers=_headers(),
-                json={
-                    "file_path": file_path,
-                    "dataset_name": dataset_name,
-                    "session_id": session_id,
-                    "delimiter": delimiter,
-                },
-            )
-            return resp.text
+        resp = await _request_json(
+            "POST",
+            url,
+            timeout=300,
+            json_body={
+                "file_path": file_path,
+                "dataset_name": dataset_name,
+                "session_id": session_id,
+                "delimiter": delimiter,
+            },
+        )
+        _log_success(
+            tool_name="load_dataset",
+            started=started,
+            session_id=session_id,
+            status_code=resp.status_code,
+            extra={"dataset_name": dataset_name, "file_path": file_path},
+        )
+        return resp.text
     except Exception as e:
+        _log_error(
+            tool_name="load_dataset",
+            started=started,
+            session_id=session_id,
+            exc=e,
+            extra={"dataset_name": dataset_name, "file_path": file_path},
+        )
         logger.error("load_dataset: error: %s", e, exc_info=True)
         return f"Error calling load_dataset API: {e}"
 
@@ -674,15 +927,31 @@ async def query_dataset(
     """
     url = f"{API_BASE}/api/data/query"
     logger.info("query_dataset: POST %s", url)
+    started = time.perf_counter()
+
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.post(
-                url,
-                headers=_headers(),
-                json={"sql": sql, "limit": limit, "offset": offset},
-            )
-            return resp.text
+        resp = await _request_json(
+            "POST",
+            url,
+            timeout=60,
+            json_body={"sql": sql, "limit": limit, "offset": offset},
+        )
+        _log_success(
+            tool_name="query_dataset",
+            started=started,
+            session_id="default",
+            status_code=resp.status_code,
+            extra={"limit": limit, "offset": offset, "sql_len": len(sql)},
+        )
+        return resp.text
     except Exception as e:
+        _log_error(
+            tool_name="query_dataset",
+            started=started,
+            session_id="default",
+            exc=e,
+            extra={"limit": limit, "offset": offset, "sql_len": len(sql)},
+        )
         logger.error("query_dataset: error: %s", e, exc_info=True)
         return f"Error calling query_dataset API: {e}"
 
@@ -700,11 +969,24 @@ async def list_datasets(session_id: str = None) -> str:
 
     url = f"{API_BASE}/api/data/datasets"
     logger.info("list_datasets: GET %s", url)
+    started = time.perf_counter()
+
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(url, headers=_headers(), params=params)
-            return resp.text
+        resp = await _request_json("GET", url, timeout=10, params=params)
+        _log_success(
+            tool_name="list_datasets",
+            started=started,
+            session_id=session_id or "default",
+            status_code=resp.status_code,
+        )
+        return resp.text
     except Exception as e:
+        _log_error(
+            tool_name="list_datasets",
+            started=started,
+            session_id=session_id or "default",
+            exc=e,
+        )
         logger.error("list_datasets: error: %s", e, exc_info=True)
         return f"Error calling list_datasets API: {e}"
 
@@ -726,20 +1008,37 @@ async def create_session(
     """
     url = f"{API_BASE}/api/sessions"
     logger.info("create_session: POST %s", url)
+    started = time.perf_counter()
+
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.post(
-                url,
-                headers=_headers(),
-                json={"name": name, "description": description},
-            )
+        resp = await _request_json(
+            "POST",
+            url,
+            timeout=10,
+            json_body={"name": name, "description": description},
+        )
 
-            # Register session for user tracking (v2.10.0)
-            from app.engine.user_tracker import UserTracker
+        # Register session for user tracking (v2.10.0)
+        from app.engine.user_tracker import UserTracker
 
-            UserTracker().register_session(name)
-            return resp.text
+        UserTracker().register_session(name)
+
+        _log_success(
+            tool_name="create_session",
+            started=started,
+            session_id="default",
+            status_code=resp.status_code,
+            extra={"session_name": name},
+        )
+        return resp.text
     except Exception as e:
+        _log_error(
+            tool_name="create_session",
+            started=started,
+            session_id="default",
+            exc=e,
+            extra={"session_name": name},
+        )
         logger.error("create_session: error: %s", e, exc_info=True)
         return f"Error calling create_session API: {e}"
 
@@ -753,11 +1052,25 @@ async def delete_session(session_id: str) -> str:
     """
     url = f"{API_BASE}/api/sessions/{session_id}"
     logger.info("delete_session: DELETE %s", url)
+    started = time.perf_counter()
+
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.delete(url, headers=_headers())
-            return resp.text
+        resp = await _request_json("DELETE", url, timeout=10)
+
+        _log_success(
+            tool_name="delete_session",
+            started=started,
+            session_id=session_id,
+            status_code=resp.status_code,
+        )
+        return resp.text
     except Exception as e:
+        _log_error(
+            tool_name="delete_session",
+            started=started,
+            session_id=session_id,
+            exc=e,
+        )
         logger.error("delete_session: error: %s", e, exc_info=True)
         return f"Error calling delete_session API: {e}"
 

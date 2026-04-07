@@ -3,9 +3,11 @@
 Handles file upload (base64), file fetch (URL), file listing,
 and public download of sandbox-generated files from Postgres.
 
-Version: 1.3.0 - Fix: Include filename in download URL path so browsers
-                 use the correct filename regardless of how the download
-                 is triggered (direct click, JS fetch, etc.)
+Version: 1.4.0 - Fix: Include file_id and download_url in list_files
+                 response by cross-referencing the sandbox_files Postgres
+                 table. This fixes broken download links where the AI
+                 was constructing /dl/default/filename instead of
+                 /dl/{uuid}/filename.
                  
                  URL format: /dl/{file_id}/{filename}
                  Fallback:   /dl/{file_id} (still works, uses DB filename)
@@ -23,6 +25,7 @@ import time
 import logging
 import httpx
 import uuid
+import os
 from urllib.parse import quote
 
 from app.config import settings
@@ -36,6 +39,12 @@ router = APIRouter()
 public_router = APIRouter()
 
 SANDBOX_DIR = settings.SANDBOX_DIR
+
+# Public base URL for download links (auto-detected or from env)
+PUBLIC_BASE_URL = os.getenv(
+    "PUBLIC_BASE_URL",
+    "https://power-interpreter-production-6396.up.railway.app"
+)
 
 # Max file sizes
 MAX_UPLOAD_SIZE = 50 * 1024 * 1024   # 50MB for base64 uploads
@@ -81,6 +90,8 @@ class FileInfo(BaseModel):
     mime_type: Optional[str] = None
     session_id: str
     preview: Optional[str] = None
+    file_id: Optional[str] = None
+    download_url: Optional[str] = None
 
 
 class FileListResponse(BaseModel):
@@ -174,6 +185,39 @@ def get_mime_type(filename: str) -> str:
 
 
 # ============================================================
+# Sandbox file ID lookup helper
+# ============================================================
+
+async def _build_file_id_map(session_id: str) -> dict:
+    """Build a filename -> file_id mapping from the sandbox_files table.
+    
+    When multiple SandboxFile records share the same filename
+    (e.g. re-generated charts), the MOST RECENT one wins.
+    
+    Returns:
+        dict mapping filename (str) -> file_id (str UUID)
+    """
+    file_id_map = {}
+    try:
+        from app.database import get_session_factory
+        from app.models import SandboxFile
+        from sqlalchemy import select
+
+        factory = get_session_factory()
+        async with factory() as db_session:
+            result = await db_session.execute(
+                select(SandboxFile.id, SandboxFile.filename)
+                .where(SandboxFile.session_id == session_id)
+                .order_by(SandboxFile.created_at.asc())   # oldest first → newest overwrites
+            )
+            for row in result:
+                file_id_map[row.filename] = str(row.id)
+    except Exception as e:
+        logger.warning(f"Could not load SandboxFile IDs for session={session_id}: {e}")
+    return file_id_map
+
+
+# ============================================================
 # Core download logic (shared by all download routes)
 # ============================================================
 
@@ -222,14 +266,9 @@ async def _serve_download(file_id: str, head_only: bool = False) -> Response:
                 await session.commit()
             
             # Determine content disposition
-            # ALWAYS use attachment to force download with correct filename
-            # URL-encode the filename for the filename* parameter (RFC 5987)
             safe_name = sandbox_file.filename
             encoded_name = quote(safe_name)
             
-            # Use both filename and filename* for maximum browser compatibility
-            # filename: ASCII fallback (replace non-ASCII with underscores)
-            # filename*: UTF-8 encoded (handles all characters)
             ascii_name = safe_name.encode('ascii', 'replace').decode('ascii')
             disposition = (
                 f'attachment; '
@@ -281,10 +320,6 @@ async def _serve_download(file_id: str, head_only: bool = False) -> Response:
 # Two URL patterns:
 #   /dl/{file_id}                    - original (filename from DB)
 #   /dl/{file_id}/{filename}         - filename in URL (browser uses this)
-#
-# The filename-in-URL pattern ensures browsers save with the
-# correct filename regardless of how the download is triggered
-# (direct click, JS fetch, curl, etc.)
 #
 # CORS: Explicit headers on every response for cross-origin access.
 # ============================================================
@@ -525,27 +560,45 @@ async def list_files(session_id: Optional[str] = None):
     """List files in the sandbox.
     
     Optionally filter by session_id. Returns file metadata
-    including size, type, and text preview.
+    including size, type, text preview, and download URLs.
+    
+    The file_id and download_url fields are populated by
+    cross-referencing the sandbox_files Postgres table. Files
+    without a matching SandboxFile record will have null values
+    for these fields (e.g. freshly fetched files not yet
+    persisted via execute_code).
     """
     files = []
     total_size = 0
     
     if session_id:
-        # List files in specific session
+        # Build filename -> file_id map from Postgres
+        file_id_map = await _build_file_id_map(session_id)
+        
         session_dir = SANDBOX_DIR / session_id
         if session_dir.exists():
             for file_path in sorted(session_dir.rglob('*')):
                 if file_path.is_file():
                     size = file_path.stat().st_size
                     total_size += size
+                    
+                    fname = file_path.name
+                    fid = file_id_map.get(fname)
+                    dl_url = (
+                        f"{PUBLIC_BASE_URL}/dl/{fid}/{quote(fname)}"
+                        if fid else None
+                    )
+                    
                     files.append(FileInfo(
-                        filename=file_path.name,
+                        filename=fname,
                         path=str(file_path.relative_to(SANDBOX_DIR)),
                         size_bytes=size,
                         size_human=_human_size(size),
-                        mime_type=_detect_mime_type(file_path.name),
+                        mime_type=_detect_mime_type(fname),
                         session_id=session_id,
-                        preview=_get_preview(file_path)
+                        preview=_get_preview(file_path),
+                        file_id=fid,
+                        download_url=dl_url,
                     ))
     else:
         # List all files across all sessions
@@ -553,18 +606,30 @@ async def list_files(session_id: Optional[str] = None):
             for session_dir in sorted(SANDBOX_DIR.iterdir()):
                 if session_dir.is_dir():
                     sid = session_dir.name
+                    file_id_map = await _build_file_id_map(sid)
+                    
                     for file_path in sorted(session_dir.rglob('*')):
                         if file_path.is_file():
                             size = file_path.stat().st_size
                             total_size += size
+                            
+                            fname = file_path.name
+                            fid = file_id_map.get(fname)
+                            dl_url = (
+                                f"{PUBLIC_BASE_URL}/dl/{fid}/{quote(fname)}"
+                                if fid else None
+                            )
+                            
                             files.append(FileInfo(
-                                filename=file_path.name,
+                                filename=fname,
                                 path=str(file_path.relative_to(SANDBOX_DIR)),
                                 size_bytes=size,
                                 size_human=_human_size(size),
-                                mime_type=_detect_mime_type(file_path.name),
+                                mime_type=_detect_mime_type(fname),
                                 session_id=sid,
-                                preview=_get_preview(file_path)
+                                preview=_get_preview(file_path),
+                                file_id=fid,
+                                download_url=dl_url,
                             ))
     
     return FileListResponse(

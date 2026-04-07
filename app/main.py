@@ -13,8 +13,7 @@ Features:
 - Auto file storage in Postgres with public download URLs
 - Microsoft OneDrive + SharePoint integration (v1.9.0)
 
-Author: Kaffer AI for Timothy Escamilla
-Version: 3.0.2
+Version: 3.0.3
 
 HISTORY:
   v1.7.2: fetch_from_url route fix, stable release
@@ -24,10 +23,11 @@ HISTORY:
   v2.8.6: Version unification across all files
   v2.9.0: Trimmed all 34 tool descriptions for token optimization (~57% reduction)
   v2.9.1: Smart error handling for empty execute_code args (model-agnostic)
-  v2.9.2: Response guardrails — truncate oversized MCP tool results (Change #10)
+  v2.9.2: Response guardrails — truncate oversized MCP tool results
   v3.0.0: Context pressure guard — per-tool caps, pressure warnings, improved recovery
-  v3.0.1: Pre-execution syntax guard — catch truncated code before sandbox (Fix 5)
+  v3.0.1: Pre-execution syntax guard — catch truncated code before sandbox
   v3.0.2: Route Python logs to stdout + response budget enforcement hook
+  v3.0.3: Reduce MCP log noise + metadata-only execute_code request logging
 """
 
 import asyncio
@@ -57,8 +57,6 @@ from app.routes.files import public_router as download_router
 from app.syntax_guard import check_syntax
 
 
-# Configure logging
-# IMPORTANT: stream=sys.stdout prevents Railway from tagging normal INFO logs as errors.
 logging.basicConfig(
     stream=sys.stdout,
     level=getattr(logging, settings.LOG_LEVEL),
@@ -67,10 +65,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ── Response Budget Guard (Change #10) ──────────────────────────────────────────
 MCP_RESPONSE_MAX_CHARS = 50_000
-
-# ── Skills Layer ────────────────────────────────────────────────────────────────
 _skill_tools: dict[str, Any] = {}
 
 
@@ -80,7 +75,6 @@ def _jsonrpc_error(
     message: str,
     status_code: int = 200,
 ) -> JSONResponse:
-    """Build a JSON-RPC error response."""
     return JSONResponse(
         content={
             "jsonrpc": "2.0",
@@ -92,15 +86,13 @@ def _jsonrpc_error(
 
 
 def _safe_json_loads(body_str: str) -> dict | list:
-    """Parse a JSON request body."""
     return json.loads(body_str)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Application lifecycle management."""
     logger.info("=" * 60)
-    logger.info("Power Interpreter MCP v3.0.2 starting...")
+    logger.info("Power Interpreter MCP v3.0.3 starting...")
     logger.info("=" * 60)
 
     settings.ensure_directories()
@@ -190,7 +182,6 @@ async def lifespan(app: FastAPI):
 
 
 async def _periodic_cleanup():
-    """Periodically clean up old jobs, temp files, and expired sandbox files."""
     while True:
         try:
             await asyncio.sleep(3600)
@@ -213,7 +204,6 @@ async def _periodic_cleanup():
 
 
 async def _cleanup_expired_sandbox_files():
-    """Delete sandbox files past their TTL from Postgres."""
     try:
         from sqlalchemy import delete
 
@@ -236,7 +226,6 @@ async def _cleanup_expired_sandbox_files():
         logger.error("Failed to clean expired sandbox files: %s", e)
 
 
-# Create FastAPI app
 app = FastAPI(
     title="Power Interpreter MCP",
     description=(
@@ -247,13 +236,12 @@ app = FastAPI(
         "Charts served at /charts/{session_id}/{filename}. "
         "Microsoft OneDrive + SharePoint integration."
     ),
-    version="3.0.2",
+    version="3.0.3",
     lifespan=lifespan,
     docs_url="/docs",
     redoc_url="/redoc",
 )
 
-# CORS (allow SimTheory.ai)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -263,18 +251,8 @@ app.add_middleware(
 )
 
 
-# =============================================================================
-# CHART SERVING ROUTE
-# =============================================================================
-
 @app.get("/charts/{session_id}/{filename}")
 async def serve_chart(session_id: str, filename: str):
-    """Serve chart images by session_id and filename.
-
-    SimTheory auto-constructs these URLs from MCP tool responses.
-    Looks up the most recent matching file in Postgres and serves it.
-    Public endpoint — no authentication required.
-    """
     logger.info("Chart request: session=%s filename=%s", session_id, filename)
 
     try:
@@ -350,7 +328,7 @@ async def serve_chart(session_id: str, filename: str):
                 headers={
                     "Content-Disposition": f'inline; filename="{filename}"',
                     "Cache-Control": "public, max-age=3600",
-                    "X-Power-Interpreter": "chart-serve-v3.0.2",
+                    "X-Power-Interpreter": "chart-serve-v3.0.3",
                 },
             )
 
@@ -374,12 +352,7 @@ async def serve_chart(session_id: str, filename: str):
         )
 
 
-# =============================================================================
-# DIRECT MCP JSON-RPC HANDLER (for SimTheory)
-# =============================================================================
-
 def _build_tool_schema(tool) -> dict:
-    """Build the JSON Schema for a tool's input parameters."""
     if hasattr(tool, "parameters") and tool.parameters:
         return tool.parameters
 
@@ -426,7 +399,6 @@ def _build_tool_schema(tool) -> dict:
 
 
 def _get_tool_registry():
-    """Get the tool registry from the MCP server, including skills."""
     base = {}
     try:
         if hasattr(mcp, "_tool_manager") and hasattr(mcp._tool_manager, "_tools"):
@@ -446,7 +418,6 @@ def _get_tool_registry():
 
 
 def _get_tools_list() -> list:
-    """Build the tools/list response array."""
     result = []
     registry = _get_tool_registry()
 
@@ -469,7 +440,6 @@ def _get_tools_list() -> list:
 
 
 def _validate_tool_args(fn, tool_args: dict, tool_name: str) -> str | None:
-    """Validate that all required arguments are present before calling a tool."""
     try:
         sig = inspect.signature(fn)
         missing = []
@@ -492,12 +462,11 @@ def _validate_tool_args(fn, tool_args: dict, tool_name: str) -> str | None:
 
 @app.post("/mcp/sse")
 async def handle_mcp_jsonrpc(request: Request):
-    """Direct MCP JSON-RPC handler for SimTheory."""
     try:
         body = await request.body()
         body_str = body.decode("utf-8", errors="replace")
         logger.info("MCP direct: received %s bytes", len(body))
-        logger.info("MCP direct: %s", body_str[:500])
+        logger.info("MCP direct: body preview=%s", body_str[:160].replace("\n", "\\n"))
         data = _safe_json_loads(body_str)
     except Exception as e:
         logger.error("MCP direct: parse error: %s", e)
@@ -523,7 +492,6 @@ async def handle_mcp_jsonrpc(request: Request):
 
 
 async def _handle_single_jsonrpc(data: dict):
-    """Process a single JSON-RPC message."""
     method = data.get("method", "")
     msg_id = data.get("id")
     params = data.get("params", {})
@@ -546,7 +514,7 @@ async def _handle_single_jsonrpc(data: dict):
                 },
                 "serverInfo": {
                     "name": "Power Interpreter",
-                    "version": "3.0.2",
+                    "version": "3.0.3",
                 },
             },
         }
@@ -570,16 +538,22 @@ async def _handle_single_jsonrpc(data: dict):
         tool_name = params.get("name", "")
         tool_args = params.get("arguments", {})
 
-        try:
-            args_preview = json.dumps(tool_args, default=str)[:300]
-        except Exception:
-            args_preview = str(tool_args)[:300]
+        if tool_name == "execute_code":
+            args_preview = json.dumps(
+                {
+                    "session_id": tool_args.get("session_id", "default"),
+                    "timeout": tool_args.get("timeout"),
+                    "code_len": len(tool_args.get("code", "")),
+                },
+                default=str,
+            )
+        else:
+            try:
+                args_preview = json.dumps(tool_args, default=str)[:160].replace("\n", "\\n")
+            except Exception:
+                args_preview = str(tool_args)[:160].replace("\n", "\\n")
 
-        logger.info(
-            "MCP direct: -> tools/call '%s' args=%s",
-            tool_name,
-            args_preview,
-        )
+        logger.info("MCP direct: -> tools/call '%s' args=%s", tool_name, args_preview)
 
         registry = _get_tool_registry()
         if tool_name not in registry:
@@ -601,10 +575,9 @@ async def _handle_single_jsonrpc(data: dict):
             validation_error = _validate_tool_args(fn, tool_args, tool_name)
             if validation_error:
                 logger.warning(
-                    "MCP direct: %s argument validation failed: %s | Full params size: %s bytes | Argument keys received: %s | Arguments empty: %s",
+                    "MCP direct: %s argument validation failed: %s | argument_keys=%s | arguments_empty=%s",
                     tool_name,
                     validation_error,
-                    len(json.dumps(params, default=str)),
                     list(tool_args.keys()),
                     len(tool_args) == 0,
                 )
@@ -621,7 +594,6 @@ async def _handle_single_jsonrpc(data: dict):
                     },
                 }
 
-            # ── Fix 5: Pre-execution syntax guard ─────────────────────
             if tool_name == "execute_code" and "code" in tool_args:
                 syntax_issue = check_syntax(tool_args["code"])
                 if syntax_issue:
@@ -642,15 +614,13 @@ async def _handle_single_jsonrpc(data: dict):
 
             logger.info("MCP direct: invoking %s...", tool_name)
             result = await fn(**tool_args)
-
-            # ── Change #10: response budget enforcement ───────────────
             result = enforce_response_budget(tool_name, result)
 
             result_str = str(result)
             original_len = len(result_str)
 
             logger.info("MCP direct: %s returned %s chars", tool_name, f"{original_len:,}")
-            logger.info("MCP direct: result preview: %s", result_str[:300])
+            logger.info("MCP direct: result preview: %s", result_str[:240].replace("\n", "\\n"))
 
             effective_cap = get_effective_cap(tool_name, MCP_RESPONSE_MAX_CHARS)
 
@@ -700,10 +670,6 @@ async def _handle_single_jsonrpc(data: dict):
         "error": {"code": -32601, "message": f"Method not found: {method}"},
     }
 
-
-# =============================================================================
-# ROUTE MOUNTING
-# =============================================================================
 
 app.include_router(health.router, tags=["Health"])
 

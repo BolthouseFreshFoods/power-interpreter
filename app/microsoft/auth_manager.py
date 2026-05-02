@@ -1,9 +1,9 @@
 """Microsoft OAuth 2.0 Device Code Flow + Token Management
 v1.9.4: Added get_default_user_id() so tools can auto-resolve user_id.
 v2.9.3a: Added clear_user_token() and list_authenticated_users() for admin.
-         No hardcoded emails — default user resolved from most recent Postgres entry.
-v3.0.4: Persistent auth hardening � widened refresh safety margin to 600s (10 min), added refresh_count tracking, robust refresh_token fallback.
-         Multi-user safety — get_default_user_id() warns on cross-user risk.
+         No hardcoded emails -- default user resolved from most recent Postgres entry.
+v3.0.4: Persistent auth hardening -- widened refresh safety margin to 600s (10 min), added refresh_count tracking, robust refresh_token fallback.
+         Multi-user safety -- get_default_user_id() warns on cross-user risk.
          get_default_user_id_async() same multi-user detection.
 """
 import os, time, json, logging, asyncio
@@ -29,9 +29,9 @@ class MSAuthManager:
     @property
     def enabled(self): return self._enabled
 
-    # ── FIX 1: Multi-user safe default resolution (v2.10.1) ─────────────
+    # -- FIX 1: Multi-user safe default resolution (v2.10.1) -------------
     def get_default_user_id(self) -> Optional[str]:
-        """Resolve default user — WARN if multiple users are active.
+        """Resolve default user -- WARN if multiple users are active.
 
         v2.10.1: When multiple users are authenticated concurrently,
         _last_authenticated_user is a global singleton that could
@@ -50,9 +50,9 @@ class MSAuthManager:
         if len(authenticated) == 1:
             self._last_authenticated_user = authenticated[0]
             return authenticated[0]
-        # MULTIPLE users active — log cross-user risk
+        # MULTIPLE users active -- log cross-user risk
         logger.warning(
-            f"MS Auth: MULTI-USER WARNING — {len(authenticated)} authenticated "
+            f"MS Auth: MULTI-USER WARNING -- {len(authenticated)} authenticated "
             f"users: {authenticated}. Returning last authenticated: "
             f"{self._last_authenticated_user}. "
             f"Pass user_email explicitly to avoid cross-user data access."
@@ -62,12 +62,12 @@ class MSAuthManager:
         self._last_authenticated_user = authenticated[0]
         return authenticated[0]
 
-    # ── FIX 2: Async multi-user safe default resolution (v2.10.1) ───────
+    # -- FIX 2: Async multi-user safe default resolution (v2.10.1) -------
     async def get_default_user_id_async(self) -> Optional[str]:
-        """Async default user resolve with DB fallback — multi-user safe.
+        """Async default user resolve with DB fallback -- multi-user safe.
 
         v2.10.1: Same multi-user warning as sync version. Postgres
-        fallback only fires when zero users are in memory — safe
+        fallback only fires when zero users are in memory -- safe
         because it loads exactly one user.
         """
         authenticated = [
@@ -79,7 +79,7 @@ class MSAuthManager:
             return authenticated[0]
         if len(authenticated) > 1:
             logger.warning(
-                f"MS Auth: MULTI-USER WARNING (async) — {len(authenticated)} "
+                f"MS Auth: MULTI-USER WARNING (async) -- {len(authenticated)} "
                 f"authenticated users: {authenticated}. Returning last: "
                 f"{self._last_authenticated_user}. "
                 f"Pass user_email explicitly to avoid cross-user data access."
@@ -88,7 +88,7 @@ class MSAuthManager:
                 return self._last_authenticated_user
             self._last_authenticated_user = authenticated[0]
             return authenticated[0]
-        # No in-memory users — try Postgres (single-user safe)
+        # No in-memory users -- try Postgres (single-user safe)
         if self._db_ready:
             try:
                 from app.database import get_session_factory

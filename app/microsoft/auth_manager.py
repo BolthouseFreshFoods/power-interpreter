@@ -2,7 +2,8 @@
 v1.9.4: Added get_default_user_id() so tools can auto-resolve user_id.
 v2.9.3a: Added clear_user_token() and list_authenticated_users() for admin.
          No hardcoded emails — default user resolved from most recent Postgres entry.
-v2.10.1: Multi-user safety — get_default_user_id() warns on cross-user risk.
+v3.0.4: Persistent auth hardening � widened refresh safety margin to 600s (10 min), added refresh_count tracking, robust refresh_token fallback.
+         Multi-user safety — get_default_user_id() warns on cross-user risk.
          get_default_user_id_async() same multi-user detection.
 """
 import os, time, json, logging, asyncio
@@ -203,7 +204,7 @@ class MSAuthManager:
             except Exception as e:
                 await asyncio.sleep(interval); continue
             if resp.status_code == 200:
-                self._tokens[user_id] = {"status": "authenticated", "access_token": body["access_token"], "refresh_token": body.get("refresh_token"), "expires_at": time.time() + body.get("expires_in", 3600), "scope": body.get("scope", "")}
+                self._tokens[user_id] = {"status": "authenticated", "access_token": body["access_token"], "refresh_token": body.get("refresh_token"), "expires_at": time.time() + body.get("expires_in", 3600), "scope": body.get("scope", ""), "refresh_count": 0}
                 self._last_authenticated_user = user_id
                 await self._persist_token(user_id)
                 logger.info(f"MS Auth: {user_id} authenticated (refresh={'YES' if 'refresh_token' in body else 'NO'})")
@@ -220,7 +221,7 @@ class MSAuthManager:
             td = await self._load_token(user_id)
             if td: self._tokens[user_id] = td; self._last_authenticated_user = user_id
         if not td or td.get("status") != "authenticated": return None
-        if td.get("expires_at", 0) - time.time() < 300:
+        if td.get("expires_at", 0) - time.time() < 600:
             if not await self._refresh_token(user_id): return None
         return self._tokens[user_id].get("access_token")
 
@@ -233,9 +234,9 @@ class MSAuthManager:
             resp = await self._http.post(f"{self.authority}/oauth2/v2.0/token", data=data)
             if resp.status_code == 200:
                 body = resp.json()
-                self._tokens[user_id] = {"status": "authenticated", "access_token": body["access_token"], "refresh_token": body.get("refresh_token", rt), "expires_at": time.time() + body.get("expires_in", 3600), "scope": body.get("scope", "")}
+                self._tokens[user_id] = {"status": "authenticated", "access_token": body["access_token"], "refresh_token": body.get("refresh_token", rt), "expires_at": time.time() + body.get("expires_in", 3600), "scope": body.get("scope", ""), "refresh_count": self._tokens.get(user_id, {}).get("refresh_count", 0) + 1}
                 await self._persist_token(user_id)
-                logger.info(f"MS Auth: Token refreshed for {user_id}")
+                logger.info(f"MS Auth: Token refreshed for {user_id} (refresh_count={self._tokens.get(user_id, {}).get('refresh_count', 0)})")
                 return True
             logger.warning(f"MS Auth: Refresh failed: HTTP {resp.status_code}")
         except Exception as e:

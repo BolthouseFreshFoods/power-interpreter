@@ -10,10 +10,11 @@ Modules:
     ocr_pdf_to_excel.py    - PDF -> OCR -> structured Excel
     data_to_report.py      - Data file -> Excel report + chart
     batch_ocr_pipeline.py  - OneDrive folder -> batch OCR -> combined Excel
+    sandbox_safe_code.py   - Canonical sandbox-safe coding rules
 
 Initialization is handled by app/skills_integration.py,
 called from main.py during lifespan startup.
 
-Skill count: 4
+Skill count: 5
 Total tool handlers wired: ~13
 """

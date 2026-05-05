@@ -10,6 +10,7 @@ This module:
 
 v1.0.0: 1 skill  (consolidate_files)
 v2.0.0: 4 skills (+ ocr_pdf_to_excel, data_to_report, batch_ocr_pipeline)
+v2.1.0: 5 skills (+ sandbox_safe_code)
 """
 
 import logging
@@ -19,15 +20,17 @@ from app.skills.consolidate_files import SKILL_DEFINITION as CONSOLIDATE_SKILL
 from app.skills.ocr_pdf_to_excel import SKILL_DEFINITION as OCR_SKILL
 from app.skills.data_to_report import SKILL_DEFINITION as REPORT_SKILL
 from app.skills.batch_ocr_pipeline import SKILL_DEFINITION as BATCH_OCR_SKILL
+from app.skills.sandbox_safe_code import SKILL_DEFINITION as SANDBOX_SAFE_SKILL
 
 logger = logging.getLogger(__name__)
 
-# All skill definitions â€” add new skills here
+# All skill definitions – add new skills here
 ALL_SKILLS = [
     CONSOLIDATE_SKILL,
     OCR_SKILL,
     REPORT_SKILL,
     BATCH_OCR_SKILL,
+    SANDBOX_SAFE_SKILL,
 ]
 
 

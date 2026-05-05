@@ -18,7 +18,7 @@ from typing import List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-# ── Default blocked imports ──────────────────────────────────
+# ?? Default blocked imports ??
 # These are blocked across ALL skills by default.
 # Individual skills can extend this list.
 DEFAULT_BLOCKED_IMPORTS = [
@@ -32,7 +32,7 @@ DEFAULT_BLOCKED_IMPORTS = [
     "socket",
 ]
 
-# ── Default blocked URL patterns ─────────────────────────────
+# ?? Default blocked URL patterns ??
 # Prevents execute_code from reaching Microsoft APIs directly.
 DEFAULT_BLOCKED_PATTERNS = [
     r"graph\.microsoft\.com",
@@ -41,7 +41,7 @@ DEFAULT_BLOCKED_PATTERNS = [
     r"service\.flow\.microsoft\.com",
 ]
 
-# ── Known broken imports ─────────────────────────────────────
+# ?? Known broken imports ??
 # These exist in the stdlib/packages but crash in our sandbox.
 KNOWN_BROKEN = {
     "dataframe_to_rows": (
@@ -49,7 +49,13 @@ KNOWN_BROKEN = {
         "Use ws.append(list(row)) instead."
     ),
     "PyPDF2": (
-        "PyPDF2 is not installed. Use pdfplumber instead."
+        "PyPDF2 is not installed. Use matplotlib.backends.backend_pdf.PdfPages instead."
+    ),
+    "fpdf": (
+        "fpdf is not installed. Use matplotlib.backends.backend_pdf.PdfPages instead."
+    ),
+    "fpdf2": (
+        "fpdf2 is not installed. Use matplotlib.backends.backend_pdf.PdfPages instead."
     ),
 }
 
@@ -60,6 +66,7 @@ def check_code_guardrails(
     blocked_patterns: Optional[List[str]] = None,
     max_lines: int = 50,
     max_print_statements: int = 10,
+    max_chars: int = 2048,
 ) -> Tuple[bool, Optional[str]]:
     """Check code against guardrails before execution.
 
@@ -72,14 +79,21 @@ def check_code_guardrails(
 
     lines = code.strip().split("\n")
 
-    # ── Line count ───────────────────────────────────────
+    # ?? Character count ??
+    if len(code) > max_chars:
+        return False, (
+            f"Code exceeds {max_chars} character limit "
+            f"({len(code)} chars). Split into smaller calls."
+        )
+
+    # ?? Line count ??
     if len(lines) > max_lines:
         return False, (
             f"Code exceeds {max_lines} line limit "
             f"({len(lines)} lines). Split into smaller calls."
         )
 
-    # ── Blocked imports ──────────────────────────────────
+    # ?? Blocked imports ??
     for imp in imports_to_check:
         escaped = re.escape(imp)
         if re.search(rf"(?:^|\s)import\s+{escaped}", code, re.MULTILINE):
@@ -87,7 +101,7 @@ def check_code_guardrails(
         if re.search(rf"from\s+{escaped}", code, re.MULTILINE):
             return False, f"Blocked import: from {imp}"
 
-    # ── Blocked URL patterns ─────────────────────────────
+    # ?? Blocked URL patterns ??
     for pattern in patterns_to_check:
         if re.search(pattern, code, re.IGNORECASE):
             return False, (
@@ -95,12 +109,12 @@ def check_code_guardrails(
                 f"Use the appropriate MCP tool instead of raw HTTP."
             )
 
-    # ── Known broken imports ─────────────────────────────
+    # ?? Known broken imports ??
     for broken_name, message in KNOWN_BROKEN.items():
         if broken_name in code:
             return False, message
 
-    # ── Excessive print statements ───────────────────────
+    # ?? Excessive print statements ??
     print_count = len(re.findall(r"\bprint\s*\(", code))
     if print_count > max_print_statements:
         return False, (
@@ -109,7 +123,7 @@ def check_code_guardrails(
             f"Only print summaries, not raw data."
         )
 
-    # ── Catch file-to-self copies ────────────────────────
+    # ?? Catch file-to-self copies ??
     copy_matches = re.findall(
         r"shutil\.copy2?\s*\(\s*[\"']([^\"']+)[\"']\s*,\s*[\"']([^\"']+)[\"']",
         code,
